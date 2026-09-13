@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Target material never belongs in this repo.
+# Binaries under analysis, decompilation corpora, ledgers, run transcripts and
+# reports are all per-target and stay local.
+work/
+state/
+targets/
+corpus/
+reports/
+out/
+runs.jsonl
+*.sys
+*.exe
+*.dll
+*.pdb
+*.c.gz

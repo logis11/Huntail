@@ -1,11 +1,35 @@
-# otter
+```
+   ██╗  ██╗██╗   ██╗███╗   ██╗████████╗ █████╗ ██╗██╗
+   ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔══██╗██║██║
+   ███████║██║   ██║██╔██╗ ██║   ██║   ███████║██║██║
+   ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══██║██║██║
+   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ██║  ██║██║███████╗
+   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚══════╝
+
+        ▄▄▄▄▄▄▄
+    ▄▄█████████████▄▄
+  ▄███▀▀▀████████████████▄▄
+ ▐█▌ ◉  ▀████████████████████▄▄                ░   ░
+  ██ ▀▄▀▄ ████████████████████████▄▄         ░  ▄█▄  ░
+  ▀██▄▄▄█████████████████████████████▄▄▄▄▄▄▄▄▄██◉█▀
+    ▀▀████████████████████████████████▀▀▀▀▀  ░  ▀█▀  ░
+       ▀▀▀██████████████████▀▀▀                ░   ░
+```
+
+# huntail
 
 An autonomous binary vulnerability-analysis harness built on the Claude Agent SDK.
+
+The deep-sea fish it is named for hunts with its **tail**: the tail carries a
+lure, and what the lure attracts is what gets eaten. That is the shape of this
+harness. The analyst does not produce findings — it produces claims, and the tail
+is the adversarial panel those claims have to swim into. What survives the panel
+is a finding. What does not is a ledger row with a reason attached.
 
 Its structure resembles a CTF exploitation harness, but **the pressure runs the
 opposite way.**
 
-|                | CTF harness                       | otter                                          |
+|                | CTF harness                       | huntail                                          |
 |----------------|-----------------------------------|------------------------------------------------|
 | Goal           | a flag (a binary success signal)  | a verdict: **confirmed / rejected / unanalysed** |
 | Failure it stops | rabbit holes                    | **false positives** and fake coverage           |

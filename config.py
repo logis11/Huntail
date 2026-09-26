@@ -11,6 +11,7 @@
 # measurement side (guest VM, kernel debugger, probe directories) is per-lab and
 # arrives with the modules that use it.
 import os
+import shutil
 
 
 def _flag(name, default="1"):
@@ -96,3 +97,30 @@ ADJUDICATOR_TIMEOUT = int(os.environ.get("ADJUDICATOR_TIMEOUT", "900"))
 # `reject|exhaust` only, so as not to open the precision direction; it is on
 # here because every such decision is auditable in the ledger. Set 0 to narrow it.
 ADJUDICATOR_MAY_CONFIRM = _flag("ADJUDICATOR_MAY_CONFIRM")
+
+
+# ── measurement side (per-lab; arrives with the modules that use it) ─────
+# The agent loop, the ledger and the tool registry reference these. They are
+# OFF or gracefully-degrading by default: with USE_IDA unset the decompile
+# path reports "USE_IDA=0" instead of failing, and the kd/probe/vm tools stay
+# disabled until a lab explicitly opts in. A published skeleton run touches
+# none of them — the capstone disassembler + anchor gate + panel need nothing
+# here.
+WINE        = os.environ.get("WINE", "wine" if shutil.which("wine") else "")
+IDAT        = os.environ.get("IDAT", "/mnt/c/Program Files/IDA Professional 9.0/idat64.exe")
+IDA_WORKER  = os.path.abspath(os.path.join(os.path.dirname(__file__), "ida_worker.py"))
+IDA_TIMEOUT = int(os.environ.get("IDA_TIMEOUT", "900"))
+USE_IDA     = os.environ.get("USE_IDA", "1") not in ("0", "false", "no")
+
+WORK_DIR = os.path.abspath(os.environ.get("WORK_DIR")
+                           or os.path.join(os.path.dirname(__file__), "work"))
+os.makedirs(WORK_DIR, exist_ok=True)
+
+# Kernel debugger / live probe / guest VM — opt-in only.
+ALLOW_PROBE    = os.environ.get("ALLOW_PROBE", "0") in ("1", "true")
+ALLOW_VM_PROBE = os.environ.get("ALLOW_VM_PROBE", "0") in ("1", "true")
+ALLOW_KDNET    = os.environ.get("ALLOW_KDNET", "0") in ("1", "true")
+
+# Prior-art dedup gate (G3) and the Stop-gate block budget.
+GATE_PRIORART = os.environ.get("GATE_PRIORART", "1") not in ("0", "false", "no")
+STOP_BLOCKS   = int(os.environ.get("STOP_BLOCKS", "2"))

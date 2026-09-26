@@ -1,4 +1,11 @@
 ```
+   ██╗  ██╗██╗   ██╗███╗   ██╗████████╗ █████╗ ██╗██╗     
+   ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔══██╗██║██║     
+   ███████║██║   ██║██╔██╗ ██║   ██║   ███████║██║██║     
+   ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══██║██║██║     
+   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ██║  ██║██║███████╗
+   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚══════╝
+                                        Autonomous Vulnerability Finding
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣶⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢦⠙⢷⡀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢳⣄⡙⣄⠀⠀⠀⠀⠀⠀⠀
@@ -139,7 +146,10 @@ only read and judge.
 
 ## What is in this commit
 
-This is the skeleton: the deterministic substrate and the adversarial panel.
+The deterministic substrate, the adversarial panel, and the agent loop that
+wires them together — the harness now runs end to end.
+
+The substrate and the panel:
 
 | File | What it is |
 |---|---|
@@ -156,9 +166,24 @@ This is the skeleton: the deterministic substrate and the adversarial panel.
 | `config.py` | Every knob is an environment variable, and **every gate can be turned off** — a gate you cannot disable cannot be measured |
 | `mkpe.py` | Builds a minimal valid PE32+ so the anchor gate can be tested against a real image without shipping one |
 
-Still to come: the ledger (the exhaustive table, the graveyard, coverage
-accounting), the navigation and measurement tools, the agent loop that wires the
-panel to the gates, and the regression benchmark.
+The loop that wires the panel to the gates:
+
+| File | What it is |
+|---|---|
+| `agent_sdk.py` | The agent loop. Registers the tool surface, runs the analyst against the gates, and calls the panel on every `verdict` — the entry point (`python3 agent_sdk.py <binary> [corpus.c]`) |
+| `ledger.py` | The ledger. Lives on disk, not in context: the exhaustive surface table, candidate lifecycle (proposed → refuted / promoted), the graveyard, coverage accounting, and the machine-verified anchors stored with every confirmation |
+| `tools.py` | The tool registry — 31 tools, 20 read-only: identity, navigation (`census`/`callers`/`callees`/`callpath`/`func_at`), code (`disassemble` for adjudication, `decompile` for navigation), the deterministic nodes (`anchor`, `dispatch_table`), and the ledger tools (`surface`/`verdict`/`control`) |
+| `nav.py` `xref.py` `authz.py` | Capstone-level navigation the registry builds on: function bounds, direct-call cross-references, and reachability from an authorization boundary |
+| `runlog.py` | One metrics line per run; notes the analyst leaves outside the context |
+
+The measurement side of `tools.py` — the IDA worker, the kernel debugger and
+the guest-VM probe — is per-lab and **off by default** (`USE_IDA` degrades to a
+"USE_IDA=0" reply, `ALLOW_*` stay disabled). A skeleton run touches none of it;
+the capstone disassembler plus the anchor gate plus the panel need nothing there.
+
+Still to come: the regression benchmark. Its harness is portable, but its answer
+key was the confirmations and kills of a specific target — which is target
+material — so it arrives rebuilt against a synthetic image, not lifted.
 
 ```bash
 pip install -r requirements.txt

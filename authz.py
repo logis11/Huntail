@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-# authz.py — 호출그래프 기반 두 가지: ① 인가 API 도달성 ② **함수 간** 가드 지배.
+# authz.py — two things off the call graph: (1) reachability of authorization
+# APIs, and (2) **inter-procedural** guard dominance.
 #
-# 둘은 같은 문제다. `cfg.py` 는 함수 **안**에서만 지배를 계산했고, pcw.sys 감사에서
-# 4건이 `cross_function` 으로 판정 불가였다. 그 4건의 모양은 전부 같다:
-#   **가드는 디스패처에, 싱크는 핸들러에.**
-# 그게 교리가 "가장 흔한 진짜 결함"이라 부르는 *문에서 한 번만 검사* 패턴이다.
+# They are the same problem. `cfg.py` computes dominance **inside** one function
+# only, and in one measured audit four rejections came back `cross_function`,
+# undecidable. All four had the same shape:
+#   **the guard is in the dispatcher, the sink is in the handler.**
+# That is the *checked once at the door* pattern the doctrine calls the most
+# common real defect.
 #
-# ① 은 window_kernel/tools/authz_reach.py (A-13 에서 쓴 것)를 하네스로 옮기고
-#    http.sys 전용 디스패치표 탐침을 걷어낸 것이다. 핸들러 VA 는 driver.py 가 준다.
+# (1) is a per-target reachability script lifted into the harness, with its
+#     target-specific dispatch-table probing stripped out. Handler VAs come from
+#     the attack-surface recovery module.
 #
-# ★ 이 도구의 음성("인가 API 0건")은 **양성 대조 없이는 근거가 아니다.**
-#   그래서 audit() 는 controls= 없이는 음성을 확정으로 내놓지 않는다.
+# **A negative from this tool ("zero authorization APIs") is not ground without
+# a positive control.** So `audit()` refuses to call a negative confirmed unless
+# `controls=` is given.
 import collections
 
 import capstone
@@ -29,14 +34,17 @@ def _md():
 
 
 def callgraph(pe, max_fn=20000):
-    """.pdata 함수 전체에 대해 **직접 call** 간선. 전 실행섹션을 포함한다.
+    """**Direct call** edges over every `.pdata` function, across every
+    executable section.
 
-    한계(항상 같이 보고할 것):
-      - 간접호출·vtable·DPC 콜백 미추적
-      - ★ **도달 ≠ 실행**. BFS 가 공유 헬퍼로 새어 들어가면 그 IOCTL 과 무관한 API 가
-        잡힌다. http.sys 클라이언트 IOCTL 48 에서 `IoGetRequestorProcess` 가 잡혔는데
-        그 소비처는 `ObOpenObjectByPointer`(디바이스 open 경로의 공유 코드)였다.
-        정체성 API 도달은 **"읽어보라"는 신호**이지 게이트의 존재 증명이 아니다.
+    Limits (always report them alongside):
+      - indirect calls, vtables and DPC callbacks are not tracked
+      - **reachable is not executed.** Once the BFS leaks into a shared helper it
+        picks up APIs that have nothing to do with the request under analysis. In
+        one measured case `IoGetRequestorProcess` was reached from a client
+        request, and its consumer was `ObOpenObjectByPointer` — shared code on
+        the device-open path. Reaching an identity API is **a signal to go read**,
+        not proof that a gate exists.
     """
     md = _md()
     try:
@@ -89,13 +97,14 @@ def func_of(bounds, va):
 
 
 def reach_apis(pe, start, apis=AUTHZ, depth=6, cg=None):
-    """start 함수에서 직접호출 BFS 로 도달하는 인가 API. 경로도 돌려준다."""
+    """Authorization APIs reachable from `start` by a direct-call BFS, with the
+    path to each one."""
     if cg is None:
         cg = callgraph(pe)
     g, bounds = cg
     st = func_of(bounds, start) or start
     if st not in g:
-        return {"error": "start 0x%X 가 .pdata 함수가 아니다" % start}
+        return {"error": "start 0x%X is not a .pdata function" % start}
     seen, q, found, nvis = {st: None}, collections.deque([(st, 0)]), {}, 0
     apis_l = {a.lower() for a in apis}
     while q:
@@ -120,11 +129,14 @@ def reach_apis(pe, start, apis=AUTHZ, depth=6, cg=None):
 
 
 def identity_compares(pe, func, depth=0):
-    """`call PsGetCurrentProcess` 류 직후 그 반환값이 **저장된 값과 비교되는가**.
+    """After a `call PsGetCurrentProcess`-style site, is the return value
+    **compared against a stored value**?
 
-    ksecdd.sys 가 그 모양이다: PsGetCurrentProcess() 를 SiloContext->[0] 와 비교해
-    실로당 1프로세스로 잠근다. Se* 가 없으니 임포트 기반 인가 스캔에는 안 잡힌다.
-    여기서는 **비교의 존재만** 보고한다 — 그게 진짜 게이트인지는 사람이 읽어야 한다.
+    One measured driver had exactly that shape: `PsGetCurrentProcess()` compared
+    against `SiloContext->[0]`, locking the object to one process per silo. With
+    no `Se*` call anywhere, an import-based authorization scan cannot see it.
+    This reports **only that a comparison exists** — whether it is the real gate
+    takes a human reading it.
     """
     md = _md()
     names = xref.iat(pe)
@@ -145,7 +157,7 @@ def identity_compares(pe, func, depth=0):
                 nm = names.get(i.address + i.size + op.mem.disp)
         if not nm or not any(x.lower() in nm.lower() for x in IDENTITY):
             continue
-        # 반환값(rax)이 메모리와 비교되는가 / 메모리에 저장되는가
+        # Is the return value (rax) compared against memory, or stored into it?
         for j in range(k + 1, min(k + 14, len(ins))):
             m = ins[j]
             if m.mnemonic in ("cmp", "sub") and "rax" in m.op_str and "ptr" in m.op_str:
@@ -162,15 +174,18 @@ def identity_compares(pe, func, depth=0):
 
 
 def audit(pe, targets, controls=None, apis=AUTHZ, depth=6):
-    """대상 핸들러들의 인가 도달성. **controls 없이는 음성을 확정으로 내지 않는다.**
+    """Authorization reachability for the target handlers. **Without `controls`
+    a negative is never reported as confirmed.**
 
-    controls = 인가가 있는 것이 알려진 핸들러 VA 목록. 거기서도 0건이면 분석기 고장이다.
+    `controls` = VAs of handlers known to carry authorization. Zero hits there
+    means the analyser is broken, not that the targets are unguarded.
     """
     cg = callgraph(pe)
     res = {"targets": {}, "controls": {}, "valid": None, "note": ""}
     for t in targets:
         r = reach_apis(pe, t, apis, depth, cg)
-        # ★ 인가 API 0건이어도 **정체성 게이트**가 있으면 '인가 없음'을 주장하면 안 된다.
+        # Zero authorization APIs plus a reachable **identity gate** is still not
+        # grounds for "there is no authorization".
         ident = reach_apis(pe, t, IDENTITY, depth, cg)
         r["identity"] = ident.get("found", {})
         if not r.get("found") and r["identity"]:
@@ -183,53 +198,61 @@ def audit(pe, targets, controls=None, apis=AUTHZ, depth=6):
         res["controls"]["0x%X" % c] = reach_apis(pe, c, apis, depth, cg)
     if not controls:
         res["valid"] = None
-        res["note"] = ("★ 양성 대조 없음. '인가 API 0건'을 근거로 쓰지 마라 — "
-                       "분석기 고장과 인가 부재는 결과가 같다. "
-                       "controls= 에 인가가 있는 것이 알려진 핸들러를 넣어라.")
+        res["note"] = ("No positive control. Do not use 'zero authorization APIs' as "
+                       "ground — a broken analyser and an unguarded target produce "
+                       "the same output. Put handlers known to carry authorization "
+                       "in controls=.")
     else:
         ok = any(r.get("found") for r in res["controls"].values())
         res["valid"] = ok
-        res["note"] = ("양성 대조 통과 — 이 분석기는 인가가 있는 곳에서 실제로 검출한다."
+        res["note"] = ("positive control passed — this analyser does detect "
+                       "authorization where it is present."
                        if ok else
-                       "★ 양성 대조 **실패**. 대조 핸들러에서도 인가 API 가 0건이다 — "
-                       "**분석기가 고장났다.** 이 실행의 음성 결과는 전부 무효다.")
+                       "positive control **FAILED**. The control handlers report zero "
+                       "authorization APIs too — **the analyser is broken.** Every "
+                       "negative from this run is void.")
     return res
 
 
-# ── ② 함수 간 가드 지배 (cfg.py 의 cross_function 확장) ──────
+# ── (2) inter-procedural guard dominance (extends cfg.py's cross_function) ──
 def gates_inter(pe, guard_va, sink_va, depth=6):
-    """가드(F 안)가 싱크(G 안)를 지배하는가 — **호출지점 지배 + 유일 호출자**로 판정.
+    """Does the guard (inside F) dominate the sink (inside G)? Decided by
+    **call-site dominance plus sole caller.**
 
-    성립 조건 둘 다 필요하다:
-      (a) G 를 부르는 곳이 **F 안에만** 있다 (밖에서 부르면 그 경로는 가드를 안 지난다)
-      (b) F 안의 모든 G 호출지점을 가드가 지배한다
-    하나라도 깨지면 '지배 안 함'이다. 판정 못 하면 판정 안 한다.
+    Both conditions are required:
+      (a) every call to G is **inside F** — a call from elsewhere is a path that
+          never passes the guard
+      (b) the guard dominates every G call site inside F
+    If either breaks, the answer is "does not dominate". If it cannot be decided,
+    it is not decided.
     """
     import cfg
     g, bounds = callgraph(pe)
     F = func_of(bounds, guard_va)
     G = func_of(bounds, sink_va)
     if F is None or G is None:
-        return {"verdict": "no_pdata", "why": "가드/싱크가 .pdata 함수 밖이다"}
+        return {"verdict": "no_pdata", "why": "the guard or the sink is outside any .pdata function"}
     if F == G:
         return cfg.gates(pe, guard_va, sink_va)
-    # (a) G 의 호출자 전수
+    # (a) every caller of G
     callers = {f for f, v in g.items() if G in v["calls"]}
     if not callers:
         return {"verdict": "indirect_only", "F": F, "G": G,
-                "why": "싱크 함수 0x%X 를 **직접 호출하는 곳이 없다** — 함수포인터/콜백 경유다. "
-                       "호출그래프로는 판정할 수 없다 (ipt.sys 의 wrmsr DPC 콜백이 그 경우였다)." % G}
+                "why": "**nothing directly calls** the sink function 0x%X — it is reached "
+                       "through a function pointer or a callback. The call graph cannot "
+                       "adjudicate that (a measured case was a DPC callback)." % G}
     outside = callers - {F}
     if outside:
         return {"verdict": "other_callers", "F": F, "G": G,
                 "callers": ["0x%X" % x for x in sorted(callers)],
-                "why": "★ 싱크 함수 0x%X 를 **가드 함수 밖에서도 부른다** (%s) — "
-                       "그 경로는 가드 0x%X 를 지나지 않는다. 이 기각은 성립하지 않는다."
+                "why": "the sink function 0x%X is **also called from outside the guard "
+                       "function** (%s) — that path does not pass the guard 0x%X. This "
+                       "rejection does not stand."
                        % (G, ", ".join("0x%X" % x for x in sorted(outside)), guard_va)}
-    # (b) F 안의 모든 G 호출지점을 가드가 지배하는가
+    # (b) does the guard dominate every G call site inside F?
     sites = [a for a, t, _n in g[F]["callsites"] if t == G]
     if not sites:
-        return {"verdict": "unbounded", "why": "호출지점을 못 찾았다"}
+        return {"verdict": "unbounded", "why": "no call site found"}
     bad = []
     for a in sites:
         r = cfg.gates(pe, guard_va, a)
@@ -238,34 +261,35 @@ def gates_inter(pe, guard_va, sink_va, depth=6):
     if bad:
         return {"verdict": "not_dominated", "F": F, "G": G,
                 "sites": ["0x%X" % a for a in sites],
-                "why": "★ F 0x%X 안의 G 호출지점 %d개 중 %d개를 가드가 지배하지 않는다: %s"
+                "why": "the guard does not dominate %d of the %d G call sites inside F 0x%X: %s"
                        % (F, len(sites), len(bad),
                           "; ".join("0x%X(%s)" % (a, v) for a, v, _w in bad))}
     return {"verdict": "gated_inter", "F": F, "G": G,
             "sites": ["0x%X" % a for a in sites],
-            "why": "싱크 함수 0x%X 는 오직 0x%X 에서만 호출되고, 그 호출지점 %d개 전부를 "
-                   "가드 0x%X 가 지배한다." % (G, F, len(sites), guard_va)}
+            "why": "the sink function 0x%X is called only from 0x%X, and the guard 0x%X "
+                   "dominates all %d of those call sites." % (G, F, guard_va, len(sites))}
 
 
 def render(res):
     L = [res["note"], ""]
     for k, r in res["controls"].items():
-        L.append("  [대조] %s → %s" % (k, ", ".join(r.get("found", {})) or "0건"))
+        L.append("  [control] %s -> %s" % (k, ", ".join(r.get("found", {})) or "zero"))
     for k, r in res["targets"].items():
         f = r.get("found", {})
-        L.append("  %s  탐색 %d함수 → %s" % (k, r.get("visited", 0),
-                                             ", ".join(f) if f else "**인가 API 0건**"))
+        L.append("  %s  %d functions visited -> %s" % (k, r.get("visited", 0),
+                                             ", ".join(f) if f else "**zero authorization APIs**"))
         for nm, path in list(f.items())[:3]:
-            L.append("      %s  경로: %s" % (nm, " → ".join("0x%X" % x for x in path)))
+            L.append("      %s  path: %s" % (nm, " -> ".join("0x%X" % x for x in path)))
         ident = r.get("identity") or {}
         if not f and ident:
-            L.append("      ★ 그런데 **정체성 API 에는 도달한다**: %s" % ", ".join(ident))
+            L.append("      but it **does reach an identity API**: %s" % ", ".join(ident))
             for c in (r.get("identity_compares") or []):
                 L.append("         %s @0x%X → %s @0x%X  [%s]"
                          % (c["api"], c["call_va"], c["insn"], c["va"], c["kind"]))
-            L.append("      ⇒ **'인가 없음'을 주장하지 마라.** 인가가 Se* API 가 아니라 "
-                     "`PsGetCurrentProcess() == 저장된값` 같은 **포인터 비교**로 되어 있을 수 있다. "
-                     "ksecdd.sys 가 정확히 그 모양이고(실로당 1프로세스), 그걸 놓쳐 확정을 냈다.")
+            L.append("      => **do not claim 'no authorization'.** It may be done with a "
+                     "**pointer comparison** such as `PsGetCurrentProcess() == <stored>` "
+                     "rather than an Se* API. One measured driver had exactly that shape "
+                     "(one process per silo), and missing it produced a confirmation.")
     return "\n".join(L)
 
 

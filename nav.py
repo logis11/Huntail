@@ -1,16 +1,18 @@
-# nav.py — 코퍼스 항해 색인.
+# nav.py — the corpus navigation index.
 #
-# Slyp(COTS 바이너리 에이전트) 가 33개 툴 중 절반을 항해에 쓴 이유:
-# 툴셋을 붙이는 것만으로 Claude Code 의 F1 이 +0.214 올랐다. 모델이 아니라 **항해**가 병목이다.
-# 이 하네스는 3884 함수를 이름 grep 하나로 다니고 있었다.
+# Why a COTS-binary agent spent half of its 33 tools on navigation: just
+# attaching a toolset lifted Claude Code's F1 by **+0.214**. The bottleneck was
+# not the model, it was **navigation**. Before this file, the harness got around
+# a 3,884-function corpus with a single grep over names.
 #
-# 여기서 만드는 것: 이름→본문, VA→함수, callees/callers, 콜패스(도달성 논증의 축), 패밀리 인구조사.
+# What it builds: name -> body, VA -> function, callees/callers, call paths (the
+# axis every reachability argument runs on), and a per-family census.
 import os, pickle, re, hashlib
 from collections import deque
 
 BANNER = re.compile(r'^/\*\s*=+\s*(\S+)\s*@\s*(0x[0-9a-fA-F]+)\s*=+\s*\*/', re.M)
 IDENT  = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(')
-# 디컴파일러 로컬/타입/키워드 — 콜 그래프 노이즈
+# Decompiler locals, types and keywords — call-graph noise.
 NOISE = {"if", "while", "for", "switch", "return", "sizeof", "return_address",
          "LOBYTE", "HIBYTE", "LOWORD", "HIWORD", "LODWORD", "HIDWORD", "BYTE1",
          "BYTE2", "BYTE3", "WORD1", "WORD2", "DWORD1", "SLOBYTE", "SHIBYTE"}
@@ -48,7 +50,7 @@ class Index:
         self.byva = []                    # [(va, name)] sorted
         for i, (n, va, s, e) in enumerate(bans):
             end = bans[i + 1][2] if i + 1 < len(bans) else len(t)
-            if n in self.fn:              # 동명이인은 VA 로 구분
+            if n in self.fn:              # same name twice -> disambiguate by VA
                 n = f"{n}@{va:x}"
             self.fn[n] = (va, e, end)
             self.byva.append((va, n))
@@ -66,7 +68,7 @@ class Index:
                 self.inn.setdefault(c, set()).add(n)
         self.inn = {k: sorted(v) for k, v in self.inn.items()}
 
-    # ── 조회 ────────────────────────────────────────────────
+    # ── lookups ─────────────────────────────────────────────
     def body(self, name):
         h = self.resolve(name)
         if not h:
@@ -84,7 +86,8 @@ class Index:
         return hits[0] if hits else None
 
     def func_at(self, va):
-        """VA 를 감싸는 함수. 코퍼스는 시작 VA 만 알므로 '직전 함수' 로 근사한다."""
+        """The function containing `va`. The corpus only records each
+        function's start VA, so this approximates by "the nearest one before"."""
         lo, hi = 0, len(self.byva) - 1
         best = None
         while lo <= hi:
@@ -110,10 +113,11 @@ class Index:
         return (h, self.inn.get(h, [])) if h else (None, [])
 
     def callpath(self, src, dst, maxdepth=8):
-        """src → dst 최단 호출 경로. 도달성 논증(=대부분의 기각 사유)의 축이다."""
+        """The shortest call path from `src` to `dst` — the axis a reachability
+        argument runs on, and most rejections are reachability arguments."""
         a, b = self.resolve(src), self.resolve(dst)
         if not a or not b:
-            return None, f"미해결: {'src ' + str(src) if not a else ''}{'dst ' + str(dst) if not b else ''}"
+            return None, f"unresolved: {'src ' + str(src) if not a else ''}{'dst ' + str(dst) if not b else ''}"
         if a == b:
             return [a], "same"
         seen, q = {a}, deque([(a, [a])])
@@ -128,10 +132,11 @@ class Index:
                     return path + [nx], "found"
                 seen.add(nx)
                 q.append((nx, path + [nx]))
-        return None, f"깊이 {maxdepth} 안에 경로 없음 (간접 호출/함수포인터는 이 그래프에 없다)"
+        return None, (f"no path within depth {maxdepth} (indirect calls and function "
+                      f"pointers are not in this graph)")
 
     def reaches(self, src, maxdepth=4):
-        """src 에서 도달 가능한 함수 집합 (깊이 제한)."""
+        """The set of functions reachable from `src`, up to `maxdepth`."""
         a = self.resolve(src)
         if not a:
             return set()
@@ -146,7 +151,8 @@ class Index:
         return seen
 
     def census(self, mentioned=()):
-        """접두 패밀리별 인구 + (선택) 미언급 비율. coverage_map.md 를 자동 생성한다."""
+        """Population per name-prefix family, plus the unmentioned fraction when
+        `mentioned` is given. This is what generates the coverage map."""
         fam = {}
         for n in self.fn:
             m = re.match(r'^([A-Z][a-z]{0,3}p?)', n)

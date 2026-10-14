@@ -1,14 +1,16 @@
-# ledger.py — 판정 원장 + 커버리지 + 지속성.
+# ledger.py — the verdict ledger + coverage + persistence.
 #
-# 바뀐 것 (근거와 함께):
-#  1) **디스크에 산다.** 예전 원장은 프로세스 메모리였다 — RESUME 로 세션을 이어도 원장은 0에서
-#     시작해 커버리지가 거짓이 됐다. 긴 세션에서 컨텍스트가 압축되면 findings 가 사라진다는 것은
-#     실제로 보고된 실패다 (Slyp 은 pre-compaction 체크포인팅으로 대응했고, 장기 과제에서
-#     컨텍스트 길이만으로 정확도가 13.9~85% 떨어진다는 측정이 있다). 원장은 컨텍스트 밖에 둔다.
-#  2) **후보 생애주기** — proposed → refuted / promoted. 반박당한 주장은 사유(klass)와 함께 남고
-#     상태 블록에 계속 뜬다. 이 프로젝트는 실제로 죽은 후보(A-12)를 두 번 되살렸다.
-#  3) **시나리오 중복 제거** — (함수, 가설) 쌍으로. 소스 타깃은 ±20줄로 잡지만 여기서는 ±0x40 VA.
-#  4) **앵커 기록** — 확정마다 기계 검증된 인용을 같이 저장한다. 리포트가 그대로 쓸 수 있다.
+# What changed (with the grounds):
+#  1) **It lives on disk.** The old ledger was process memory — even when a session was resumed with
+#     RESUME, the ledger started from zero and the coverage became false. Findings vanishing when the
+#     context is compacted in a long session is a really reported failure (Slyp answered it with
+#     pre-compaction checkpointing, and there is a measurement showing accuracy dropping 13.9-85% on
+#     long tasks from context length alone). The ledger is kept outside the context.
+#  2) **The candidate lifecycle** — proposed → refuted / promoted. A refuted claim stays with its
+#     reason (klass) and keeps showing up in the status block. This project really did resurrect a
+#     dead candidate (A-12) twice.
+#  3) **Scenario de-duplication** — by (function, hypothesis) pair. Source targets use ±20 lines; here it is ±0x40 VA.
+#  4) **Anchor records** — every confirmation stores its machine-verified citations alongside. A report can use them as-is.
 import atexit, hashlib, json, os, re, sys, tempfile, time, uuid
 
 import config
@@ -16,40 +18,40 @@ import config
 STATE = {
     "target": "", "guid": "", "started": "",
     "surface":   {},   # name -> {status, kind, why}
-    "verdicts":  [],   # 확정/기각 기록
+    "verdicts":  [],   # confirmed/rejected records
     "candidates": [],  # {id,target,claim,state,klass,reason,anchors}
     "disasm":    set(),
     "controls":  {},
     "graveyard": [],
     "hedges":    0,
     "refutes":   {"run": 0, "killed": 0, "survived": 0, "failed": 0},
-    # 기각 측 압력. broke = 기각이 무너져 ASK 로 되돌아간 건수.
+    # Pressure on the rejection side. broke = how many rejections collapsed and went back to ASK.
     "interrogs": {"run": 0, "broke": 0, "sustained": 0, "failed": 0, "skipped": 0},
 }
 
-STATUS = ("미분석", "감사중", "확정", "기각", "반박됨", "경계보류")
-# 경계보류 = **결함은 섰는데 경계가 범위 밖**(현재는 admin→kernel).
-#   확정이 아니다(등급을 못 준다). 기각도 아니다(코드의 결함은 실재한다).
-#   ★ 남은 질문이 딱 하나로 좁혀진 상태다: **"이 싱크에 닿는 더 낮은 권한이 있는가."**
-#   그래서 이 행은 승격자에게 간다. 묘지에 가지 않는다.
-# ★ disassemble 과 measured 를 같은 3으로 두면 **정적 판독 clean 이 실측 clean 과 같은 칸에 들어간다.**
-# afd.sys 세션의 반증 3건(전부 disassemble 판정이 measured 에 의해 뒤집히거나 무효화됨):
-#   · TDI 전송명 검증: "레벨2=미등록 거부" -> 실측은 존재하지 않는 이름까지 전부 SUCCESS
-#   · free-후-미NULL 스캐너: 후보 86 -> 실측 표본 9/9 오탐
-#   · AfdGetConnectData: 정적 clean -> 실측 8케이스 전부 조기반환, 한 번도 실행 안 됨
+STATUS = ("unanalysed", "auditing", "confirmed", "rejected", "refuted", "boundary-held")
+# boundary-held = **the defect stands, but the boundary is out of scope** (currently admin→kernel).
+#   It is not a confirmation (it cannot be graded). Nor is it a rejection (the defect in the code is real).
+#   ★ The remaining question has narrowed to exactly one: **"is there a lower privilege that reaches this sink?"**
+#   So this row goes to the escalator. It does not go to the graveyard.
+# ★ Putting disassemble and measured both at 3 **puts a static-reading clean in the same slot as a measured clean.**
+# The three refutations from the afd.sys session (every one a disassemble verdict overturned or voided by measured):
+#   · TDI transport-name validation: "level 2 = rejects unregistered" -> measured, even names that do not exist all returned SUCCESS
+#   · the free-then-no-NULL scanner: 86 candidates -> measured sample 9/9 false positives
+#   · AfdGetConnectData: static clean -> measured, all 8 cases returned early; it never ran once
 BASIS_RANK = {"decompile": 1, "doc": 2, "disassemble": 3, "measured": 4}
 
-# ★ 2026-09-07 — **`basis` 가 자유 문자열이라 어휘가 붕괴하고 게이트가 우회됐다.**
-#   실측(원장 전수): ahcache 기각 157건의 basis 가 `disassemble` 83 · `disassembly` 30 ·
-#   `static` 22 · `disasm` 3 — **같은 것에 이름 4개**. 30자를 넘는 basis 가 50건,
-#   최대 **3,116자**(논증 전문이 basis 칸에 들어가 있었다).
-#   그래서 `BASIS_RANK` 는 대부분 0 으로 떨어지고, 무엇보다
-#   `GATE_CONTROL_BEFORE_REJECT` 가 `basis == "measured"` **정확일치**로만 걸려서
-#   `"measured on the live kernel, not inferred…"` 로 시작하는 실측 기각이
-#   **양성 대조 검사를 통째로 건너뛰었다**(verifier_guard 사건이 만든 바로 그 게이트다).
-#   ⇒ **선두 토큰**으로 정본화한다. 산문은 버리지 않고 `basis_note` 로 옮긴다.
-#     ("disassembly of the measured build" 는 선두가 disassemble 계열이므로 정적이다 —
-#      부분문자열 매칭이었다면 이 5건이 거짓으로 실측 취급됐을 것이다.)
+# ★ 2026-09-07 — **`basis` was a free string, so the vocabulary collapsed and the gate was bypassed.**
+#   Measured (the whole ledger): the basis of ahcache's 157 rejections was `disassemble` 83 · `disassembly` 30 ·
+#   `static` 22 · `disasm` 3 — **four names for the same thing**. 50 bases were longer than 30 chars,
+#   the longest **3,116 chars** (the full argument had been put in the basis slot).
+#   So `BASIS_RANK` mostly fell to 0, and above all
+#   `GATE_CONTROL_BEFORE_REJECT` only fired on an **exact match** `basis == "measured"`, so
+#   a measured rejection starting with `"measured on the live kernel, not inferred…"`
+#   **skipped the positive-control check entirely** (the very gate the verifier_guard incident created).
+#   => canonicalise by the **leading token**. The prose is not thrown away; it moves to `basis_note`.
+#     ("disassembly of the measured build" leads with the disassemble family, so it is static —
+#      had this been a substring match, these 5 would have been falsely treated as measured.)
 _BASIS_ALIAS = {
     "measured": "measured", "measure": "measured", "measurement": "measured",
     "live": "measured", "kd": "measured", "ioctl": "measured", "runtime": "measured",
@@ -62,9 +64,9 @@ _BASIS_ALIAS = {
 
 
 def normalize_basis(b):
-    """`basis` 의 **선두 토큰**을 정본 어휘로 접는다. 반환: (정본 또는 None, 원문).
+    """Fold the **leading token** of `basis` into the canonical vocabulary. Returns: (canonical or None, the original).
 
-    None 이면 등록되지 않은 어휘다 — 호출자가 반려한다. 접히면 `BASIS_RANK` 가 살아난다.
+    None means an unregistered word — the caller denies it. Once folded, `BASIS_RANK` works again.
     """
     raw = str(b or "").strip()
     if not raw:
@@ -73,11 +75,11 @@ def normalize_basis(b):
     return _BASIS_ALIAS.get(tok), raw
 _PATH = [None]
 
-# PreToolUse 게이트가 계산한 것을 verdict 툴로 넘기는 인계함.
-# hook 에서 tool_input 을 고쳐도 툴에는 전달되지 않는다 (실측).
+# The handoff box that carries what the PreToolUse gate computed over to the verdict tool.
+# Modifying tool_input in a hook does not reach the tool (measured).
 PENDING = {"anchors": None, "refute": None, "key": None}
-# ★ `basis=measured` 를 무엇이 뒷받침했는지 판정 레코드까지 나르는 한 칸.
-#   `classify`(채점됨) 와 `trace`(실행됨, 미채점)는 증거 무게가 달라 소비부가 구분해야 한다.
+# ★ One slot that carries what backed `basis=measured` all the way to the verdict record.
+#   `classify` (graded) and `trace` (executed, ungraded) carry different evidential weight, and consumers must tell them apart.
 _pending_meas = [None]
 
 
@@ -94,13 +96,13 @@ def _take(target, claim):
     return [], None
 
 
-# ── 지속성 ────────────────────────────────────────────────────
+# ── persistence ────────────────────────────────────────────────────
 def _key(target):
     return re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(target or "corpus"))[:60]
 
 
-# ★ test/prod 경계. 벤치가 프로덕션 원장에 섞여 `pcw.sys` 를 오염시켰다(2026-08-24).
-#   지우는 것으로 끝내면 같은 사고가 또 난다 — 원장에 출처를 박고 네임스페이스를 가른다.
+# ★ The test/prod boundary. A bench run mixed into the production ledger and polluted `pcw.sys` (2026-08-24).
+#   Ending it with a deletion lets the same accident happen again — stamp the provenance into the ledger and split the namespace.
 PROVENANCE = os.environ.get("LEDGER_NS", "prod")     # prod | bench | scratch
 
 
@@ -112,33 +114,33 @@ def _ns_dir():
     return d
 
 
-# 표적을 바꿀 때 되돌릴 기본 골격. `attach` 가 **비우고** 채우기 위해 필요하다.
+# The default skeleton to restore when the target changes. `attach` needs it to **empty** and then fill.
 _SKELETON = {k: (v.copy() if hasattr(v, "copy") else v) for k, v in STATE.items()}
 
 
-# 회차(프로세스) 스코프 카운터 — 원장에 저장하지 않는다. 회차마다 0에서 시작한다.
+# A round-(process-)scoped counter — not saved in the ledger. Every round starts from 0.
 _RUN = {"adds": 0, "verdicts0": 0}
 
-# 등재 예산: 기본 12개 + 이번 회차에 낸 **판정 1건당 8개**.
-#   "더 등재하고 싶으면 먼저 판정하라." 완전성을 막는 게 아니라 **순서**를 강제한다.
+# Registration budget: 12 by default + **8 per verdict** filed this round.
+#   "If you want to register more, adjudicate first." It does not block completeness, it enforces **order.**
 SURFACE_BASE = int(os.environ.get("SURFACE_BASE", "12"))
 SURFACE_PER_VERDICT = int(os.environ.get("SURFACE_PER_VERDICT", "8"))
 
 
 def surface_budget():
-    """(남은 등재 수, 예산, 이번 회차 판정 수)."""
+    """(registrations left, budget, verdicts this round)."""
     made = max(0, len(STATE.get("verdicts") or []) - int(_RUN.get("verdicts0") or 0))
     cap = SURFACE_BASE + SURFACE_PER_VERDICT * made
     return cap - int(_RUN.get("adds") or 0), cap, made
 
 
-# ── 원장 키 락 ────────────────────────────────────────────────
-# ★ 왜: 같은 표적을 두 프로세스가 열면 `save()` 가 last-writer-wins 로 판정을 통째로
-#   지운다. 로그에 흔적이 없다 — 이 저장소가 반복해서 잃은 바로 그 모양이다.
-#   `nightrun.acquire_lock()` 이 같은 일을 하는데 **거기에만 있었다.** `agent_sdk.py` 를
-#   직접 부르거나 스크립트가 attach 하면 무방비였다. 락이 지키는 것은 원장이므로
-#   진입점이 아니라 **원장 옆**에 둔다 — 어느 경로로 들어와도 같은 규칙이 걸린다.
-#   (표적을 안 겹치게 여러 터미널을 띄우는 것은 그대로 된다. 키가 다르면 락도 다르다.)
+# ── ledger key lock ────────────────────────────────────────────────
+# ★ Why: when two processes open the same target, `save()` wipes verdicts wholesale with
+#   last-writer-wins. No trace in the log — exactly the shape this repository has lost again and again.
+#   `nightrun.acquire_lock()` does the same job, but **it existed only there.** Calling `agent_sdk.py`
+#   directly, or a script attaching, was unprotected. What the lock guards is the ledger, so it lives
+#   **next to the ledger**, not at an entry point — the same rule applies whichever path comes in.
+#   (Several terminals on non-overlapping targets still work. A different key means a different lock.)
 _LOCK = {"path": None}
 _LOCK_HOOKED = [False]
 
@@ -149,7 +151,7 @@ def _pid_alive(pid):
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True                      # 살아 있는데 남의 것
+        return True                      # alive, but someone else's
     except OSError:
         return False
     return True
@@ -168,7 +170,7 @@ def _lock_release():
 
 
 def detach():
-    """원장을 놓는다. 락을 풀고 `save()` 를 무장해제한다(미부착 예외로 되돌린다)."""
+    """Let go of the ledger. Releases the lock and disarms `save()` (back to the not-attached exception)."""
     _lock_release()
     _PATH[0] = ""
 
@@ -178,8 +180,8 @@ def _lock_acquire(path):
         return
     lp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".lock")
     if _LOCK.get("path") == lp:
-        return                           # 같은 프로세스가 같은 원장에 다시 붙는다
-    _lock_release()                      # 표적을 바꾼다 — 앞 락을 놓는다
+        return                           # the same process re-attaching to the same ledger
+    _lock_release()                      # switching targets — release the previous lock
     if os.path.exists(lp):
         try:
             old = int(open(lp).read().strip())
@@ -187,19 +189,19 @@ def _lock_acquire(path):
             old = None
         if old is not None and old != os.getpid() and _pid_alive(old):
             raise RuntimeError(
-                "이 원장은 이미 다른 프로세스가 쓰고 있다: %s (pid %d).\n"
-                "  같은 표적을 두 곳에서 열면 save() 가 서로를 덮어써 판정이 조용히 사라진다.\n"
-                "  · 표적이 다른 병렬 실행은 막지 않는다 — 다른 표적으로 띄워라\n"
-                "  · 그 프로세스가 죽은 것 같으면:  kill %d ; rm %s\n"
-                "  · 읽기만 할 거면:  LEDGER_NOLOCK=1 (쓰지 마라)"
+                "this ledger is already being written by another process: %s (pid %d).\n"
+                "  Opening the same target in two places makes save() overwrite each other and verdicts vanish silently.\n"
+                "  · parallel runs on different targets are not blocked — launch on a different target\n"
+                "  · if that process looks dead:  kill %d ; rm %s\n"
+                "  · if you only mean to read:  LEDGER_NOLOCK=1 (do not write)"
                 % (os.path.basename(path), old, old, lp))
         if old is not None and old != os.getpid():
-            sys.stderr.write("\033[93m[ledger] 낡은 락 제거 (죽은 pid %s)\033[0m\n" % old)
+            sys.stderr.write("\033[93m[ledger] removing a stale lock (dead pid %s)\033[0m\n" % old)
     try:
         with open(lp, "w") as f:
             f.write(str(os.getpid()))
     except OSError as e:
-        sys.stderr.write("\033[93m[ledger] 락 파일을 만들지 못했다: %s\033[0m\n" % e)
+        sys.stderr.write("\033[93m[ledger] could not create the lock file: %s\033[0m\n" % e)
         return
     _LOCK["path"] = lp
     if not _LOCK_HOOKED[0]:
@@ -210,13 +212,13 @@ def _lock_acquire(path):
 def attach(target, guid=""):
     d = _ns_dir()
     _p = os.path.join(d, _key(target) + ".json")
-    # ★ 락을 **STATE 를 건드리기 전에** 잡는다. 실패해도 지금 들고 있는 원장은 멀쩡하다.
+    # ★ Take the lock **before touching STATE.** If it fails, the ledger held right now is untouched.
     _lock_acquire(_p)
     _PATH[0] = _p
-    # ★ 2026-09-02 버그: 예전엔 `STATE.update(d)` 만 했다. 그러면 **앞 표적의 키가 남는다** —
-    #   한 프로세스에서 두 표적을 붙이자 ahcache 의 `tracks` 가 wcifs 원장에 그대로 새어
-    #   저장됐다(트랙 초기화 스크립트가 그걸 드러냈다). 원장을 섞는 것은 조용한 오염이고,
-    #   판정 계보를 근본에서 망가뜨린다. 붙일 때마다 **비우고** 채운다.
+    # ★ 2026-09-02 bug: this used to do only `STATE.update(d)`. That **leaves the previous target's keys behind** —
+    #   attaching two targets in one process leaked ahcache's `tracks` straight into the wcifs ledger
+    #   and saved them (a track-reset script exposed it). Mixing ledgers is silent pollution, and
+    #   it ruins verdict lineage at the root. Every attach **empties** and then fills.
     STATE.clear()
     STATE.update({k: (v.copy() if hasattr(v, "copy") else v) for k, v in _SKELETON.items()})
     if os.path.exists(_PATH[0]) and os.environ.get("FRESH", "") not in ("1", "true"):
@@ -231,38 +233,38 @@ def attach(target, guid=""):
     else:
         loaded = False
     STATE["target"], STATE["guid"] = target or "", guid or STATE.get("guid", "")
-    # ★ 2026-09-08 — **옛 질문에 `kind`/`by` 를 붙이는 소급을 붙일 때 돌린다.**
-    #   둘 다 이미 있는 칸에서 유도한다(파생 필드, 멱등). 새 행만 고치면 옛 356행이
-    #   영원히 랭킹 축 없이 남는다 — 그러면 단일 큐가 정렬되지 않는다.
+    # ★ 2026-09-08 — **the backfill that adds `kind`/`by` to old questions runs at attach time.**
+    #   Both are derived from slots that already exist (derived fields, idempotent). Fixing only new rows
+    #   leaves the old 356 rows without a ranking axis forever — and then the single queue cannot be sorted.
     if loaded:
         try:
             backfill_ask_fields()
         except Exception:
-            pass                     # 소급 실패가 붙기 자체를 막으면 안 된다
-        # ★ 2026-09-08 자기 정정 — 저항 질문을 **원장에 물질화**한다.
-        #   전에는 `resisted_to_asks` 를 시드 렌더(파일 사본, save_now=False)에서만 불러서
-        #   XQ 질문이 **SEED 에는 있고 원장에는 없었다**. 분석가가 시드에서 본 id 를
-        #   `verdict(action='asks')` 로 못 찾는다(09-08 런에서는 리드가 상위를 다 차지해
-        #   안 물렸을 뿐, 잠복한 결함이었다).
-        #   ★ 멱등이다: id 는 표적에서 결정적으로 나오고, 재생성은 저항이 실제로 늘었을 때만
-        #     `attempts` 를 올린다. 안 그러면 랭킹 2순위 축이 "몇 번 돌았나"가 된다.
+            pass                     # a backfill failure must not block the attach itself
+        # ★ 2026-09-08 self-correction — **materialise** the resisted questions **into the ledger.**
+        #   `resisted_to_asks` used to be called only from the seed render (a file copy, save_now=False), so
+        #   the XQ questions **were in the SEED and not in the ledger**. An analyst could not find an id seen
+        #   in the seed with `verdict(action='asks')` (in the 09-08 run the leads took the whole top so it
+        #   simply was not hit — a latent defect).
+        #   ★ It is idempotent: the id comes deterministically from the target, and regeneration bumps
+        #     `attempts` only when resistance really grew. Otherwise the second ranking axis becomes "how many times it ran".
         try:
             resisted_to_asks(STATE.get("target"))
         except Exception:
             pass
-    # ★ 회차 예산의 기준선. 표면 등재는 싸고 판정은 비싸다 — 그대로 두면 분모만 큰다.
-    #   실측(2026-09-02 3시간): 표면 +69 / 판정 +4, blocked 476/518(92%).
-    #   ahcache R3 은 툴 108회 중 25회를 등재에 썼다.
+    # ★ The baseline for the round budget. Registering surfaces is cheap and verdicts are expensive — left alone, only the denominator grows.
+    #   Measured (2026-09-02, 3 hours): surface +69 / verdicts +4, blocked 476/518 (92%).
+    #   ahcache R3 spent 25 of its 108 tool calls on registration.
     _RUN["adds"] = 0
     _RUN["verdicts0"] = len(STATE.get("verdicts") or [])
-    # ★ 인수인계 게이트의 기준선. 물려받은 손잡이를 이번 회차 것으로 세면 게이트가 죽는다 —
-    #   실측: 누적 원장의 BLOCKED 행 450개가 앵커를 거의 다 덮어서 armA 가 그냥 통과했다.
+    # ★ The baseline for the handoff gate. Counting inherited handles as this round's kills the gate —
+    #   measured: the cumulative ledger's 450 BLOCKED rows covered almost every anchor, so armA simply passed.
     _RUN["asks0"] = {str(a.get("id")) for a in (STATE.get("asks") or [])}
     _RUN["surface0"] = set(STATE.get("surface") or {})
-    # ★ 2026-09-07 — **부채 상한(WIP cap)의 기준선.** 재고가 아니라 **흐름**을 잰다.
-    #   재고로 걸면 누적 blocked 546 · 열린 ASK 160 때문에 첫 턴부터 잠긴다.
-    #   흐름으로 걸면 "이번 회차가 연 것 − 닫은 것"만 보므로, 09-06 의 순증 +90 /
-    #   09-07 의 +34 같은 일만 정확히 불가능해진다.
+    # ★ 2026-09-07 — **the baseline for the debt cap (WIP cap).** It measures **flow**, not stock.
+    #   Capping on stock locks from the first turn because of the cumulative 546 blocked · 160 open ASKs.
+    #   Capping on flow looks only at "what this round opened − what it closed", so exactly things like
+    #   09-06's net +90 / 09-07's +34 become impossible.
     try:
         _RUN["leads0"] = {str(x.get("id")) for x in open_leads(STATE.get("target"))}
     except Exception:
@@ -274,7 +276,7 @@ def attach(target, guid=""):
                                   "evidence."
                          % PROVENANCE)
     STATE.setdefault("started", time.strftime("%Y-%m-%d %H:%M"))
-    status_reset("attach")       # 표적이 바뀌면 델타를 믿을 수 없다 — 다음 블록은 전문
+    status_reset("attach")       # the target changed, so a delta cannot be trusted — the next block is in full
     save()
     return loaded
 
@@ -284,11 +286,11 @@ def save():
         raise RuntimeError(
             "ledger.save(): attach() was never called. This record was about to be discarded "
             "silently. Call ledger.attach(target) first.")
-    # ★ 원자적 쓰기. 예전엔 `open(path,"w")` 가 파일을 **먼저 0바이트로 자르고** 그 위에 썼다.
-    #   쓰는 도중에 죽거나 두 프로세스가 겹치면 **잘린 JSON** 이 남고, 다음 `attach()` 는
-    #   그걸 `except Exception: loaded=False` 로 삼켜 원장을 0에서 다시 시작한다.
-    #   판정이 통째로 사라져도 로그에 흔적이 없다. tmp 에 쓰고 `os.replace` 로 갈아끼우면
-    #   그 창이 없어진다 — 같은 디렉터리라 같은 파일시스템이고, replace 는 원자적이다.
+    # ★ Atomic write. `open(path,"w")` used to **truncate the file to 0 bytes first** and write over it.
+    #   Dying mid-write, or two processes overlapping, left **truncated JSON**, and the next `attach()`
+    #   swallowed it with `except Exception: loaded=False` and restarted the ledger from zero.
+    #   Verdicts could vanish wholesale with no trace in the log. Writing to tmp and swapping it in with
+    #   `os.replace` removes that window — same directory means same filesystem, and replace is atomic.
     d = dict(STATE)
     d["disasm"] = sorted(STATE["disasm"])
     tmp = None
@@ -302,9 +304,9 @@ def save():
         os.replace(tmp, _PATH[0])
         tmp = None
     except OSError as e:
-        # ★ 조용히 넘기지 않는다. 저장 실패는 판정 유실이고, 예전 `except OSError: pass` 는
-        #   그것을 정상 종료와 구분 불가능하게 만들었다.
-        sys.stderr.write("\033[91m[ledger] save 실패 — 이 회차의 기록이 디스크에 없다: "
+        # ★ Not passed over silently. A save failure is lost verdicts, and the old `except OSError: pass`
+        #   made it indistinguishable from a normal exit.
+        sys.stderr.write("\033[91m[ledger] save failed — this round's records are not on disk: "
                          "%s (%s)\033[0m\n" % (e, _PATH[0]))
     finally:
         if tmp:
@@ -314,21 +316,21 @@ def save():
                 pass
 
 
-# ── 1) 전수 표 ────────────────────────────────────────────────
-# ★ 도달성은 **항목의 속성**이다. 예전엔 아니었고, 그래서 분모가 이질적이었다:
-#   WUDFRd 회차에서 `RdFdoDevice` 의 **PnP/전원 핸들러 20개**가 `kind="ingress"` 로 등재돼
-#   공격면 114개의 일부가 됐다. 비특권 프로세스는 `IRP_MJ_PNP` 를 보낼 수 없다.
-#   에이전트는 정직하게 *"neither reachable nor unreachable"* 이라고 적었지만
-#   그 문장을 담을 **필드가 없어서** `kind` 는 계속 `ingress` 였다.
+# ── 1) the census table ────────────────────────────────────────────────
+# ★ Reachability is **a property of the row.** It used to not be, so the denominator was heterogeneous:
+#   in the WUDFRd round, **20 PnP/power handlers** of `RdFdoDevice` were filed as `kind="ingress"` and
+#   became part of a 114-entry attack surface. An unprivileged process cannot send `IRP_MJ_PNP`.
+#   The agent honestly wrote *"neither reachable nor unreachable"*, but
+#   **there was no field** to hold that sentence, so `kind` stayed `ingress`.
 #
-# ★★ 그리고 `kernel-only` 를 그냥 버리면 안 된다 — SCPVBUS-01 UAF 의 살해자가
-#    **PnP 스레드**였다. 사용자가 IOCTL 로 재열거를 유발하면 PnP 가 비동기로 REMOVE 를 친다.
-#    그래서 3치가 아니라 **4치**다: 가운데 칸이 **경합 상대 풀**이다.
-REACH = ("user-direct",            # DeviceIoControl 등으로 직접
-         "user-triggerable-async",  # 사용자 요청이 간접 유발 (PnP·완료·취소·DPC·work item·타이머)
-         "kernel-only",             # 진짜 사용자와 무관
-         "unknown")                 # ★ 기본값. 모르는 것을 안다고 적지 않는다.
-# ★ unknown 을 뺀 집합. `reach_unknown()` 이 "아직 안 정한 행"을 고르는 기준이다.
+# ★★ And `kernel-only` must not simply be discarded — the killer in the SCPVBUS-01 UAF was
+#    **the PnP thread.** When the user provokes a re-enumeration through an IOCTL, PnP fires REMOVE asynchronously.
+#    So it is **4-valued**, not 3-valued: the middle slot is **the pool of race counterparties.**
+REACH = ("user-direct",            # directly, via DeviceIoControl and the like
+         "user-triggerable-async",  # indirectly provoked by a user request (PnP · completion · cancel · DPC · work item · timer)
+         "kernel-only",             # genuinely unrelated to the user
+         "unknown")                 # ★ the default. Do not write down as known what is not known.
+# ★ The set minus unknown. It is the criterion `reach_unknown()` uses to pick "rows not yet decided".
 REACH_KNOWN = tuple(x for x in REACH if x != "unknown")
 
 
@@ -336,13 +338,13 @@ _CODE_RE = re.compile(r'0x8[0-9a-fA-F]{7}')
 
 
 def _ctl_code(name):
-    """표면 항목 이름에서 컨트롤 코드를 뽑는다. 없으면 None."""
+    """Pull the control code out of a surface row's name. None if there is none."""
     m = _CODE_RE.search(name or "")
     return m.group(0).lower() if m else None
 
 
 def code_index():
-    """컨트롤 코드 -> 등재된 이름들. 중복 등재 탐지용."""
+    """Control code -> the registered names. For detecting duplicate registrations."""
     idx = {}
     for k in (STATE.get("surface") or {}):
         c = _ctl_code(k)
@@ -351,27 +353,27 @@ def code_index():
     return idx
 
 
-# ── 앵커 역색인 ──────────────────────────────────────────────────
-# ★ 2026-09-03. 이 프로젝트에서 가장 비쌌던 손실의 직접 대응.
-#   "이 기능 게이트의 기본값은 무엇인가"라는 질문이 **다섯 회차**에 걸쳐 다시 올라왔다.
-#   답은 그동안 `verdicts[].evidence` 안에 산문으로 있었다 — 분석자 자신이 쓴 문장에
-#   그 디스크립터 주소가 "ENABLED 로 평가된다"고 적혀 있었다.
-#   원장은 판정을 **행 단위**로만 보고, 근거는 자유서술이라 아무도 조회하지 않았다.
+# ── the anchor reverse index ──────────────────────────────────────────────────
+# ★ 2026-09-03. A direct answer to the most expensive loss in this project.
+#   "What is this feature gate's default?" came back up across **five rounds.**
+#   All along the answer sat as prose inside `verdicts[].evidence` — a sentence the analyst wrote
+#   themselves said that descriptor address "evaluates to ENABLED".
+#   The ledger sees verdicts only **row by row**, and the grounds are free text, so nobody queried them.
 #
-#   그리고 저장소 여섯 개(verdicts/asks/graveyard/gate_blocks/candidates/surface)가
-#   전부 **표현 기반 키**를 쓴다: 이름 문자열 · 주장 단어주머니 SHA1 · target 완전일치 · 키 없음.
-#   문장을 바꾸면 뚫리고, 접두사 하나만 달라도 다른 시나리오가 된다.
-#   ⇒ 표현을 바꿔도 안 변하는 것은 **앵커(VA)** 뿐이다. 그것을 1급 키로 쓴다.
-# ★ 접두사 `0x` 를 요구하면 **정작 그 답을 놓친다.** 문제의 확정 행 근거에는
-#   "descriptor VAs 14000f818, 14000f540, 14000f690" 처럼 **0x 없이** 적혀 있었다.
-#   자유서술은 표기를 강제할 수 없으므로 둘 다 잡고 **정규화**한다.
-#   맨 16진수는 커널 VA 모양(1 로 시작하는 9자리, 즉 0x1_0000_0000~0x1_FFFF_FFFF)만 본다 —
-#   빌드 GUID 같은 긴 토큰은 단어 경계 때문에 조각으로 안 걸린다.
+#   And all six stores (verdicts/asks/graveyard/gate_blocks/candidates/surface) use
+#   **expression-based keys**: a name string · a SHA1 of the claim's bag of words · an exact target match · no key.
+#   Reword a sentence and it slips through; one differing prefix makes it a different scenario.
+#   => the only thing that does not change when the wording changes is **the anchor (VA).** It becomes a first-class key.
+# ★ Requiring the `0x` prefix **misses the very answer.** The grounds of the confirmed row in question
+#   were written **without 0x**, as in "descriptor VAs 14000f818, 14000f540, 14000f690".
+#   Free text cannot enforce a notation, so both are caught and **normalised.**
+#   A bare hex number is only taken in kernel-VA shape (9 digits starting with 1, i.e. 0x1_0000_0000~0x1_FFFF_FFFF) —
+#   long tokens like a build GUID do not match in fragments, because of the word boundaries.
 _ANCHOR_RE = re.compile(r'0x([0-9a-fA-F]{6,16})\b|\b(1[0-9a-fA-F]{8})\b')
 
 
 def _vas(text):
-    """표기 정규화된 앵커 집합. 0x14003625d · 14003625D · 0x014003625d 를 같은 것으로 본다."""
+    """The notation-normalised anchor set. 0x14003625d · 14003625D · 0x014003625d count as the same thing."""
     out = set()
     for m in _ANCHOR_RE.finditer(str(text or "")):
         h = (m.group(1) or m.group(2)).lower().lstrip("0") or "0"
@@ -380,7 +382,7 @@ def _vas(text):
 
 
 def anchor_index():
-    """VA -> [(저장소, id, 한줄)] . 매번 새로 만든다(원장이 작고, 낡은 색인이 더 위험하다)."""
+    """VA -> [(store, id, one line)] . Rebuilt every time (the ledger is small, and a stale index is more dangerous)."""
     idx = {}
 
     def add(blob, store, ident, brief):
@@ -389,31 +391,31 @@ def anchor_index():
 
     for v in STATE.get("verdicts") or []:
         add(" ".join(str(v.get(k) or "") for k in ("claim", "evidence", "reason")),
-            v.get("status") or "판정", v.get("id"), v.get("target"))
+            v.get("status") or "verdict", v.get("id"), v.get("target"))
     for a in STATE.get("asks") or []:
         n = len(a.get("attempts") or [])
         add(" ".join(str(a.get(k) or "") for k in ("claim", "why", "guard", "sink", "method")),
-            "질문%s" % ("·%d회" % n if n else ""), a.get("id"), a.get("target"))
+            "question%s" % ("·%dx" % n if n else ""), a.get("id"), a.get("target"))
     for g in STATE.get("graveyard") or []:
         add(" ".join(str(g.get(k) or "") for k in ("claim", "reason")),
-            "묘지[%s]" % (g.get("klass") or "-"), g.get("id"), g.get("target"))
+            "graveyard[%s]" % (g.get("klass") or "-"), g.get("id"), g.get("target"))
     for b in STATE.get("gate_blocks") or []:
         add(" ".join(str(b.get(k) or "") for k in ("why", "would_be", "evidence", "gate")),
-            "칸없음", b.get("gate"), b.get("target"))
+            "no-slot", b.get("gate"), b.get("target"))
     for c in STATE.get("candidates") or []:
         add(" ".join(str(c.get(k) or "") for k in ("claim", "reason")),
-            "후보[%s]" % (c.get("state") or "-"), c.get("id"), c.get("target"))
+            "candidate[%s]" % (c.get("state") or "-"), c.get("id"), c.get("target"))
     for k, r in (STATE.get("surface") or {}).items():
-        add("%s %s" % (k, r.get("why") or ""), "표면[%s]" % (r.get("status") or "-"), "", k)
+        add("%s %s" % (k, r.get("why") or ""), "surface[%s]" % (r.get("status") or "-"), "", k)
     for n, t in (STATE.get("tracks") or {}).items():
-        add(t.get("note") or "", "트랙·단계%s" % t.get("stage"), n, n)
+        add(t.get("note") or "", "track·stage%s" % t.get("stage"), n, n)
     for m in (STATE.get("measures") or []):
-        add(json.dumps(m, ensure_ascii=False), "실측", m.get("id") if isinstance(m, dict) else "", "")
+        add(json.dumps(m, ensure_ascii=False), "measured", m.get("id") if isinstance(m, dict) else "", "")
     return idx
 
 
 def anchor_hits(text, exclude_id=None, limit=10):
-    """이 텍스트의 앵커가 원장 어디에 이미 있는가. 없으면 빈 문자열."""
+    """Where in the ledger are this text's anchors already. An empty string if nowhere."""
     want = _vas(text)
     if not want:
         return ""
@@ -426,13 +428,13 @@ def anchor_hits(text, exclude_id=None, limit=10):
             grouped.setdefault((store, ident, brief), set()).add(va)
     if not grouped:
         return ""
-    # 근거가 이미 있는 판정 → 질문 → 묘지 순으로 위험도가 높다
+    # Risk is highest for a verdict whose grounds already exist → a question → the graveyard, in that order
     def rank(k):
         st = k[0]
-        return (0 if st.startswith(("확정", "기각")) else
-                1 if st.startswith("질문") else
-                2 if st.startswith("묘지") else 3, -len(grouped[k]))
-    # 같은 저장소가 화면을 다 먹지 않게 종류별 상한을 둔다(표면은 중복 등재가 많다).
+        return (0 if st.startswith(("confirmed", "rejected")) else
+                1 if st.startswith("question") else
+                2 if st.startswith("graveyard") else 3, -len(grouped[k]))
+    # A per-kind cap so one store does not eat the whole screen (surfaces have many duplicate registrations).
     per, rows = {}, []
     for k in sorted(grouped, key=rank):
         st = k[0].split("[")[0]
@@ -454,16 +456,16 @@ def anchor_hits(text, exclude_id=None, limit=10):
             L.append("        %s" % brief)
     more = len(grouped) - len(rows)
     if more > 0:
-        L.append("   … 외 %d건" % more)
+        L.append("   … and %d more" % more)
     L.append("   => To read the full basis, open that row with note(action='read') or status().")
     L.append("─" * 66)
     return "\n".join(L)
 
 
 def surface_add(items, kind="ingress", reach="unknown"):
-    # ★ 2026-09-03: 등재에 상한이 없었다. 시드는 완전성을 요구하고(미분석을 빼지 마라),
-    #   등재는 싸고, 등재된 행은 전부 판정을 요구한다 ⇒ 분모만 커지고 커버리지가 거짓으로
-    #   나빠진다. 막는 게 아니라 **순서**를 강제한다: 판정을 내면 등재 예산이 늘어난다.
+    # ★ 2026-09-03: registration had no cap. The seed demands completeness (do not drop unanalysed rows),
+    #   registration is cheap, and every registered row demands a verdict => only the denominator grows and
+    #   coverage falsely worsens. It does not block, it enforces **order**: filing verdicts grows the registration budget.
     left, cap, made = surface_budget()
     if left <= 0:
         return ("YOU HAVE SPENT THIS SESSION'S REGISTRATION BUDGET (%d/%d, %d verdicts this "
@@ -484,33 +486,33 @@ def surface_add(items, kind="ingress", reach="unknown"):
         name = it if isinstance(it, str) else it.get("name", "")
         if not name or name in STATE["surface"]:
             continue
-        # ★ 같은 컨트롤 코드를 **다른 접두사로** 다시 등재하면 분모가 부풀고
-        #   같은 코드를 두 번 판정하게 된다. WUDFRd 08-31 야간 실행에서 실제로 일어났다:
-        #   USB 코드 20개가 `USB.*` / `CTRL.IRP.*` 로 이중 등재돼 표면 115 중 21개가 중복이었고,
-        #   기각 22건 중 4건이 같은 코드의 재판정이었다.
+        # ★ Re-registering the same control code **under a different prefix** inflates the denominator
+        #   and adjudicates the same code twice. It really happened in the WUDFRd 08-31 night run:
+        #   20 USB codes were double-registered as `USB.*` / `CTRL.IRP.*`, 21 of the 115 surfaces were duplicates,
+        #   and 4 of 22 rejections were re-adjudications of the same code.
         c = _ctl_code(name)
         if c and idx.get(c):
             dup.append((name, idx[c][0]))
             continue
         r = reach if isinstance(it, str) else (it.get("reach") or reach)
         if r not in REACH:
-            return f"reach 는 {REACH} 중 하나. 모르면 'unknown' — 추측해서 적지 마라."
-        # ★ 2026-09-05: `entry` 는 **읽기만 하고 아무도 안 썼다** — 실측 1144행 중 0행.
-        #   그래서 `code_coverage()` 가 늘 `Dispatch|Callback|Unload` 이름 휴리스틱으로
-        #   떨어졌고, 도달가능 집합이 진짜 인그레스가 아니라 이름이 그럴싸한 함수들에서
-        #   출발했다. 그런데 **381행이 이름에 `@0xVA` 를 이미 달고 있다.**
-        #   (에이전트가 게이트 신고로 정확히 이걸 지적했다 — 신고가 옳았다.)
-        #   ⇒ 이름에 박힌 주소를 그대로 쓴다. 추측하지 않는다: 없으면 안 넣는다.
-        _rec = {"status": "미분석", "kind": kind, "reach": r,
+            return f"reach is one of {REACH}. If you do not know, 'unknown' — do not write a guess."
+        # ★ 2026-09-05: `entry` was **only read, never written** — 0 of 1144 rows, measured.
+        #   So `code_coverage()` always fell back to the `Dispatch|Callback|Unload` name heuristic, and
+        #   the reachable set started not from the real ingress but from functions with plausible names.
+        #   Yet **381 rows already carry `@0xVA` in their name.**
+        #   (The agent pointed out exactly this in a gate report — the report was right.)
+        #   => use the address embedded in the name as-is. No guessing: if there is none, nothing is set.
+        _rec = {"status": "unanalysed", "kind": kind, "reach": r,
                 "why": "" if isinstance(it, str) else it.get("why", "")}
         _ent = None if isinstance(it, str) else it.get("entry")
         if not _ent:
-            # ★ 2026-09-07 — **`@` 를 요구하면 표적마다 무장 여부가 갈린다.**
-            #   실측: wcifs 는 `WcProcessGetUnions@0x140020d48` 관례라 354/583 행이 entry 를
-            #   갖는데, ahcache 는 `IOCTL f6 -> 0x140038850` 관례라 **0/620** 이었다.
-            #   `code_coverage()` 의 씨앗이 이 칸이므로 ahcache 는 계속 이름 휴리스틱
-            #   폴백으로 돌았다. 계기가 **에이전트의 작명 관례에 달려 있으면 안 된다.**
-            #   ⇒ `@` 는 선택. 없으면 이름 안의 **첫 주소**를 쓴다(추측이 아니라 인용이다).
+            # ★ 2026-09-07 — **requiring `@` splits arming by target.**
+            #   Measured: wcifs follows the `WcProcessGetUnions@0x140020d48` convention so 354/583 rows have an entry,
+            #   while ahcache follows `IOCTL f6 -> 0x140038850` and had **0/620**.
+            #   This slot seeds `code_coverage()`, so ahcache kept running on the name-heuristic
+            #   fallback. The trigger **must not depend on the agent's naming convention.**
+            #   => `@` is optional. Without it, the **first address** in the name is used (a citation, not a guess).
             _me = (re.search(r'@\s*(0x[0-9a-fA-F]{6,16})', name)
                    or re.search(r'(0x[0-9a-fA-F]{6,16})', name))
             if _me:
@@ -533,8 +535,8 @@ def surface_add(items, kind="ingress", reach="unknown"):
                   "ADJUDICATES THE SAME CODE TWICE. Adjudicate under the existing name, or - if "
                   "it really is a different surface - put the distinguishing axis (handler / "
                   "transfer method) in the name, not the code.")
-    #   ★ kind / reach 를 반환에 남긴다 — 무엇으로 등재됐는지 모델이 확인할 수 있어야 한다.
-    #     그리고 예산 때문에 **일부만** 들어간 경우를 조용히 넘기지 않는다.
+    #   ★ Keep kind / reach in the return — the model must be able to check what it was registered as.
+    #     And when the budget let **only part** of it in, that is not passed over silently.
     _clip = (" Registered only %d of the %d requested (registration budget)." %
              (n, _asked)) if _clipped else ""
     return ("Registered %d items (kind=%s, reach=%s).%s Total table: %d items. Nothing ever "
@@ -546,12 +548,12 @@ def surface_add(items, kind="ingress", reach="unknown"):
 
 
 def count_via(bucket, v):
-    """적대자 판정이 **어느 매체로** 왔는지 센다: 툴 제출 / 텍스트 폴백 / 고장.
+    """Count **which medium** an adversary verdict arrived through: tool submission / text fallback / fault.
 
-    ★ 2026-09-03. 제출 툴을 붙이고도 이걸 안 세면 **효과를 알 수 없다.** 이 저장소는
-      만들고 배선 안 한 도구를 이미 여러 번 잃었다(measure·sink_gates·claimaudit).
-      `via_text` 가 계속 올라간다면 모델이 툴을 안 부르고 있다는 뜻이고, 그때는
-      프롬프트가 아니라 **툴 설명**을 고쳐야 한다.
+    ★ 2026-09-03. Attaching the submission tool without counting this **leaves its effect unknowable.** This
+      repository has already lost tools that were built and never wired several times (measure · sink_gates · claimaudit).
+      If `via_text` keeps rising, the model is not calling the tool, and then what needs fixing is
+      **the tool description**, not the prompt.
     """
     if not isinstance(v, dict):
         return
@@ -562,15 +564,15 @@ def count_via(bucket, v):
 
 
 def measure_vas(text):
-    """문자열에서 **실측이 건드린 주소**를 뽑는다. 절대 VA + `<mod>+0xOFF` 둘 다.
+    """Pull **the addresses a measurement touched** out of a string. Both absolute VAs and `<mod>+0xOFF`.
 
-    ★ 왜 필요한가 (2026-09-08 실측): `measured()` 가 `m["target"] == target` **정확
-      문자열 일치**였다. target 은 자유 산문이라(사이트 하나에 11행이 붙는 그 문제)
-      `ioctl` 이 `device`(`\\.\ahcache`)로 기록한 실측을 판정의 target
-      (`0x14004188c K2 call site in AhcQuirksInit …`)이 절대 못 만난다.
-      09-06 에 `mark_interrogated` 를 target 문자열 → `vid=` 로 고친 그 병이 여기 남아 있었다.
-    ★ `<mod>+0xOFF` 는 이 원장의 표적 모듈일 때만 **ImageBase 를 더해** 절대 VA 로 접는다.
-      `nt!…` 같은 다른 모듈은 접지 않는다 — 베이스를 모르면서 접으면 가짜 일치가 난다.
+    ★ Why it is needed (measured 2026-09-08): `measured()` was an **exact string match**
+      `m["target"] == target`. target is free prose (the problem of 11 rows hanging off one site), so
+      a measurement `ioctl` recorded under `device` (`\\.\ahcache`) could never meet a verdict's target
+      (`0x14004188c K2 call site in AhcQuirksInit …`).
+      The same disease that was fixed on 09-06 by moving `mark_interrogated` from the target string to `vid=` was left here.
+    ★ `<mod>+0xOFF` is folded into an absolute VA **by adding the ImageBase** only when it is this ledger's target module.
+      Other modules like `nt!…` are not folded — folding without knowing the base produces fake matches.
     """
     t = str(text or "")
     out = {int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]{6,16})', t)}
@@ -589,37 +591,37 @@ def measure_vas(text):
     return out
 
 
-# ─── principal 정본화 (2026-09-10) ────────────────────────────────────────────
-#   ★ 배선이 끊겨 있던 자리다. `probe.py` 는 결과에 `principal={user,il_sid,elevated}`
-#     를 싣고 `vmprobe.assert_low_principal()` 이 토큰을 **실제로 읽어** 비승격이
-#     아니면 던진다(D형 접지). 그런데 `measure_record()` 에 그 인자가 없어서
-#     원장 경계에서 그 사실이 버려졌다 — 실측 212건 전부 principal 칸 없음.
-#   ⇒ 원장만 읽는 다음 세션은 **"저권한에서 안 됐다"와 "저권한으로 재본 적이 없다"를
-#     구분할 수 없다.** 그 구분이 권한경계 주장의 전부다.
-#   관련: memory `vm-guest-channel-runs-elevated`(vmrun 토큰은 High+Administrators),
-#         `controls-assume-a-context`(승격을 가르는 건 이제 principal 칸뿐이다),
+# ─── principal canonicalisation (2026-09-10) ────────────────────────────────────────────
+#   ★ This was a spot where the wiring was cut. `probe.py` puts `principal={user,il_sid,elevated}`
+#     in its result, and `vmprobe.assert_low_principal()` **really reads** the token and throws if it is
+#     not non-elevated (type-D grounding). But `measure_record()` had no such argument, so
+#     that fact was discarded at the ledger boundary — all 212 measurements had no principal field.
+#   => the next session, reading only the ledger, **cannot tell "it did not work at low privilege" from
+#     "it was never re-measured at low privilege".** That distinction is the whole of a privilege-boundary claim.
+#   Related: memory `vm-guest-channel-runs-elevated` (the vmrun token is High+Administrators),
+#         `controls-assume-a-context` (the principal field is now the only thing that separates elevation),
 #         `built-but-never-wired` · `prose-cannot-carry-a-predicate`.
 PRINCIPAL_SRC = ("probe", "kd", "declared", "unknown")
-# 비승격으로 인정하는 무결성 SID (Low / Medium). vmprobe._IL_OK 와 같은 집합이다.
+# Integrity SIDs accepted as non-elevated (Low / Medium). The same set as vmprobe._IL_OK.
 _IL_LOW = ("S-1-16-4096", "S-1-16-8192")
 
 
 def normalize_principal(p, req=None, src=None):
-    """어떤 형태로 들어오든 **관측된 것만** 실은 정본 dict 로 접는다.
+    """Fold whatever comes in into a canonical dict carrying **only what was observed.**
 
-    반환 키:
-      src      probe | kd | declared | unknown  — 이 사실이 어디서 왔나
-      req      low | default | None             — 요청한 것 (probe 만)
-      il_sid / elevated / user                  — **관측값**. 모르면 None (0/False 로 채우지 마라)
-      verified True 일 때만 "이 측정은 이 principal 에서 났다"를 주장할 수 있다
+    Returned keys:
+      src      probe | kd | declared | unknown  — where this fact came from
+      req      low | default | None             — what was requested (probe only)
+      il_sid / elevated / user                  — **observed values.** None if unknown (do not fill with 0/False)
+      verified only when True can one claim "this measurement came from this principal"
 
-    ★ `verified` 가 이 함수의 존재 이유다. 나머지는 참고값이고, 소비부는 이 한 칸만 본다.
-      `src='declared'`(에이전트가 옮겨 적음)는 **절대 verified 가 아니다** — B형이다.
+    ★ `verified` is the reason this function exists. The rest are reference values; consumers look at this one slot only.
+      `src='declared'` (transcribed by the agent) is **never verified** — it is type B.
     """
     out = {"src": "unknown", "req": (req or None), "il_sid": None,
            "elevated": None, "user": None, "verified": False}
     if isinstance(p, dict):
-        # 프로브 결과의 principal 칸. err 가 있으면 자격을 못 읽은 것이다 = 미검증.
+        # The principal field of a probe result. If err is set the credentials could not be read = unverified.
         out["src"] = src or "probe"
         if not p.get("err"):
             out["il_sid"] = str(p.get("il_sid") or "") or None
@@ -632,14 +634,14 @@ def normalize_principal(p, req=None, src=None):
         out["src"] = tok if tok in PRINCIPAL_SRC else (src or "declared")
         if out["src"] == "declared":
             out["user"] = p.strip()[:120]
-        # kd 는 사용자 토큰이 아니라 커널 디버거다. 관측이긴 하나 principal 주장에는 못 쓴다.
+        # kd is a kernel debugger, not a user token. It is an observation, but it cannot be used for a principal claim.
     elif src:
         out["src"] = src if src in PRINCIPAL_SRC else "unknown"
     return out
 
 
 def principal_grade(p):
-    """정본 dict → 한 단어. 질의·집계용."""
+    """Canonical dict → one word. For queries and aggregation."""
     if not isinstance(p, dict):
         return "unknown"
     if p.get("src") == "kd":
@@ -653,22 +655,22 @@ def principal_grade(p):
 
 
 def measure_record(target, grade, why="", kind="classify", vas=None, principal=None):
-    """실측 기록. `verdict(basis='measured')` 는 이게 있어야 성립한다 —
-    없으면 '실측했다'가 **자기 신고**로 남는다.
+    """A measurement record. `verdict(basis='measured')` stands only if this exists —
+    without it, 'I measured it' stays a **self-report.**
 
-    ★ 2026-09-08 — `kind` 를 가른다. 둘은 증거 무게가 다르고, 섞으면 등급이 거짓이 된다:
-        `classify` — 이중채움으로 **채점된** 관측 (measure.py 가 등급을 냈다)
-        `trace`    — 하네스가 **실행한** 관측이지만 채점은 안 됐다 (kd 체인 등)
-      trace 도 **자기 신고가 아니다** — 하네스가 쏜 기록이다.
+    ★ 2026-09-08 — `kind` splits them. The two carry different evidential weight, and mixing them makes the grade false:
+        `classify` — an observation **graded** by dual fill (measure.py produced the grade)
+        `trace`    — an observation the harness **executed** but that was not graded (a kd chain, etc.)
+      A trace is **not a self-report** either — it is a record of what the harness fired.
 
-    ★ 2026-09-10 — `principal` 을 받는다. **호출자가 관측한 것만 넘겨라.**
-      프로브 경로는 `principal=r.get("principal")`(게스트 토큰을 실제로 읽은 dict),
-      kd 경로는 `principal="kd"`, 에이전트가 옮겨 적은 hex 는 `principal="declared"`.
-      안 넘기면 `unknown` 으로 남는다 — 그리고 **그게 정직한 값이다**. 기본값으로
-      `default` 를 채우면 "승격에서 쟀다"가 사실로 둔갑한다(read-shaped-call-writes). 그래서 게이트를 통과시키되
-      판정에 무엇이 뒷받침했는지 **도장을 찍는다**. 그리고 `basis=measured` 기각은
-      `GATE_CONTROL_BEFORE_REJECT` 가 여전히 **양성 대조를 따로 요구**하므로,
-      이걸 허용해도 "고장난 하네스와 결함 부재"를 못 가르는 구멍은 안 열린다.
+    ★ 2026-09-10 — takes `principal`. **Pass only what the caller observed.**
+      The probe path passes `principal=r.get("principal")` (a dict that really read the guest token),
+      the kd path `principal="kd"`, and hex the agent transcribed `principal="declared"`.
+      If nothing is passed it stays `unknown` — and **that is the honest value.** Filling in `default`
+      as a default turns "measured elevated" into a fact (read-shaped-call-writes). So the gate is let through, but
+      **a stamp** goes on the verdict saying what backed it. And a `basis=measured` rejection still has
+      `GATE_CONTROL_BEFORE_REJECT` **demand a positive control separately**, so
+      allowing this does not open the hole of being unable to tell "a broken harness from an absent defect".
     """
     _pr = principal if isinstance(principal, dict) and "verified" in principal \
         else normalize_principal(principal)
@@ -682,11 +684,11 @@ def measure_record(target, grade, why="", kind="classify", vas=None, principal=N
 
 
 def measured(target, state=None):
-    """이 판정을 뒷받침하는 실측 기록. **정확일치 + 주소 겹침**.
+    """The measurement records backing this verdict. **Exact match + address overlap.**
 
-    ★ 정확일치만 보던 것이 09-08 런에서 실제로 값나가는 판정을 떨어뜨렸다:
-      분석가가 기준선→처치→사후 3단을 대조군 3/3 으로 돌리고 `basis=measured` 로 냈는데
-      `measures` 에 그 target 문자열이 없어 거부됐고, 결국 `basis=disassemble` 로 내려앉았다.
+    ★ Looking only at exact matches dropped a genuinely valuable verdict in the 09-08 run:
+      the analyst ran baseline→treatment→after in three stages with 3/3 controls and filed `basis=measured`, but
+      that target string was not in `measures`, so it was refused, and it ended up sinking to `basis=disassemble`.
     """
     _S = state if state is not None else STATE
     M = _S.get("measures") or []
@@ -704,14 +706,15 @@ def measured(target, state=None):
 
 
 def measured_principal(target, state=None):
-    """이 표적의 실측들이 **어느 principal 에서 났는가**. 반환: (최선 등급, 근거 레코드들).
+    """**Which principal** this target's measurements came from. Returns (best grade, supporting records).
 
-    최선 = 권한경계 주장에 가장 강한 것. `verified_low` > `verified_default`
+    Best = the strongest for a privilege-boundary claim. `verified_low` > `verified_default`
     > `verified_elevated` > `kernel-debugger` > `declared` > `unknown`.
 
-    ★ 이 함수의 요점은 **`unknown` 을 `denied` 와 구분해서 돌려주는 것**이다.
-      "저권한에서 안 됐다"(측정했고 거부됐다)와 "저권한으로 재본 적이 없다"(미측정)는
-      권한경계 주장에서 정반대인데, principal 칸이 없던 동안 원장에서 같아 보였다.
+    ★ The point of this function is to **return `unknown` distinctly from `denied`.**
+      "It failed at low privilege" (measured, and refused) and "it was never re-measured at low
+      privilege" (unmeasured) are opposites for a privilege-boundary claim, yet while there was
+      no principal field they looked the same in the ledger.
     """
     _rank = {"verified_low": 5, "verified_default": 4, "verified_elevated": 3,
              "kernel-debugger": 2, "declared": 1, "unknown": 0}
@@ -729,16 +732,16 @@ def measured_principal(target, state=None):
 
 
 def arm_record(name, precondition, why=""):
-    """측정 **무장 자기신고**. `measure(action='armed')` 의 뒷단.
+    """A measurement **arming self-report**. The back end of `measure(action='armed')`.
 
-    ★ 이건 검증이 아니다. 문자열은 술어를 못 나른다 (memory
-    `prose-cannot-carry-a-predicate`) — 하네스는 `precondition` 을 평가하지 않는다.
-    그래도 기록해야 하는 이유: `classify` 가 이 기록의 **유무**를 판정문에 붙인다.
-    없으면 "그 경로를 실제로 탔는지 아무도 신고하지 않았다"가 판정에 같이 남는다.
+    ★ This is not a verification. A string cannot carry a predicate (memory
+    `prose-cannot-carry-a-predicate`) — the harness does not evaluate `precondition`.
+    Why record it anyway: `classify` attaches **whether this record exists** to its verdict.
+    Without it, "nobody reported actually taking that path" stays attached to the verdict.
 
-    실사례(원 docstring): `AfdRioInvalidateBuffer` 의 `id < table_count` 경계검사를
-    재려고 극단 id 10종을 먹여 전부 SUCCESS 를 받았는데, 테이블이 비어 count=0 이라
-    **경계검사 경로를 애초에 안 탔다.** "측정했다"는 착각이었다.
+    Real case (from the original docstring): to measure the `id < table_count` bounds check in
+    `AfdRioInvalidateBuffer`, 10 extreme ids were fed in and all returned SUCCESS — but the
+    table was empty, count=0, so **the bounds-check path was never taken at all.** "We measured it" was an illusion.
     """
     STATE.setdefault("armings", []).append(
         {"name": name, "precondition": str(precondition)[:300],
@@ -752,18 +755,19 @@ def armings(name):
 
 
 def race_add(a, b, shared, why="", reach="user-triggerable-async"):
-    """★ **2항 표면 항목.** 경합은 위치의 성질이 아니라 (T_A, T_B) + 공유객체의 성질이다.
+    """★ **A two-sided surface entry.** A race is not a property of a location but of (T_A, T_B) + a shared object.
 
-    전 원장 표면 604개 중 경합 가설 형태는 **1개**였고, 이 프로젝트의 유일한 확정
-    메모리 안전 버그(SCPVBUS-01 UAF)가 그 1개에서 나왔다. 담을 행이 없으면 등재가 안 되고
-    등재가 안 되면 **미분석으로도 안 남는다** — 분모에서 통째로 빠진다.
+    Of the 604 surface rows across all ledgers, **1** had the shape of a race hypothesis, and this
+    project's only confirmed memory-safety bug (SCPVBUS-01 UAF) came out of that 1. With no row to
+    hold it, it is not filed, and if it is not filed **it does not even remain as unanalysed** — it
+    drops out of the denominator entirely.
     """
     if not (a and b and shared):
-        return "race 는 a=, b=, shared=(공유 객체/필드) 셋이 다 필요하다."
+        return "race needs all three of a=, b=, shared= (the shared object/field)."
     if reach not in REACH:
-        return f"reach 는 {REACH} 중 하나."
+        return f"reach is one of {REACH}."
     name = f"RACE({a} , {b} @ {shared})"
-    STATE["surface"][name] = {"status": "미분석", "kind": "race", "reach": reach,
+    STATE["surface"][name] = {"status": "unanalysed", "kind": "race", "reach": reach,
                               "pair": [a, b], "shared": shared, "why": why[:400]}
     save()
     return ("\nTo adjudicate you must show that BOTH sides touch the SAME SHARED STATE and that "
@@ -786,12 +790,12 @@ def races():
 
 
 def surface_reach(name, reach, why=""):
-    """도달성을 갱신한다. `kernel-only` 는 공격면 분모에서 빠지지만 **표에는 남는다** —
-    경합 상대(`user-triggerable-async`) 후보이기 때문이다."""
+    """Update reachability. `kernel-only` drops out of the attack-surface denominator but **stays in the table** —
+    because it is a candidate race counterparty (`user-triggerable-async`)."""
     if reach not in REACH:
-        return f"reach 는 {REACH} 중 하나."
+        return f"reach is one of {REACH}."
     if name not in STATE["surface"]:
-        return f"'{name}' 은 전수 표에 없다. surface(action='add') 가 먼저다."
+        return f"'{name}' is not in the census table. surface(action='add') comes first."
     STATE["surface"][name]["reach"] = reach
     if why:
         STATE["surface"][name]["reach_why"] = why[:300]
@@ -800,14 +804,14 @@ def surface_reach(name, reach, why=""):
 
 
 def reach_unknown(limit=40):
-    """★ `reach='unknown'` 인 행의 **이름을 돌려준다.**
+    """★ **Returns the names** of the rows with `reach='unknown'`.
 
-    2026-09-05 사건: 완료 게이트가 `reach=unknown` 행이 남으면 막는데,
-    **그 행을 이름으로 지목할 방법이 없었다.** 에이전트는 개수만 볼 수 있었다.
-    S42 가 16행을 설정하고도 0에 못 닿아 gate_blocked 를 냈고, S45 는 **이름으로 약 140회**
-    탐침하고도 못 찾아 gate_blocked 를 두 번 냈다. 두 회차 합쳐 150회 가까운 헛수고다.
-    S45 의 노트 제목이 그대로 증거다: `STOP-PROBING-read-before-touching`.
-    ⇒ 게이트가 요구하는 것을 **열거할 수 있게** 만든다. 이건 판단이 아니라 배선 문제였다.
+    The 2026-09-05 incident: the completion gate blocks while `reach=unknown` rows remain, yet
+    **there was no way to point at those rows by name.** The agent could see only the count.
+    S42 set 16 rows and still could not reach 0, filing gate_blocked; S45 **probed by name about
+    140 times** without finding them and filed gate_blocked twice. Close to 150 wasted probes over the two rounds.
+    S45's note title is the evidence as it stands: `STOP-PROBING-read-before-touching`.
+    => make what the gate demands **enumerable.** This was a wiring problem, not a judgement problem.
     """
     out = [k for k, v in (STATE.get("surface") or {}).items()
            if isinstance(v, dict) and (v.get("reach") or "unknown") not in REACH_KNOWN]
@@ -815,30 +819,31 @@ def reach_unknown(limit=40):
 
 
 def dead_claim_open(limit=40, surface=None):
-    """★ **주장은 죽었는데 표면이 안 닫힌 행**을 두 통으로 나눠 이름째 돌려준다.
+    """★ Returns, by name and split into two buckets, **the rows whose claims died but whose surface did not close.**
 
-    반환: (no_scope, open_cand, n_no_scope, n_open)
-      · no_scope  — 분모가 선언된 적이 없다. `verdict(action='scope', target=, items=, method=)`
-                    한 번이면 닫기 경로가 열린다.
-      · open_cand — 분모는 있는데 후보가 남았다. 남은 후보를 판정하면 표면이 닫힌다.
+    Returns: (no_scope, open_cand, n_no_scope, n_open)
+      · no_scope  — no denominator was ever declared. A single `verdict(action='scope', target=, items=, method=)`
+                    opens the path to closing it.
+      · open_cand — there is a denominator but candidates remain. Deciding the remaining candidates closes the surface.
 
-    2026-09-06 실측: 표면 560행 중 **83행**이 이 상태다(`rejected_claims` 있는데 미분석).
-    기각이 표면을 닫으려면 먼저 분모가 있어야 하고(`_settle_reject` 의 no_scope/open),
-    안내문은 기각이 성공할 때마다 나간다 — **104번 나갔다**. 그런데 전 원장에서
-    `closed_by_scope` 는 **1행**뿐이다. 안내를 못 봐서가 아니라 **적체가 안 보여서**다:
-    그 행들을 이름으로 열거할 방법이 없었다.
-    ⇒ `reach_unknown` 과 같은 처방이다. 게이트가 요구하는 것을 **열거 가능하게** 만든다.
-      판단이 아니라 배선 문제다. 무엇을 먼저 할지는 처방하지 않는다.
+    Measured 2026-09-06: **83** of 560 surface rows are in this state (`rejected_claims` present, yet unanalysed).
+    For a rejection to close a surface there must first be a denominator (`_settle_reject`'s no_scope/open),
+    and the guidance goes out on every successful rejection — **it went out 104 times.** Yet across the whole
+    ledger only **1 row** is `closed_by_scope`. Not because the guidance went unseen, but **because the backlog was
+    invisible**: there was no way to enumerate those rows by name.
+    => the same remedy as `reach_unknown`. Make what the gate demands **enumerable.**
+      A wiring problem, not a judgement problem. It does not prescribe what to do first.
     """
-    # ★ `surface=` 로 **스냅샷**을 받을 수 있다. 2026-09-06 실측: `nightrun.build_carryover`
-    #   는 `json.load(_state_path(name))` 파일 스냅샷으로 이어받기를 만들고 `ledger.STATE`
-    #   를 쓰지 않는다. STATE 만 읽게 짰더니 부모 프로세스에서 **조용히 0건**이 나와
-    #   블록이 통째로 안 실렸다(예외도 없어서 실패로도 안 보였다). 로직은 한 벌로 두고
-    #   **데이터 출처만** 인자로 받는다 — 복제하면 한쪽만 고쳐진다.
+    # ★ `surface=` accepts a **snapshot.** Measured 2026-09-06: `nightrun.build_carryover`
+    #   builds the carry-over from a file snapshot, `json.load(_state_path(name))`, and does
+    #   not use `ledger.STATE`. Written to read only STATE, it **silently returned 0** in the
+    #   parent process and the whole block was dropped (with no exception, it did not even look
+    #   like a failure). The logic is kept as one copy and **only the data source** is an
+    #   argument — duplicate it and only one side gets fixed.
     ns, oc = [], []
     _src = surface if surface is not None else (STATE.get("surface") or {})
     for k, v in _src.items():
-        if not isinstance(v, dict) or v.get("status") != "미분석":
+        if not isinstance(v, dict) or v.get("status") != "unanalysed":
             continue
         if not (v.get("rejected_claims") or v.get("claims_rejected")):
             continue
@@ -847,7 +852,7 @@ def dead_claim_open(limit=40, surface=None):
 
 
 def reach_breakdown():
-    """(공격면 분모, kernel-only, unknown). 분모 = user-direct + user-triggerable-async."""
+    """(attack-surface denominator, kernel-only, unknown). Denominator = user-direct + user-triggerable-async."""
     c = {k: 0 for k in REACH}
     for v in (STATE.get("surface") or {}).values():
         c[v.get("reach", "unknown") if v.get("reach") in REACH else "unknown"] += 1
@@ -855,13 +860,13 @@ def reach_breakdown():
 
 
 def mark_incidental(name, found_while):
-    """**A 를 보다 B 를 발견**한 것을 표시한다.
+    """Mark that **B was found while looking at A.**
 
-    ★ 왜 필요한가: 이 세션 최고의 결함(`S13-UAF-AVLNODE-V2`)이 정확히 그렇게 나왔다 —
-      시드는 '정보 유출 게이트를 보라'였는데 AVL 노드 UAF 를 발견했다.
-      그런데 그 뒤 시드마다 "새 표면을 늘리지 마라"를 박고 이어받기에 "분모만 키운 회차다"
-      경고까지 자동으로 붙였다. **최고의 발견 경로에 벌을 주고 있었다.**
-      넓히기(무작정 등재)와 파다가 걸린 것은 다르다 — 후자는 실제 작업의 산물이다.
+    ★ Why it is needed: this session's best defect (`S13-UAF-AVLNODE-V2`) came out exactly that way —
+      the seed said 'look at the information-leak gate' and an AVL node UAF turned up.
+      Yet after that every seed hammered in "do not add new surface", and the carry-over even
+      got an automatic "this round only grew the denominator" warning. **It was punishing the best discovery path.**
+      Widening (filing rows indiscriminately) and something hit while digging are different — the latter is a product of real work.
     """
     r = STATE.get("surface", {}).get(name)
     if r is None:
@@ -878,13 +883,13 @@ def incidental_count():
 
 def surface_set(name, status, why=""):
     if status not in STATUS:
-        return f"status 는 {STATUS} 중 하나."
-    STATE["surface"].setdefault(name, {"status": "미분석", "kind": "ad-hoc",
+        return f"status is one of {STATUS}."
+    STATE["surface"].setdefault(name, {"status": "unanalysed", "kind": "ad-hoc",
                                       "reach": "unknown", "why": ""})
     STATE["surface"][name]["status"] = status
-    if status != "미분석":
+    if status != "unanalysed":
         STATE["surface"][name].pop("blocked", None)
-        # 판정된 행의 '다음 걸음'은 무의미하다 — 남겨두면 다음 회차가 죽은 걸음을 집는다.
+        # A decided row's 'next step' is meaningless — left in place, the next round picks up a dead step.
         STATE["surface"][name].pop("next", None)
     if why:
         STATE["surface"][name]["why"] = why
@@ -894,18 +899,18 @@ def surface_set(name, status, why=""):
 
 
 def _settle(vid, tgt, status, why=""):
-    """판정을 **전수 표에 올바른 키로** 반영한다.
+    """Reflect a verdict into the **census table under the right key.**
 
-    ★ 예전엔 `surface_set(tgt, ...)` 하나였다. 전수 표의 키는 에이전트가 등재한 **id**
-      (예: `MJ_CREATE_0x18001b864`)인데 `tgt` 은 **주소**(`0x18001B864`)다.
-      `surface_set` 이 setdefault 라 주소 키로 **새 행이 생기고** 원래 행은 영원히
-      미분석으로 남았다 — 분모는 부풀고 분자는 안 오른다.
-      cng.sys 회차가 25건을 판정하고도 커버리지 **13/42(31%)** 로 찍혔다 (실제 25/27).
-      MIN_COVERAGE 를 켜면 만족 불가능한 게이트가 된다.
+    ★ This used to be a single `surface_set(tgt, ...)`. The census table's key is the **id** the agent
+      filed (e.g. `MJ_CREATE_0x18001b864`), but `tgt` is an **address** (`0x18001B864`).
+      `surface_set` is a setdefault, so the address key **created a new row** and the original row stayed
+      unanalysed forever — the denominator inflates and the numerator never rises.
+      A cng.sys round decided 25 items and was still printed at coverage **13/42 (31%)** (really 25/27).
+      With MIN_COVERAGE turned on it becomes an unsatisfiable gate.
 
-    규칙: id 가 표에 있으면 그것을, tgt 도 이미 표에 있으면 같이 표시한다.
-          **판정이 전수 표에 새 행을 만들지 않는다.** 둘 다 없을 때만 하나 만든다
-          (조용히 버리지 않기 위해서다).
+    Rule: if the id is in the table use it, and if tgt is also already in the table mark it too.
+          **A verdict does not create new rows in the census table.** Only when neither exists is one created
+          (so that nothing is silently dropped).
     """
     keys = [k for k in (vid, tgt) if k and k in STATE["surface"]]
     if not keys:
@@ -927,7 +932,7 @@ def _scope_of(k):
 
 
 def _scope_open(k):
-    """아직 판정 안 된 후보를 돌려준다. 스코프 선언이 없으면 None (=선언부터 하라)."""
+    """Return the candidates not yet decided. None if there is no scope declaration (= declare it first)."""
     sc = _scope_of(k)
     if not sc:
         return None
@@ -935,10 +940,10 @@ def _scope_open(k):
 
 
 def _scope_mark(k, item_label, sink_va, vid):
-    """기각 하나가 후보 **하나**를 닫는다. 매칭은 명시(item=) 또는 sink VA 일치만 인정한다.
+    """One rejection closes **one** candidate. Only an explicit match (item=) or a matching sink VA counts.
 
-    ★ 문자열 유사도로 추측 매칭하지 않는다. 잘못 매칭하면 안 본 후보가 판정된 것으로
-      둔갑하는데, 그건 이 하니스가 반복해서 밟은 바로 그 함정이다(조용한 오답).
+    ★ It does not guess matches by string similarity. A wrong match passes off an unseen candidate as
+      decided, and that is exactly the trap this harness has stepped in repeatedly (a quiet wrong answer).
     """
     sc = _scope_of(k)
     if not sc:
@@ -956,30 +961,30 @@ def _scope_mark(k, item_label, sink_va, vid):
 
 
 def _settle_reject(vid, tgt, claim, item_label, sink_va):
-    """★ R-A: **기각은 표면 행을 닫지 않는다.**
+    """★ R-A: **a rejection does not close a surface row.**
 
-    측정(2026-08-31): 기각된 표면 73건 중 **73건이 주장 1개로 닫혔다.** 경쟁 주장을 둘 이상
-    세우고 닫힌 표면은 하나도 없었다. 실제 사례 `FDO.MAJOR.READ@0x14000d2d0` — 공유 분류기의
-    싱크 **한 개**를 반박하고 major 핸들러 **전체**를 기각했는데, 같은 회차의 자기 노트에
-    "CopyIoBuffer/MapIoBuffer/MakeSafeMdl 는 아직 안 봤다"고 적혀 있었다.
+    Measured (2026-08-31): of 73 rejected surfaces, **73 were closed by a single claim.** Not one surface
+    was closed after two or more competing claims were raised. A real case, `FDO.MAJOR.READ@0x14000d2d0` —
+    it rebutted **one** sink of a shared classifier and rejected the **entire** major handler, while the
+    same round's own note said "CopyIoBuffer/MapIoBuffer/MakeSafeMdl not looked at yet".
 
-    그래서 표면이 `기각`이 되는 조건을 셋으로 못 박는다:
-      ① `verdict(action='scope', ...)` 로 **후보 집합을 먼저 선언**했고
-      ② 그 후보가 **전부** 판정됐거나
-      ③ `action='exhaust'` (그건 기각이 아니라 방법 소진이다)
-    조건이 안 차면 표면은 **미분석(blocked)** 으로 남는다 — 주장은 죽었지만 표면은 안 죽었다.
+    So the conditions for a surface to become `rejected` are pinned to three:
+      ① a **candidate set was declared first** with `verdict(action='scope', ...)`, and
+      ② **every** one of those candidates has been decided, or
+      ③ `action='exhaust'` (that is not a rejection but an exhausted method)
+    If the conditions are not met the surface stays **unanalysed (blocked)** — the claim died but the surface did not.
     """
     keys = [k for k in (vid, tgt) if k and k in STATE["surface"]] or [tgt or vid]
     out = []
     for k in keys:
         row = STATE["surface"].setdefault(
-            k, {"status": "미분석", "kind": "ad-hoc", "reach": "unknown", "why": ""})
+            k, {"status": "unanalysed", "kind": "ad-hoc", "reach": "unknown", "why": ""})
         row["claims_rejected"] = int(row.get("claims_rejected") or 0) + 1
         row.setdefault("rejected_claims", []).append({"vid": vid, "claim": (claim or "")[:120]})
         hit = _scope_mark(k, item_label, sink_va, vid)
         rest = _scope_open(k)
         if rest is None:
-            row["status"] = "미분석"
+            row["status"] = "unanalysed"
             row["blocked"] = True
             row["why"] = ("%d claims were rejected but NO CANDIDATE SET WAS DECLARED - the "
                           "surface does not close. Declare this surface's denominator first with "
@@ -987,41 +992,41 @@ def _settle_reject(vid, tgt, claim, item_label, sink_va):
                           % (row["claims_rejected"], k))
             out.append((k, "no_scope", None))
         elif rest:
-            row["status"] = "미분석"
+            row["status"] = "unanalysed"
             row["blocked"] = True
-            row["why"] = ("주장 %d건 기각 · 후보 %d/%d 판정 — **남은 후보: %s**"
+            row["why"] = ("%d claims rejected · %d/%d candidates decided — **remaining candidates: %s**"
                           % (row["claims_rejected"],
                              len(_scope_of(k)["items"]) - len(rest),
                              len(_scope_of(k)["items"]),
                              ", ".join(it["label"] for it in rest[:6])))
             out.append((k, "partial", rest))
         else:
-            surface_set(k, "기각", (claim or "")[:120])
+            surface_set(k, "rejected", (claim or "")[:120])
             row["closed_by_scope"] = True
             out.append((k, "closed", hit))
     return out
 
 
 def coverage():
-    """**판정률** — 확정/기각/반박됨만 센다. blocked 는 성과가 아니므로 안 센다."""
+    """**Decision rate** — counts only confirmed/rejected/refuted. blocked is not an achievement, so it is not counted."""
     tot = len(STATE["surface"])
     if not tot:
         return 0.0, 0, 0
     done = sum(1 for v in STATE["surface"].values()
-               if v["status"] in ("확정", "기각", "반박됨", "경계보류"))
+               if v["status"] in ("confirmed", "rejected", "refuted", "boundary-held"))
     return done / tot, done, tot
 
 
 def code_coverage():
-    """★ **실제 코드 커버리지.** `coverage()` 와 재는 것이 다르다.
+    """★ **Actual code coverage.** It measures something different from `coverage()`.
 
-    `coverage()` = 판정/표면 인데, **표면은 에이전트가 스스로 채운다.**
-    즉 자기가 고른 분모에 대한 비율이라 "얼마나 감사했나"가 아니라
-    "적어둔 걸 정리했나"를 잰다. 진입점 16개를 적고 17건을 판정하면 57% 가 되지만,
-    그 뒤에 도달 가능한 함수가 394개면 실제로 본 건 8% 다 (ahcache 실측).
+    `coverage()` = verdicts / surface, but **the agent fills the surface itself.**
+    So it is a ratio over a denominator it picked itself, measuring not "how much was audited" but
+    "did it tidy up what it wrote down". Write 16 entry points and decide 17 items and it reads 57%,
+    but if 394 functions are reachable behind them, what was actually seen is 8% (measured on ahcache).
 
-    반환 (rate, 본 함수, 도달가능 함수). 인덱스가 없으면 (None,0,0).
-    ※ 직접호출 그래프만 쓰므로 도달가능 수는 **하한**이다(점프표·guard_dispatch_icall 누락).
+    Returns (rate, functions seen, reachable functions). (None,0,0) if there is no index.
+    ※ It uses only the direct-call graph, so the reachable count is a **lower bound** (jump tables and guard_dispatch_icall are missed).
     """
     try:
         import tools as _T, pe as _PE
@@ -1029,16 +1034,17 @@ def code_coverage():
         if not ix:
             return (None, 0, 0)
         nm = {cva: n for cva, n in ix.byva}
-        # ★ 2026-09-05 — **키 공간이 섞여 있었다.** `ix.out` 과 아래 `touched` 는 **심볼 이름(str)**
-        #   키인데, `surface[].entry` 는 **VA(int)** 다. 그대로 씨앗으로 넣으면
-        #   `ix.out.get(<int>)` 이 항상 None 이라 폐포가 한 번도 안 커지고,
-        #   마지막 교집합 `touched(이름들) & seen(정수들)` 이 **영원히 공집합**이다 ⇒ 늘 0%.
+        # ★ 2026-09-05 — **the key spaces were mixed.** `ix.out` and `touched` below are keyed by
+        #   **symbol name (str)**, but `surface[].entry` is a **VA (int)**. Fed in as seeds as-is,
+        #   `ix.out.get(<int>)` is always None so the closure never grows once, and the final
+        #   intersection `touched(names) & seen(ints)` is **empty forever** => always 0%.
         #
-        #   ★★ 이건 내가(관찰자) 만든 회귀다. 02:31 에 `entry` 를 채우는 배선을 넣으면서
-        #   **소비자를 안 고쳤다.** 그전엔 `entry` 가 늘 비어 있어 아래 이름 휴리스틱 폴백이
-        #   돌았고, 그래서 증상이 없었다. 즉 **필드를 올바르게 채우는 것이 게이트를 무장시켰다.**
-        #   (msquic 회차가 `(0.0, 0, 20)` 을 그대로 재현해 진단했다. 그 진단이 맞다.)
-        #   ⇒ 씨앗을 **그래프의 키 공간으로 정규화**한다. 함수 시작이 아니면 경계로 접는다.
+        #   ★★ This is a regression I (the observer) introduced. At 02:31, while adding the wiring that
+        #   fills `entry`, I **did not fix the consumer.** Before that `entry` was always empty, so the
+        #   name-heuristic fallback below ran, and there was no symptom. In other words **filling the
+        #   field correctly is what armed the gate.**
+        #   (The msquic round reproduced `(0.0, 0, 20)` exactly and diagnosed it. That diagnosis is right.)
+        #   => normalise the seeds **into the graph's key space.** If it is not a function start, fold it to the bounds.
         _t0 = STATE.get("target") or ""
         _pe0 = None
         if _t0 and os.path.exists(_t0):
@@ -1095,47 +1101,47 @@ def code_coverage():
 
 
 def mark_interrogated(tgt, v, broke=None, note="", vid=None):
-    """기각 항목에 심문 결과를 박아둔다. **심문 안 받은 기각은 검증된 음성이 아니다** —
-    표본율을 낮추는 것과 커버리지를 부풀리는 것은 다른 일이므로 per-항목으로 남긴다.
+    """Stamp an interrogation result onto a rejection entry. **A rejection that was never interrogated is not a verified negative** —
+    lowering the sample rate and inflating coverage are different things, so it is kept per entry.
 
-    ★ 2026-09-06 실측 — **이 함수가 target 문자열로 행을 찾아 남의 행을 덮고 있었다.**
-      심문은 항상 기각이 기록되기 **전에** 도는 사전 게이트다. 그런데 아래 루프가
-      "같은 target 의 기각"을 먼저 찾아 패치하므로, 후보 집합·형제 행처럼 **target 을
-      공유하는 두 번째 기각부터는**
-        ① 자기 표식을 못 받고(= 미심문으로 남고)
-        ② 자기 심문 결과가 **앞선 행에 찍힌다**(= 조용한 오염).
-      실측: target 을 공유하는 기각이 ahcache 18묶음 59행 · wcifs 12묶음 33행,
-      심문기록을 가진 기각 중 42%(ahcache)가 뒤에 같은 target 기각이 또 온 행이었다.
-      ⇒ **행 id 로 나른다.** id 를 받으면 그 행에만 박고, 없으면 id 키로 stash 한다.
-      (memory `hook-local-dict-is-not-a-transport` 와 같은 계열 — 전달 수단이 행을 식별 못 했다.)
+    ★ Measured 2026-09-06 — **this function found rows by target string and was overwriting other rows.**
+      Interrogation is always a pre-gate that runs **before** the rejection is recorded. But the loop
+      below first looked for "a rejection with the same target" and patched it, so **from the second
+      rejection that shares a target onward** (candidate sets, sibling rows)
+        ① it did not get its own mark (= stayed uninterrogated), and
+        ② its own interrogation result was **stamped onto the earlier row** (= quiet contamination).
+      Measured: rejections sharing a target — ahcache 18 groups / 59 rows · wcifs 12 groups / 33 rows;
+      42% (ahcache) of the rejections carrying an interrogation record were rows later followed by another rejection of the same target.
+      => **carry it by row id.** Given an id, stamp only that row; without one, stash it under the id key.
+      (Same family as memory `hook-local-dict-is-not-a-transport` — the transport could not identify the row.)
     """
     key = str(vid).strip() if vid else None
     for rec in reversed(STATE.get("verdicts") or []):
-        # ★ id 를 받았으면 **그 행만** 고친다. 못 받았으면 아무 행도 고치지 않는다 —
-        #   사전 게이트이므로 지금 맞는 행은 아직 존재하지 않는 것이 정상이다.
-        if key and str(rec.get("id")) == key and rec.get("status") == "기각":
+        # ★ Given an id, fix **only that row.** Without one, fix no row at all —
+        #   this is a pre-gate, so the matching row normally does not exist yet.
+        if key and str(rec.get("id")) == key and rec.get("status") == "rejected":
             rec["interrogated"] = bool(v)
             if v:
                 rec["interrogation"] = {"klass": v.get("klass"),
                                         "reason": (v.get("reason") or "")[:400],
-                                        # ★ 2026-09-05: `broke` 가 없으면 `session_products()`
-                                        #   가 "깨진 기각"과 "심문 통과"를 구분 못 한다.
+                                        # ★ 2026-09-05: without `broke`, `session_products()`
+                                        #   cannot tell "a broken rejection" from "passed interrogation".
                                         "broke": bool(broke) if broke is not None
                                                  else (not v.get("sustained", True))}
             save()
             return True
-    # ★ 심문은 **기각이 기록되기 전에** 도는 사전 게이트다 ⇒ 여기서 찾을 판정이 아직 없다.
-    #   예전엔 bool 만 넣고 아무도 안 꺼내 써서 **심문 결과가 통째로 증발**했다:
-    #   08-31 12:57 회차는 심문 2회를 돌고도 원장에 `rejects_interrogated=0` 으로 찍혔다.
-    #   = "기각이 검증됐는지"를 계기판이 영원히 0으로 보고한다.
+    # ★ Interrogation is a pre-gate that runs **before the rejection is recorded** => there is no verdict to find here yet.
+    #   It used to store only a bool that nobody ever read back, so **the interrogation result evaporated entirely**:
+    #   the 08-31 12:57 round ran two interrogations and was still printed in the ledger as `rejects_interrogated=0`.
+    #   = the dashboard reports "were the rejections verified" as 0 forever.
     STATE.setdefault("pending_interrog", {})[key or tgt] = {
         "ok": bool(v),
-        # ★ 소비 측이 id 로 못 찾고 target 으로 폴백할 때, 그 결과가 정말 이 행 것인지
-        #   판별할 수 있도록 출처를 같이 남긴다.
+        # ★ When the consumer cannot find it by id and falls back to target, the provenance is kept
+        #   alongside so it can tell whether the result really belongs to this row.
         "for_id": key,
         "for_target": str(tgt)[:160],
-        # ★ 2026-09-05: `ok` 는 "심문이 돌았나"이지 "기각이 섰나"가 아니다.
-        #   둘을 안 가르면 `session_products()` 가 **깨진 기각을 산출물로 센다.**
+        # ★ 2026-09-05: `ok` means "did the interrogation run", not "did the rejection stand".
+        #   Without separating the two, `session_products()` **counts a broken rejection as output.**
         "broke": (bool(broke) if broke is not None
                   else (bool(v) and not (v or {}).get("sustained", True))),
         "klass": (v or {}).get("klass"),
@@ -1146,11 +1152,11 @@ def mark_interrogated(tgt, v, broke=None, note="", vid=None):
 
 
 def verified_negatives():
-    """★ **검증된 음성률.** `coverage()` 는 기각을 전부 판정으로 세지만, 게이트가
-    '판정 불가'로 통과시킨 기각은 음성이 아니라 미분석이다 (`ledger.py` 가 스스로
-    "커버리지에서 이건 확정된 음성이 아니다"라고 적어두고도 세어 왔다).
+    """★ **The verified-negative rate.** `coverage()` counts every rejection as a verdict, but a rejection the
+    gate let through as 'undecidable' is not a negative but unanalysed (`ledger.py` itself wrote
+    "for coverage this is not a confirmed negative" and kept counting it anyway).
 
-    반환: (rate, verified, total_rejections). 표본 0이면 rate=None — 비율을 주장하지 않는다.
+    Returns: (rate, verified, total_rejections). With a sample of 0, rate=None — it claims no ratio.
     """
     try:
         import rejaudit as RA
@@ -1158,7 +1164,7 @@ def verified_negatives():
         return (None, 0, 0)
     tot = ver = 0
     for v in STATE.get("verdicts") or []:
-        if (v.get("status") or "") != "기각":
+        if (v.get("status") or "") != "rejected":
             continue
         tot += 1
         if RA.classify(v)[0] == "T0":
@@ -1167,46 +1173,48 @@ def verified_negatives():
 
 
 def settled():
-    """**처리율** — 판정 + '사유가 붙은 blocked'. 종료 게이트는 이걸 본다.
+    """**Settled rate** — verdicts + 'blocked with a reason attached'. The finish gate looks at this.
 
-    ★ 이걸 안 나눠서 게이트가 만족 불가능한 지시를 하고 있었다:
-      can_finish() 는 "blocked 로 사유라도 붙여라"고 하는데 coverage() 는 blocked 를
-      안 세므로, MIN_COVERAGE>0 을 켜면 그 지시를 따라도 영원히 못 끝낸다.
-      MIN_COVERAGE 가 기본 0.0 이라 한 번도 안 켜져서 드러나지 않았다.
-    사유가 붙은 미분석은 **정직한 미분석**이다 — 끝낼 수는 있게 하되, 성과로는 안 센다.
+    ★ Without this split the gate was issuing an unsatisfiable instruction:
+      can_finish() says "at least attach a reason with blocked", but coverage() does not count
+      blocked, so with MIN_COVERAGE>0 turned on you could follow that instruction and never finish.
+      MIN_COVERAGE defaults to 0.0 and was never turned on, so it never surfaced.
+    Unanalysed with a reason attached is **honest unanalysed** — it lets you finish, but does not count as an achievement.
     """
     tot = len(STATE["surface"])
     if not tot:
         return 0.0, 0, 0
-    # ★ R-A 마이그레이션이 되돌린 행은 **처리된 것이 아니다.** 그 행의 `why` 는 분석이 아니라
-    #   마이그레이션 문구다. 이걸 세면 처리율이 시작부터 89%가 되어 종료 게이트가 즉시 만족된다
-    #   — 08-31 15:50 회차가 실제로 그렇게 60분 cap 중 31분만에 스스로 끝났다(판정 0건).
-    #   에이전트가 그 행에 **자기 사유**를 쓰면 `why` 가 덮이므로 이 배제는 자동으로 풀린다.
+    # ★ Rows the R-A migration reverted are **not settled.** Their `why` is not analysis but
+    #   migration wording. Counting them puts the settled rate at 89% from the start and the finish
+    #   gate is satisfied immediately — the 08-31 15:50 round really did end itself that way after
+    #   31 minutes of a 60-minute cap (0 verdicts). Once the agent writes **its own reason** on such
+    #   a row, `why` is overwritten and this exclusion lifts automatically.
     def _migrated(v):
-        return v.get("reopened_by") and str(v.get("why", "")).startswith("R-A 재개")
+        return v.get("reopened_by") and str(v.get("why", "")).startswith("R-A reopen")
     n = sum(1 for v in STATE["surface"].values()
-            if v["status"] in ("확정", "기각", "반박됨", "경계보류")
+            if v["status"] in ("confirmed", "rejected", "refuted", "boundary-held")
             or (v.get("blocked") and not _migrated(v)))
     return n / tot, n, tot
 
 
-# ★ 2026-09-04 실측: 옛 구현은 `[:limit]` = **dict 삽입 순서 0~7** 이었다.
-#   wcifs 미분석 560행 중 등재 순번 0~7 만 나오고 **552행은 한 번도 안 보였다**.
-#   ahcache 도 같다 (fn0~fn7 고정) — 그런데 확정 3건은 전부 fn8·fn10 근처에서 나왔다.
-#   이 목록은 `status_block` 에 실려 **툴 4회마다 + 모든 verdict 뒤**, 회차당 45회쯤 주입되고
-#   회차를 넘어도 같은 8행이었다. 콜드스타트 편향의 극단형 — 새로 등재된 행은 **회수될
-#   기회 자체가 없다**. (worklist 만 점수로 고르는데 그건 회차당 1회 실린다. 45:1 로 편향이 이긴다.)
+# ★ Measured 2026-09-04: the old implementation was `[:limit]` = **dict insertion order 0-7.**
+#   Of wcifs's 560 unanalysed rows only filing positions 0-7 appeared and **552 rows were never seen.**
+#   ahcache was the same (fixed at fn0-fn7) — yet all 3 confirmations came from around fn8 and fn10.
+#   This list rides in `status_block` and is injected **every 4 tools + after every verdict**, about 45
+#   times per round, and it was the same 8 rows across rounds too. The extreme form of cold-start bias —
+#   a newly filed row **never even gets a chance to be picked up.** (Only the worklist picks by score,
+#   and it is shown once per round. At 45:1 the bias wins.)
 #
-# 대체안: ① 남은 것의 **구성**을 먼저 보여주고(8행보다 정보량이 크다)
-#         ② 표본은 호출마다 **창을 밀어** 회차 안에서 전체를 훑는다.
-#   점수축(worklist)을 쓰지 않는 이유 — 그건 "등급을 움직이는 행"을 고르는 축이고,
-#   여기서 답할 질문은 "아직 안 본 것이 무엇인가"라 목적이 다르다. 우선순위를 두 번
-#   겹치면 그 자체가 새 편향이 된다.
+# The replacement: ① show the **composition** of what is left first (more information than 8 rows),
+#         and ② **slide the window** on every call so the sample sweeps the whole set within a round.
+#   Why not use the score axis (worklist) — that axis picks "the rows that move the grade", while
+#   the question here is "what has not been looked at yet", a different purpose. Layering priority
+#   twice would itself become a new bias.
 _UN_CURSOR = [0]
 
 
 def unaudited(limit=8, rotate=True):
-    rows = [k for k, v in STATE["surface"].items() if v["status"] == "미분석"]
+    rows = [k for k, v in STATE["surface"].items() if v["status"] == "unanalysed"]
     if not rows:
         return []
     if not rotate or len(rows) <= limit:
@@ -1214,23 +1222,23 @@ def unaudited(limit=8, rotate=True):
     i = _UN_CURSOR[0] % len(rows)
     _UN_CURSOR[0] = (i + limit) % len(rows)
     out = rows[i:i + limit]
-    if len(out) < limit:                     # 끝을 넘으면 앞으로 감는다
+    if len(out) < limit:                     # past the end, wrap around to the front
         out += rows[:limit - len(out)]
     return out
 
 
 def unaudited_shape():
-    """남은 미분석의 **구성**. 이름 8개보다 이게 더 많은 것을 말해준다."""
+    """The **composition** of the remaining unanalysed rows. This says more than 8 names do."""
     import collections as _c
     c = _c.Counter()
     for _k, v in STATE["surface"].items():
-        if v.get("status") != "미분석":
+        if v.get("status") != "unanalysed":
             continue
         c[(v.get("reach") or "unknown")] += 1
     return c
 
 
-# ── 2) 근거 ───────────────────────────────────────────────────
+# ── 2) grounds ───────────────────────────────────────────────────
 def note_disasm(target):
     STATE["disasm"].add(str(target))
     save()
@@ -1241,10 +1249,10 @@ def has_disasm(target):
     return any(t in d or d in t for d in STATE["disasm"])
 
 
-# ── 3) 시나리오 중복 ──────────────────────────────────────────
+# ── 3) scenario duplication ───────────────────────────────────────
 def _scen(target, claim):
-    """(위치, 가설) 쌍. 같은 함수에 같은 취지의 주장이 다시 오면 같은 시나리오다."""
-    words = sorted(set(re.findall(r'[A-Za-z가-힣]{3,}', (claim or "").lower())))[:12]
+    """A (location, hypothesis) pair. A claim to the same effect arriving again for the same function is the same scenario."""
+    words = sorted(set(re.findall(r'[^\W\d_]{3,}', (claim or "").lower())))[:12]
     return hashlib.sha1((str(target) + "|" + " ".join(words)).encode()).hexdigest()[:12]
 
 
@@ -1259,23 +1267,23 @@ REOPEN_GROUND = {
 
 
 def reopen(gid, ground, why, evidence=""):
-    """묘지 재심. **되살리는 게 아니라 다시 다툴 자격을 준다.**
+    """Graveyard re-examination. **It does not resurrect; it grants the standing to argue again.**
 
-    ★ 2026-09-03 에 만든 이유. `S23-GATE3-DEFAULT-V2` 가 실제 사건이다:
-      주장은 "이 기능 게이트는 기본 DISABLED 다"(값이 무엇인가), 기각 klass 는
-      `not_controlled`("값이 상수다"). 상수라는 것은 그 주장을 **반박하는 게 아니라
-      뒷받침한다.** 그런데 묘지에 들어가 '재개 금지'로 잠겼고, 그 위에 얹힌 OOB 신고가
-      다섯 회차에 걸쳐 다시 올라왔다. 즉 **한 번의 관측이면 끝날 질문이 잠겨 있었다.**
+    ★ Why it was built on 2026-09-03. `S23-GATE3-DEFAULT-V2` is the real incident:
+      the claim was "this feature gate is DISABLED by default" (what the value is), the rejection klass
+      was `not_controlled` ("the value is a constant"). Being a constant **does not rebut that claim, it
+      supports it.** Yet it went into the graveyard locked as 'do not reopen', and an OOB report built on
+      top of it came back up over five rounds. In other words **a question one observation would settle was locked away.**
 
-    ★ 동시에 묘지가 **뚫려 있기도 했다**: `_scen` 이 단어주머니 해시라 표현만 바꾸면
-      다른 시나리오가 된다. 실제로 에이전트가 "세 번째 표현"을 찾는 데 회차를 태웠다.
-      ⇒ 정당한 재심은 열고, 바꿔쓰기는 막는다. 둘은 반대 방향의 결함이다.
+    ★ At the same time the graveyard **was also leaky**: `_scen` is a bag-of-words hash, so changing the
+      wording makes a different scenario. The agent really did burn rounds hunting for "a third phrasing".
+      => open legitimate re-examinations, block rewordings. The two are defects in opposite directions.
     """
     gid = str(gid or "").strip()
     g = next((x for x in STATE.get("graveyard") or [] if str(x.get("id")) == gid), None)
     if g is None:
         ids = [str(x.get("id")) for x in (STATE.get("graveyard") or [])][-8:]
-        return ("묘지에 id=%r 이 없다. 최근 id: %s\nstatus() 의 '묘지' 줄에서 골라라." % (gid, ids))
+        return ("no id=%r in the graveyard. Recent ids: %s\nPick one from the 'graveyard' line of status()." % (gid, ids))
     ground = str(ground or "").strip().lower()
     if ground not in REOPEN_GROUND:
         return ("`reopen` requires ground=. It must be one of these three:\n"
@@ -1307,11 +1315,11 @@ def reopen(gid, ground, why, evidence=""):
         {"ground": ground, "why": why[:500], "t": time.strftime("%m-%d %H:%M"),
          "evidence": str(evidence)[:400]})
     g["reopened"] = True
-    # ★ 2026-09-05 — **재개는 트랙의 "끝났다" 주장을 상하게 한다.** (memory `raw-material-goes-stale`)
-    #   실측: `searchpath-head-injection` 트랙 노트가 *"S48 FINAL v4 — GOAL MET AND THE TRACK IS
-    #   ANSWERED END TO END … closes NEGATIVE"* 인데, 그 축의 S46 이 범위 오류로 재개됐고
-    #   ablation 팔이 같은 축에 열린 질문 3개를 새로 달았다. 그런데 노트는 여전히 모든 다음
-    #   회차에게 "끝났고 음성"이라고 말한다. 지우지 않고 **표시만** 한다 — 판단은 사람·분석가 몫.
+    # ★ 2026-09-05 — **a reopen spoils a track's "it is finished" claim.** (memory `raw-material-goes-stale`)
+    #   Measured: the `searchpath-head-injection` track note says *"S48 FINAL v4 — GOAL MET AND THE TRACK IS
+    #   ANSWERED END TO END … closes NEGATIVE"*, yet S46 on that axis was reopened for a scope error and
+    #   the ablation arm hung 3 new open questions on the same axis. The note still tells every following
+    #   round "finished, and negative". It is not erased, only **marked** — judgement belongs to the human/analyst.
     _CLOSED = ("ANSWERED", "GOAL MET", "CLOSED AS", "closes NEGATIVE", "END TO END", "FINAL")
     for _tn, _t in (STATE.get("tracks") or {}).items():
         _note = str(_t.get("note") or "")
@@ -1333,12 +1341,12 @@ def reopen(gid, ground, why, evidence=""):
 
 
 def gy_origin(entry):
-    """묘지 항목의 출처. 옛 항목은 `origin` 이 없으므로 후보 목록으로 **역추론**한다.
+    """Where a graveyard entry came from. Old entries have no `origin`, so it is **inferred backwards** from the candidate list.
 
-    ★ 둘은 증거 무게가 다르다:
-      refuted — 킬 맨데이트를 가진 **독립 적대자**가 죽였다. 부활에 새 근거를 요구하는 게 맞다.
-      self    — **분석가 자신의 기각**이다. 다음 회차가 다시 보는 것은 정상적인 재심이지
-                "묘지에서의 부활"이 아니다.
+    ★ The two carry different evidential weight:
+      refuted — an **independent adversary** with a kill mandate killed it. Demanding new grounds for a resurrection is right.
+      self    — **the analyst's own rejection.** The next round looking at it again is a normal re-examination,
+                not "a resurrection from the graveyard".
     """
     o = entry.get("origin")
     if o:
@@ -1351,26 +1359,26 @@ def gy_origin(entry):
 
 
 def graveyard_priming(n=12):
-    """★ 시작 프롬프트·상태블록에 실을 묘지 요약. 출처별로 **문구를 가른다.**
+    """★ The graveyard summary carried into the opening prompt and the status block. **The wording is split by origin.**
 
-    옛 문구는 394건 전부에 "CLAIMS ALREADY KILLED (do not resurrect)" 를 붙였다.
-    그중 94%가 분석가 자신의 기각이라, 자기 판정이 적대자 판정과 같은 언어로 되돌아왔다.
+    The old wording stamped "CLAIMS ALREADY KILLED (do not resurrect)" on all 394 rows.
+    Of those, 94 percent were the analyst's own rejections, so its own verdicts came back in the same language as an adversary's.
 
-    선택도 `[-12:]`(최근성) 대신 **klass 층화** — "최근에 뭘 죽였나"가 아니라
-    "어떤 사유로 죽는가"가 전달되어야 다음 회차가 그 사유를 미리 점검한다.
+    Selection is also **stratified by klass** instead of `[-12:]` (recency) — what has to get across is not
+    "what was killed recently" but "for which reasons things die", so the next round checks those reasons up front.
     """
     import collections as _c
     gy = STATE.get("graveyard") or []
     if not gy:
         return ""
-    # ★ 2026-09-10 — **서지 않는 음성을 '죽은 주장' 칸에서 뺀다.**
-    #   09-06 에 등급을 세고 이름까지 불러줬는데도 `reaudit` 호출은 09-07 의 3회가
-    #   마지막이다(09-08·09·10 전 세션 0회). 그 사이 ahcache 의 `broke` 는 17 → 43.
-    #   원인은 **같은 행이 두 칸에 동시에 실리기 때문**이다: 위의 "KILLED / YOUR OWN
-    #   EARLIER REJECTIONS" 목록(길고 먼저 온다)과 아래의 "서 있지 않은 기각"(짧고 뒤에
-    #   온다). 앞 칸이 이기고, 그 행은 닫힌 축으로 읽힌다.
-    #   memory `graveyard-is-not-ground-truth` 의 규칙 그대로다 — *"기각됨"과 "적대자를
-    #   통과한 기각"을 같은 칸에 두지 마라.* 이제 아래 재심 칸에만 실린다.
+    # ★ 2026-09-10 — **take negatives that do not stand out of the 'killed claims' slot.**
+    #   On 09-06 the grades were counted and the rows were even named, yet the last `reaudit`
+    #   calls were the 3 on 09-07 (zero in every session on 09-08, 09 and 10). Meanwhile ahcache's `broke` went 17 → 43.
+    #   The cause is that **the same row was carried in two slots at once**: the "KILLED / YOUR OWN
+    #   EARLIER REJECTIONS" list above (long, comes first) and the "rejections that do not stand" below (short, comes
+    #   after). The first slot wins, and the row reads as a closed axis.
+    #   It is exactly the rule of memory `graveyard-is-not-ground-truth` — *do not put "rejected" and "a rejection that
+    #   survived an adversary" in the same slot.* Now they are carried only in the re-examination slot below.
     try:
         _sc, _srows, _sn = graveyard_trust(limit=10 ** 6)
         _suspect = {str(r["id"]) for r in _srows}
@@ -1391,8 +1399,8 @@ def graveyard_priming(n=12):
         L.append("=== YOUR OWN EARLIER REJECTIONS (%d) — these are VERDICTS, NOT REFUTATIONS. "
                  "Re-examining one is normal re-audit, not resurrection. The interrogator breaks "
                  "%s of rejections it sees, so treat these as provisional ===" % (len(own), "67%"))
-        L.append("  사유 분포: " + " · ".join("%s %d" % kv for kv in by.most_common(8)))
-        # klass 층화 — 사유마다 하나씩
+        L.append("  reason distribution: " + " · ".join("%s %d" % kv for kv in by.most_common(8)))
+        # stratified by klass — one per reason
         seen = set()
         for g in reversed(own):
             k = g.get("klass") or "-"
@@ -1403,25 +1411,25 @@ def graveyard_priming(n=12):
                                              str(g.get("claim"))[:80]))
             if len(seen) >= n - min(len(ref), 6):
                 break
-    # ★ 2026-09-06 — **묘지의 신뢰 등급을 같이 싣는다.**
-    #   실측: 이 표의 `verified`(심문자가 못 깬 음성)는 ahcache 167행 중 54행(32%)뿐인데,
-    #   위 문구는 등급을 구분하지 않고 나갔다. 특히 `broke`/`reopened` 행은
-    #   **철회됐거나 서지 않는 음성**인데 다음 회차에는 닫힌 축으로 보였다 —
-    #   09-06 런은 그렇게 `S77-REDIR-GUARD-ASYM`(심문자가 door_only 로 깨고 분석가가
-    #   수용한 행)을 기각인 채로 남긴 채 예산 만료로 잘렸다. 이름으로 불러준다.
-    _c2, _rows, _n = _sc, _srows, _sn      # ★ 위에서 이미 쟀다 — 두 번 세면 두 값이 갈린다
+    # ★ 2026-09-06 — **carry the graveyard's trust grades as well.**
+    #   Measured: this table's `verified` rows (negatives the interrogator could not break) were only 54 of
+    #   ahcache's 167 (32%), yet the wording above went out without telling the grades apart. In particular the
+    #   `broke`/`reopened` rows are **negatives that were withdrawn or do not stand**, yet the next round saw them as closed axes —
+    #   that is how the 09-06 run left `S77-REDIR-GUARD-ASYM` (a row the interrogator broke as door_only and the analyst
+    #   accepted) sitting as a rejection when it was cut off by budget expiry. They are called out by name.
+    _c2, _rows, _n = _sc, _srows, _sn      # ★ already measured above — counting twice makes the two values diverge
     if _c2:
         L.append("")
-        L.append("=== 이 묘지의 신뢰 등급 — 검증된 음성 %d / 전체 %d ==="
+        L.append("=== this graveyard's trust grades — verified negatives %d / total %d ==="
                  % (_c2.get("verified", 0), sum(_c2.values())))
         L.append("  " + " · ".join("%s %d" % kv for kv in _c2.items() if kv[1]))
-        L.append("  `verified` 만 적대자를 통과한 음성이다. `unexamined` 는 아무도 안 깨본 것이고,")
-        L.append("  `broke`/`reopened` 는 **이미 무너졌는데 철회가 안 된 행**이다 — 재심 1순위다.")
+        L.append("  Only `verified` rows are negatives that survived an adversary. `unexamined` means nobody has tried to break it,")
+        L.append("  and `broke`/`reopened` are **rows that already collapsed but were never withdrawn** — first in line for re-examination.")
     if _rows:
         L.append("")
-        L.append("=== 서 있지 않은 기각 %d건 — 부활이 아니라 **정리**다 ===" % _n)
-        L.append("  ★ 이 %d건은 **위의 '죽은 주장' 목록에서 빼 두었다.** 심문자가 깼거나"
-                 "(broke) 저자가 철회한(reopened) 행이라 닫힌 축으로 읽으면 안 된다." % _n)
+        L.append("=== %d rejections that do not stand — this is **cleanup**, not resurrection ===" % _n)
+        L.append("  ★ These %d rows were **taken out of the 'killed claims' list above.** The interrogator broke them"
+                 " (broke) or their author withdrew them (reopened), so they must not be read as closed axes." % _n)
         for r in _rows[:6]:
             L.append("  [%s] %s (%s) %s — %s"
                      % (r["grade"], r["id"], r.get("klass"), r.get("target", "")[:40],
@@ -1431,15 +1439,15 @@ def graveyard_priming(n=12):
 
 def seen_scenario(target, claim):
     s = _scen(target, claim)
-    # ★ 재심이 열린 시나리오는 막지 않는다. 묘지 항목과 후보는 id 로 이어져 있다.
+    # ★ A scenario with a re-examination open is not blocked. Graveyard entries and candidates are linked by id.
     reopened = {str(g.get("id")) for g in (STATE.get("graveyard") or [])
                 if g.get("reopened") and not g.get("rekilled")}
-    # ★ 2026-09-10 — **심문자가 깬 기각(broke)도 막지 않는다.**
-    #   프라이밍은 이 행들을 "서지 않는 음성이니 정리하라"고 내보내는데, 정작 다시 열려고
-    #   하면 이 게이트가 "이미 죽은 시나리오"로 거부했다. 길을 안 대는 거부는 헛돌기를
-    #   만든다(memory `predicate-cannot-ask`). 등급은 `graveyard_trust` 하나에서만 온다 —
-    #   같은 술어를 두 벌 쓰면 두 값이 갈린다.
-    #   ★ 무제한 재제출이 아니다: 반복 미종결은 판결자(`ADJUDICATE_AFTER`)가 닫는다.
+    # ★ 2026-09-10 — **a rejection the interrogator broke (broke) is not blocked either.**
+    #   The priming sends these rows out as "negatives that do not stand, clean them up", yet when someone
+    #   actually tried to reopen one this gate refused it as "an already dead scenario". A refusal that offers no
+    #   way forward produces spinning (memory `predicate-cannot-ask`). The grade comes from `graveyard_trust` alone —
+    #   writing the same predicate twice makes the two values diverge.
+    #   ★ This is not unlimited resubmission: repeated non-closure is closed by the adjudicator (`ADJUDICATE_AFTER`).
     try:
         _, _srows, _ = graveyard_trust(limit=10 ** 6)
         reopened |= {str(r["id"]) for r in _srows if r.get("grade") == "broke"}
@@ -1453,7 +1461,7 @@ def seen_scenario(target, claim):
     return None
 
 
-# ── 4) 판정 ───────────────────────────────────────────────────
+# ── 4) verdicts ───────────────────────────────────────────────────
 def open_candidate(target, claim, basis, evidence, anchors=None):
     cid = f"C{len(STATE['candidates']) + 1}"
     rec = {"id": cid, "target": target, "claim": claim, "basis": basis,
@@ -1466,11 +1474,11 @@ def open_candidate(target, claim, basis, evidence, anchors=None):
 
 
 def close_candidate(rec, state, klass=None, reason="", impact=None):
-    """★ 2026-09-04 두 가지 추가:
-      ① `impact` 보존 — 죽은 확정은 verdict 레코드가 안 생겨 임팩트 3항이 **통째로 사라졌다.**
-         오늘 밤 `impact_unproven` 킬 2건을 사후 감사하려 했을 때 근거가 없었다.
-      ② 묘지 레코드에 `t` — 없어서 날짜로 거르면 **전부 0건**이 나온다.
-         실제로 내가 "오늘 밤 반박자 킬 0건"으로 오독했다(킬은 5건 있었다).
+    """★ Two additions on 2026-09-04:
+      ① keep `impact` — a dead confirmation produces no verdict record, so the three impact items **vanished entirely.**
+         Tonight, trying to audit two `impact_unproven` kills after the fact, there were no grounds to look at.
+      ② a `t` on the graveyard record — without it, filtering by date yields **zero rows every time.**
+         I really did misread it as "zero refuter kills tonight" (there were 5 kills).
     """
     rec["state"] = state
     rec["klass"] = klass
@@ -1478,8 +1486,8 @@ def close_candidate(rec, state, klass=None, reason="", impact=None):
     if impact:
         rec["impact"] = impact
     if state == "refuted":
-        # ★ 재심으로 열렸던 항목이 다시 죽으면 **재심 표시를 닫는다**(rekilled).
-        #   안 그러면 한 번의 재심이 영구 통행증이 된다.
+        # ★ When an item opened for re-examination dies again, **close the re-examination mark** (rekilled).
+        #   Otherwise a single re-examination becomes a permanent pass.
         _prev = next((g for g in (STATE.get("graveyard") or [])
                       if str(g.get("id")) == str(rec.get("id"))), None)
         if _prev is not None and _prev.get("reopened"):
@@ -1489,9 +1497,9 @@ def close_candidate(rec, state, klass=None, reason="", impact=None):
                                    "claim": rec["claim"][:120], "klass": klass,
                                    "reason": reason[:300],
                                    "impact": rec.get("impact"),
-                                   "origin": "refuted",     # 독립 적대자가 죽였다
+                                   "origin": "refuted",     # killed by an independent adversary
                                    "t": time.strftime("%m-%d %H:%M")})
-        _settle(rec.get("id"), rec["target"], "반박됨", f"{klass}: {reason[:70]}")
+        _settle(rec.get("id"), rec["target"], "refuted", f"{klass}: {reason[:70]}")
     save()
 
 
@@ -1506,7 +1514,7 @@ def _pe_for_gates():
 
 
 def _sink_va(rec):
-    """확정의 target/evidence 에서 싱크 VA 를 뽑는다. 없으면 None(=미분석)."""
+    """Pull the sink VA out of a confirmation's target/evidence. None (= unanalysed) if there is none."""
     import re as _re
     for fld in (rec.get("target"), rec.get("evidence")):
         if not fld:
@@ -1517,17 +1525,17 @@ def _sink_va(rec):
     return None
 
 
-# ── ASK — 게이트가 못 정하면 **묻는다** ─────────────────────────
-#   2026-08-29. 그 전까지 게이트는 술어였다: `(ok, note)`. 못 정하면 선택지가
-#   **통과 아니면 거부** 둘뿐이고 둘 다 틀리므로, `⚠ 미검증 기각으로 기록한다` 라는
-#   **경고 문구로 새어나갔다.** 그렇게 샌 것이 262건 중 186건이다.
-#   세 번째 선택지가 필요하다 — **묻는다.** 술어는 못 묻는다. 그래서 반환에 질문을 싣는다.
+# ── ASK — when a gate cannot decide, it **asks** ─────────────────────────
+#   2026-08-29. Until then a gate was a predicate: `(ok, note)`. When it could not decide, the only
+#   choices were **pass or refuse**, both wrong, so it **leaked out as a warning line**:
+#   `⚠ recording as an unverified rejection`. 186 of 262 leaked that way.
+#   A third choice is needed — **ask.** A predicate cannot ask. So the question is carried in the return value.
 #
-#   게이트는 **왜** 못 정했는지 이미 안다 ⇒ 질문이 구체적이고, 다음 방법까지 붙는다.
-#   (지금까지 경고 문구로 쓰던 문장이 그대로 질문이 된다.)
+#   The gate already knows **why** it could not decide => the question is specific, and the next method comes with it.
+#   (The sentences used so far as warnings become the questions as they are.)
 ASK_METHOD = {
-    # ── 컷 일반화(2026-09-04)가 내는 판정들. 안내가 없으면 기본 문구로 떨어지고,
-    #    에이전트는 "무슨 다음 수가 있는지"를 모른 채 같은 짝을 다시 낸다.
+    # ── verdicts produced by the cut generalisation (2026-09-04). Without guidance they fall through to
+    #    the default wording, and the agent re-submits the same pair not knowing "what next moves there are".
     "not_a_cut":
         "The declared guards are NOT a cut: removing all of them still leaves a path from the "
         "function entry to the sink, i.e. there is a way in that crosses none of your guards. "
@@ -1548,13 +1556,13 @@ ASK_METHOD = {
         "the branch whose failure arm actually leaves (usually the LAST comparison of a chain), "
         "or declare the whole set with `guards=` if the invariant is established by several "
         "blocks together.",
-    # ★ 2026-09-04, 원장 33건(answered) 을 읽고 고쳤다. 이 벽이 답해진 질문의 **85%** 다.
-    #   그리고 결말이 **정반대 둘**로 갈린다 — 옛 문구는 그중 하나로 가는 길만 안내했다:
-    #     (1)(2) 는 둘 다 "어딘가에 가드가 있다"를 전제한다. 그런데 실제로 답해진 것의
-    #     절반 가까이는 **"가드가 없어서 결함"** 이었다(S11-P3b probe 범위 불일치,
-    #     S15-AM1c AccessMode=KernelMode, S15-C2 RemoveEntryList 임의쓰기, S20 feature-off …).
-    #   소진 기록이 그 대가를 보여준다: "게이트가 제시한 두 경로를 모두 시도했다 …
-    #   이 싱크를 제약하는 분기는 하나뿐" — **없는 가드를 찾다 죽었다.**
+    # ★ 2026-09-04, fixed after reading the ledger's 33 (answered) rows. This wall is **85%** of the answered questions.
+    #   And the outcomes split into **two opposites** — the old wording only showed the road to one of them:
+    #     (1)(2) both assume "there is a guard somewhere". Yet nearly half of what was actually
+    #     answered was **"no guard, hence a defect"** (S11-P3b probe range mismatch,
+    #     S15-AM1c AccessMode=KernelMode, S15-C2 RemoveEntryList arbitrary write, S20 feature-off …).
+    #   The exhaustion records show the price: "tried both paths the gate offered …
+    #   only one branch constrains this sink" — **they died looking for a guard that was not there.**
     "dominates_only":
         "The value the guard reads never reaches the sink operand. The gate cannot tell WHICH "
         "of two opposite things this is, so answer that first:\n"
@@ -1621,7 +1629,7 @@ ASK_METHOD = {
 
 
 def asks(status="open"):
-    """ASK 큐. `status=None` 이면 전부."""
+    """The ASK queue. `status=None` means all of it."""
     return [q for q in (STATE.get("asks") or [])
             if status is None or q.get("status") == status]
 
@@ -1634,7 +1642,7 @@ def _ask_open(tgt):
 
 
 def _ask_close(tgt, vid, how="answered", note=""):
-    """질문을 닫는다. **판정이 나면 자동으로 닫힌다** — 안 그러면 큐가 영원히 자란다."""
+    """Close a question. **A verdict closes it automatically** — otherwise the queue grows forever."""
     n = 0
     for q in (STATE.get("asks") or []):
         if q.get("target") == tgt and q.get("status") == "open":
@@ -1647,22 +1655,22 @@ def _ask_close(tgt, vid, how="answered", note=""):
     return n
 
 
-# ── 깨진 기각 기록부 (원장 **밖**) ────────────────────────────
-# ★ 왜 원장 밖인가: 지휘자는 `state/*.json` 전체를 읽는다. 깨진 기각을 거기 넣으면
-#   회차마다 수십 건씩 늘어 지휘자가 읽을 것이 폭증한다. 그런데 이 기록의 소비자는
-#   지휘자가 아니라 **다음 회차의 분석가**다 — 그래서 매체를 가른다.
+# ── the broken-rejection register (**outside** the ledger) ────────────────────────────
+# ★ Why outside the ledger: the conductor reads all of `state/*.json`. Putting broken rejections there
+#   would add dozens per round and explode what the conductor has to read. But the consumer of this
+#   record is not the conductor, it is **the next round's analyst** — so the medium is split.
 #
-# ★ 왜 필요한가 (실측 2026-09-04): 심문자가 기각을 깬 것이 **213건**인데
-#   원장에 사유가 남은 것은 11건이고 그마저 klass 가 비어 있다.
-#   `mark_interrogated()` 가 **sustained 분기에서만** 불리기 때문이다 —
-#   깨진 기각은 판정으로 기록되지 않으니 붙일 행이 없다.
-#   사유는 `work/transcript.*.log` 로 갔는데 그 파일은 **회차마다 truncate** 된다.
-#   ⇒ 213개의 "왜 이 기각이 안 서는가"가 흔적 없이 사라졌다. 그중에는 새 리드도 있었다
-#     (살아남은 1줄에도 `AhcDispatch` 의 unprobed 0x1B8 memcpy 가 딸려 있었다).
+# ★ Why it is needed (measured 2026-09-04): the interrogator broke **213** rejections, yet
+#   only 11 left a reason in the ledger, and even those had an empty klass.
+#   Because `mark_interrogated()` is called **only on the sustained branch** —
+#   a broken rejection is not recorded as a verdict, so there is no row to attach it to.
+#   The reasons went to `work/transcript.*.log`, and that file is **truncated every round.**
+#   => 213 answers to "why does this rejection not stand" vanished without a trace. Some were new leads
+#     (even the one surviving line carried an unprobed 0x1B8 memcpy in `AhcDispatch`).
 def _break_dir():
-    """★ 네임스페이스를 따른다. 안 따르면 **벤치·scratch 가 프로덕션 기록에서 학습**한다 —
-    `_lesson_ledgers` 는 이미 그렇게 고쳤는데 여기만 빠져 있었다(T39 가 그걸로 터졌다).
-    같은 사고가 08-24 에 벤치→pcw.sys 원장 오염으로 이미 났다."""
+    """★ Follows the namespace. Otherwise **bench/scratch learns from production records** —
+    `_lesson_ledgers` had already been fixed that way, and only this place was missed (T39 blew up on it).
+    The same accident already happened on 08-24 as bench→pcw.sys ledger contamination."""
     d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports", "breaks")
     if PROVENANCE != "prod":
         d = os.path.join(d, "_" + PROVENANCE)
@@ -1670,34 +1678,34 @@ def _break_dir():
 
 
 def _break_path(image=None):
-    """★ 파일 키는 **이미지**다(표적 함수가 아니다). 함수로 가르면 표적마다 수백 개의
-    한 줄짜리 파일이 생기고 누적이라는 목적 자체가 사라진다. 함수명은 행 안에 들어간다."""
+    """★ The file key is the **image** (not the target function). Splitting by function creates hundreds of
+    one-line files per target and defeats the whole point of accumulation. The function name goes inside the row."""
     _d = _break_dir()
     os.makedirs(_d, exist_ok=True)
     return os.path.join(_d, _key(image or STATE.get("target") or "unknown") + ".jsonl")
 
 
-# ★ 2026-09-07 — 리드 큐와 재제출 큐를 **갈라야 한다.**
-#   실측(누적 71건): wrong_pair 28(39%) · other_constructor 11 · bound_wrong 11 ·
+# ★ 2026-09-07 — the lead queue and the refile queue **must be split.**
+#   Measured (71 cumulative): wrong_pair 28 (39%) · other_constructor 11 · bound_wrong 11 ·
 #   indirect_entry 7 · door_only 5 · window_too_short 5 · not_measured 4.
-#   `break_digest` 자신이 적어둔 해석대로 `wrong_pair` 는 **분석가가 엉뚱한 짝을 냈다**는
-#   서류 문제이지 리드가 아니다. 둘을 섞어 두니 실질 리드 20건이 71건처럼 보이고,
-#   그러면 "큐 소진"이 불가능한 목표로 보여 아무도 손대지 않는다.
+#   By `break_digest`'s own interpretation, `wrong_pair` is a paperwork problem — **the analyst submitted the wrong
+#   pair** — not a lead. Mixed together, 20 real leads look like 71,
+#   and then "draining the queue" looks like an impossible goal, so nobody touches it.
 _REFILE_KLASS = {"wrong_pair"}
 
 
 def break_kind(klass):
-    """break 한 건이 **리드**인가 **재제출**인가. klass 하나로 갈린다."""
+    """Is one break a **lead** or a **refile**? A single klass decides it."""
     return "refile" if (klass or "") in _REFILE_KLASS else "lead"
 
 
-_BREAK_ESCALATE_AT = 3          # 같은 표적에서 이 횟수째 파손이면 승격한다
+_BREAK_ESCALATE_AT = 3          # escalate at this many breaks on the same target
 
 
 def _break_key(target, claim=""):
-    """파손을 **표적 정체**로 묶는 키. 이름이 바뀌어도 같은 행으로 잡힌다.
+    """The key that groups breaks by **target identity.** A renamed row is still caught as the same row.
 
-    반환: {정규화한 함수명} | {문자열에서 뽑은 VA}. 교집합이 있으면 같은 행.
+    Returns: {normalised function name} | {VAs pulled from the strings}. Any intersection means the same row.
     """
     t = str(target or "").lower()
     out = set()
@@ -1711,13 +1719,13 @@ def _break_key(target, claim=""):
 
 
 def record_break(target, v, args=None, kind="interrogator"):
-    """깨진 기각 하나를 append 한다. **STATE 를 건드리지 않는다** — 지휘자 부하 0.
+    """Append one broken rejection. **Does not touch STATE** — zero load on the conductor.
 
-    누적된다(회차마다 지워지지 않는다). 그게 이 파일의 존재 이유다.
+    It accumulates (it is not wiped each round). That is the reason this file exists.
 
-    ★ 2026-09-07 — `id` 와 `status` 를 같이 박는다. 없으면 큐가 **줄지 않는다**:
-      답한 것과 안 답한 것이 구분되지 않아 매 회차 같은 것을 다시 보여주거나,
-      `B[-n:]` 에 밀려 영영 안 보이거나 둘 중 하나다(둘 다 실제로 일어났다).
+    ★ 2026-09-07 — `id` and `status` are stamped with it. Without them the queue **never shrinks**:
+      answered and unanswered cannot be told apart, so either every round shows the same rows again,
+      or they get pushed out of `B[-n:]` and are never seen again (both really happened).
     """
     a = args or {}
     bid = "%s-%s" % (time.strftime("%m%d%H%M%S"), uuid.uuid4().hex[:4])
@@ -1732,16 +1740,16 @@ def record_break(target, v, args=None, kind="interrogator"):
            "rejected_as": a.get("klass"),
            "vid": a.get("id"),
            "guard": a.get("guard"), "sink": a.get("sink")}
-    # ★ 2026-09-23 — **표적 단위 반복 카운터.**
-    #   ★ 처음엔 판정 id(vid)로 셌는데 **한 번도 안 걸린다**: 실제 루프는 id 를 바꿔가며
-    #     돈다 — mrxsmb 09-22 밤의 그 행은 `QUIC-RECV-SEED-001 → -R2 → -R3 → -R4 → -R5`
-    #     로 이름을 갈아입었다. 그래서 키를 **표적 정체**로 잡는다: 모듈 접두사와 주소를
-    #     떼어낸 함수명 + 문자열에서 뽑은 VA 집합. 둘 중 하나라도 겹치면 같은 행으로 본다.
-    #     (그 밤의 실측: 파손 20건 중 **10건이 한 함수** — 이름 4건은 VA 가 없었고
-    #      6건은 `mrxsmb!SmbQuicReceiveEx@0x140052860` 이었다. 이름축이 없으면 4건을 놓친다.)
-    #   ★ 큐 값은 {lead, refile} 그대로 둔다 — 새 큐 값을 만들면 `open_leads(queue="lead")`
-    #     가 그 행들을 **어느 큐에서도 못 보게** 된다(큐가 두 종류를 섞는 그 병).
-    #     대신 반복 행은 서류 큐에서 꺼내 **lead 로 되돌리고** 도장을 찍는다.
+    # ★ 2026-09-23 — **a per-target repeat counter.**
+    #   ★ It first counted by verdict id (vid), and **it never fired once**: the real loop runs while
+    #     changing ids — that row from the mrxsmb night of 09-22 changed its name as `QUIC-RECV-SEED-001 → -R2 → -R3 → -R4 → -R5`.
+    #     So the key is **target identity**: the function name with the module prefix and the address
+    #     stripped + the set of VAs pulled from the strings. If either overlaps, it is treated as the same row.
+    #     (Measured that night: **10 of 20 breaks were one function** — 4 by name had no VA, and
+    #      6 were `mrxsmb!SmbQuicReceiveEx@0x140052860`. Without the name axis, 4 are missed.)
+    #   ★ The queue value stays {lead, refile} — inventing a new queue value would make `open_leads(queue="lead")`
+    #     **unable to see those rows in any queue** (the very disease of a queue that mixes two kinds).
+    #     Instead a repeat row is taken out of the paperwork queue, **sent back to lead**, and stamped.
     _key = _break_key(target, a.get("claim"))
     _n = 0
     if _key:
@@ -1760,46 +1768,46 @@ def record_break(target, v, args=None, kind="interrogator"):
             _n = 0
     row["attempt"] = _n + 1
     if _n + 1 >= _BREAK_ESCALATE_AT:
-        # ★ 2026-09-23 (2판) — **`queue` 를 변조하지 않는다.**
-        #   첫 판은 refile→lead 로 덮었는데, `break_digest` 가 그 칸으로 "재제출 대기 N"
-        #   을 세고 있어서 집계가 깨졌다(test_breaks 가 잡았다). 라벨을 덮는 대신
-        #   **도장을 따로 찍고** `open_leads` 가 그 도장을 보게 한다 — 정보를 안 버린다.
+        # ★ 2026-09-23 (2nd edition) — **do not tamper with `queue`.**
+        #   The first edition overwrote refile→lead, but `break_digest` counts "awaiting refile N" from that
+        #   field, so the tally broke (test_breaks caught it). Instead of overwriting the label,
+        #   **stamp separately** and have `open_leads` look at the stamp — no information is thrown away.
         row["escalated"] = True
         row["escalate_hint"] = (
-            "이 표적에서 %d번째 파손이다. 라벨을 다섯 번째로 고쳐 쓰지 마라 — "
-            "빠진 것은 **관측**일 가능성이 높다. `verdict(action='gate_blocked', "
-            "gate='needs-measurement', …)` 로 봉하고 그 관측을 요구하라." % (_n + 1))
+            "This is break number %d on this target. Do not rewrite the label a fifth time — "
+            "what is missing is most likely **an observation.** Seal it with `verdict(action='gate_blocked', "
+            "gate='needs-measurement', …)` and demand that observation." % (_n + 1))
     try:
         with open(_break_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as e:
-        sys.stderr.write("\033[93m[breaks] 기록 실패: %s\033[0m\n" % e)
+        sys.stderr.write("\033[93m[breaks] write failed: %s\033[0m\n" % e)
         return None
     return row
 
 
-# ★ 리드가 닫히는 길은 **셋뿐**이다. 여기에 `exhausted` 는 없다 —
-#   ASK 가 정확히 그 출구로 샜다(생성 395 · 답함 41(10%) · **소진 194(49%)**,
-#   09-04 하루에만 81건이 소진으로 닫혔고 그날 답한 것은 2건이다).
-#   소진 압력을 걸면 답이 아니라 포기가 나온다는 것이 이 원장의 실측이다.
+# ★ There are **only three** ways a lead closes. `exhausted` is not one of them —
+#   ASK leaked out through exactly that exit (395 created · 41 answered (10%) · **194 exhausted (49%)**;
+#   on 09-04 alone 81 were closed as exhausted, while 2 were answered that day).
+#   This ledger's measurement is that pressure to exhaust produces giving up, not answers.
 CLOSE_HOWS = {
-    "refuted":        "반박자가 이 축의 확정을 죽였다 (적대자가 판단했다)",
-    "measured":       "실측이 갈랐다 (대조 통과한 관측이 있다)",
-    "reinterrogated": "다시 기각을 냈고 심문자가 이번엔 **못 깼다**",
+    "refuted":        "the refuter killed the confirmation on this axis (an adversary judged it)",
+    "measured":       "a measurement split it (there is an observation that passed its controls)",
+    "reinterrogated": "the rejection was filed again and this time the interrogator **could not break it**",
 }
 
 
 def close_break(bid, how, why="", image=None):
-    """리드 한 건을 닫는다. **append-only** — 닫힘도 한 줄로 쌓는다.
+    """Close one lead. **Append-only** — a closure is stacked as one more line too.
 
-    ★ 파일을 다시 쓰지 않는 이유: 같은 이미지에 병렬 회차가 append 한다.
-      재작성하면 그 사이의 append 를 통째로 날린다.
+    ★ Why the file is not rewritten: parallel rounds append to the same image.
+      Rewriting it would wipe out every append made in between.
     """
     how = (how or "").strip().lower()
     if how not in CLOSE_HOWS:
-        return ("[CLOSE REFUSED] how=%r 은 리드를 닫는 길이 아니다. 셋뿐이다:\n"
+        return ("[CLOSE REFUSED] how=%r is not a way to close a lead. There are only three:\n"
                 % how + "\n".join("  · %s — %s" % kv for kv in CLOSE_HOWS.items())
-                + "\n소진(exhausted)은 없다. 못 닫으면 열어 둔 채로 두는 것이 정직하다.")
+                + "\nThere is no exhausted. If you cannot close it, leaving it open is the honest thing.")
     rec = {"op": "close", "ref": str(bid), "how": how,
            "why": str(why or "")[:600], "t": time.strftime("%Y-%m-%d %H:%M")}
     try:
@@ -1807,27 +1815,27 @@ def close_break(bid, how, why="", image=None):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError as e:
         return "[CLOSE FAILED] %s" % e
-    return "리드 %s 를 `%s` 로 닫았다 — %s" % (bid, how, CLOSE_HOWS[how])
+    return "closed lead %s as `%s` — %s" % (bid, how, CLOSE_HOWS[how])
 
 
-# ── 질문 큐 — **수신자로 가른다** ─────────────────────────────
-# ★ 2026-09-07 실측이 만든 것. 열린 질문 160건의 내역:
-#     분석가가 낸 것 102 → 답함 34(33%) · 소진 64 · **열림 4**
-#     지휘자가 낸 것 293 → 답함  7( 2%) · 소진 130 · **열림 156**
-#   쌓인 160건 중 156건이 지휘자 것이다. 그리고 그중 최소 85건은 표적 분석이 아니라
-#   원장·게이트 감사 질문이다(target 이 아예 `harness / …` 로 시작한다. CQ87 은 본문에
-#   "행동하지 말고 수치로 보고하라"고 못 박혀 있다).
-#   ⇒ 분석가에게 답할 수 없는 질문을 쌓아 놓고 답한 비율을 세고 있었다.
-#     소진 130건의 상당수는 포기가 아니라 **오배송 반송**이다.
+# ── the question queue — **split by recipient** ─────────────────────────────
+# ★ Built from a 2026-09-07 measurement. The breakdown of 160 open questions:
+#     filed by the analyst  102 → answered 34 (33%) · exhausted 64 · **open 4**
+#     filed by the conductor 293 → answered  7 ( 2%) · exhausted 130 · **open 156**
+#   156 of the 160 that piled up belong to the conductor. And at least 85 of those are not target analysis but
+#   ledger/gate audit questions (their target starts with `harness / …` outright. CQ87 nails down in its body:
+#   "do not act, report in numbers").
+#   => questions the analyst cannot answer were being piled up, and the answered ratio was being counted.
+#     Many of the 130 exhausted were not giving up but **returns to sender for misdelivery.**
 _ASK_OPERATOR = re.compile(r'^\s*[\[\(]?\s*harness\b', re.I)
 
 
-# ★ 2026-09-08 — **질문의 출처는 라벨이 아니라 랭킹 축이다.**
-#   실측(전 원장): `by=conductor` 질문은 ahcache **185건 중 answered 0건**, wcifs 87건 중 2건.
-#   게이트·반박자 질문은 같은 원장에서 **32.6% / 18.4%** 가 답해졌다. 그런데 열린 질문의
-#   113/115 가 지휘자 것이라, 회전 창이 돌아도 **보이는 것은 사실상 지휘자 질문뿐**이었다.
-#   그리고 가장 값이 날 질문 — 심문자의 `next_method` — 은 `asks` 에 **한 건도 없다**
-#   (73건이 `reports/breaks/` 에 있고 전부 next_method 를 갖고 있는데 닫힌 건 1건).
+# ★ 2026-09-08 — **a question's origin is not a label but a ranking axis.**
+#   Measured (all ledgers): `by=conductor` questions — **0 answered of 185** for ahcache, 2 of 87 for wcifs.
+#   Gate/refuter questions in the same ledgers were answered at **32.6% / 18.4%.** Yet 113/115 of the
+#   open questions were the conductor's, so even with the rotating window **what was visible was effectively only conductor questions.**
+#   And the question most likely to pay off — the interrogator's `next_method` — has **not a single row** in `asks`
+#   (73 sit in `reports/breaks/`, all carrying a next_method, and 1 has been closed).
 _ASK_BY = ("gate", "refuter", "interrogator", "resisted", "conductor")
 _ASK_BY_ALIAS = {"gate": "gate", "r3": "gate", "reject_gate": "gate",
                  "refuter": "refuter", "refute": "refuter", "rq": "refuter",
@@ -1838,10 +1846,10 @@ _ASK_BY_ALIAS = {"gate": "gate", "r3": "gate", "reject_gate": "gate",
 
 
 def normalize_ask_by(b, aid=""):
-    """질문 출처를 정본 어휘로. 비어 있으면 **id 접두로 역추론**한다(옛 행 소급용).
+    """Normalise a question's origin to the canonical vocabulary. If empty, **infer it back from the id prefix** (to backfill old rows).
 
-    ★ 지어내지 않는다 — 접두가 어휘에 없으면 `gate` 로 떨어진다. 그게 옛 기본값이다
-      (게이트가 판정 불가일 때 만드는 것이 이 큐의 원래 유일한 생산자였다).
+    ★ Nothing is made up — a prefix outside the vocabulary falls to `gate`. That is the old default
+      (originally the only producer of this queue was the gate, when it could not decide).
     """
     tok = str(b or "").strip().lower()
     if tok in _ASK_BY_ALIAS:
@@ -1851,11 +1859,11 @@ def normalize_ask_by(b, aid=""):
 
 
 def ask_yield(state=None):
-    """출처별 **답해진 비율**. 랭킹 가중치를 상수로 박지 않고 원장에서 잰다.
+    """The **answered ratio** per origin. Ranking weights are measured from the ledger, not hard-coded as constants.
 
-    ★ 상수로 박으면 표적이 바뀔 때 낡는다. 그리고 이 수치 자체가 관측 대상이다 —
-      지휘자 질문의 수율이 오르면 랭킹이 저절로 따라가야 한다.
-    ★ 표본이 적으면(<8) `None` 을 돌려준다 — 0 과 미측정을 안 섞는다.
+    ★ Hard-coded constants go stale when the target changes. And this figure is itself something to observe —
+      if the yield of conductor questions rises, the ranking should follow on its own.
+    ★ With a small sample (<8) it returns `None` — zero and unmeasured are not mixed.
     """
     S = state if state is not None else STATE
     agg = {}
@@ -1870,23 +1878,23 @@ def ask_yield(state=None):
             d["closed"] += 1
     out = {}
     for o, d in agg.items():
-        # ★ 분모는 **닫힌 것**이지 전체가 아니다. 열린 질문은 아직 실패한 게 아니라
-        #   답해지지 않았을 뿐이다. 전체를 분모로 쓰면 **한꺼번에 생성된 새 출처가
-        #   기회를 갖기도 전에 0% 로 바닥에 깔린다** — 첫 판이 정확히 그랬다
-        #   (`resisted` 가 26건을 한 번에 만들자 0/26 = 0.0 이 됐다).
-        # ★ 표본이 적으면(<8) `None`. 0 과 미측정을 안 섞는다.
+        # ★ The denominator is **the closed ones**, not the total. An open question has not failed yet, it just
+        #   has not been answered. Using the total as the denominator **pins a new origin that was created in one
+        #   batch to the floor at 0% before it gets a chance** — the first edition did exactly that
+        #   (`resisted` created 26 at once and got 0/26 = 0.0).
+        # ★ With a small sample (<8), `None`. Zero and unmeasured are not mixed.
         out[o] = {"n": d["n"], "answered": d["answered"], "closed": d["closed"],
                   "rate": (d["answered"] / d["closed"]) if d["closed"] >= 8 else None}
     return out
 
 
 def _ask_t_key(a):
-    """정렬용 시각 키. **저장 값은 안 고친다** — 저장소가 둘이고 주인이 다르다.
+    """Sort key by time. **The stored value is not changed** — there are two stores with different owners.
 
-    ★ 2026-09-08 실측: 리드 저장소는 `2026-09-04 23:11`(연도 있음), 원장 질문은
-      `08-30 01:06`(연도 없음)을 쓴다. 문자열 비교라 `"2026-…"` 이 `"09-…"` 보다
-      **항상 뒤로** 밀렸고, 그래서 동점 구간에서 **심문자 질문이 영구히 꼴찌**였다.
-      가장 값이 날 질문이 형식 불일치 하나로 안 보이고 있었다.
+    ★ Measured 2026-09-08: the lead store uses `2026-09-04 23:11` (with the year), ledger questions use
+      `08-30 01:06` (no year). It is a string comparison, so `"2026-…"` was **always pushed behind** `"09-…"`,
+      and so within a tie **interrogator questions were permanently last.**
+      The question most likely to pay off was invisible because of one format mismatch.
     """
     t = str((a or {}).get("t") or "")
     m = re.match(r'^\d{4}-(\d{2}-\d{2}.*)$', t)
@@ -1894,54 +1902,54 @@ def _ask_t_key(a):
 
 
 def ask_rank_key(a, yields=None):
-    """단일 큐의 정렬키. **수율 > 시도횟수 > 오래된 순**.
+    """The sort key of the single queue. **yield > attempt count > oldest first**.
 
-    ★ 시도횟수(`attempts`)가 2순위인 이유: 같은 행에 게이트가 반복해서 판정 불가였다는
-      뜻이고, 그건 `resisted` 가 세는 것과 같은 신호다. 큐가 하나면 그 신호가 여기 산다.
+    ★ Why attempt count (`attempts`) is second: it means the gate was repeatedly undecided on the same row,
+      which is the same signal `resisted` counts. With a single queue, that signal lives here.
     """
     o = normalize_ask_by(a.get("by"), a.get("id"))
     y = (yields or {}).get(o) or {}
     r = y.get("rate")
-    # 수율 미측정(None)은 **중간**에 둔다 — 0 으로 취급하면 새 출처가 영원히 바닥에 깔린다.
+    # Unmeasured yield (None) goes **in the middle** — treated as 0, a new origin would sit on the floor forever.
     r = 0.5 if r is None else r
     return (-r, -len(a.get("attempts") or []), _ask_t_key(a))
 
 
 def ask_audience(a):
-    """질문 한 건의 **수신자**. 지휘자가 이미 `harness /` 접두어를 쓰고 있어 기계로 갈린다."""
+    """A question's **recipient.** The conductor already uses a `harness /` prefix, so it splits mechanically."""
     return "operator" if _ASK_OPERATOR.match(str((a or {}).get("target") or "")) else "analyst"
 
 
 def open_asks(state=None, audience=None, rank=False, include_leads=False):
-    """열린 질문 **하나의 큐**. 기본은 수율 랭킹, `rank=False` 면 옛 동작(오래된 순).
+    """Open questions as **one queue.** Ranked by yield by default; `rank=False` gives the old behaviour (oldest first).
 
-    ★ 2026-09-08 — 기본값은 **옛 계약 그대로**다(오래된 순 · 원장 질문만). 합류와 랭킹은
-      **명시적 옵트인**이다: `ask_window` 는 회전과 건수를 세는 렌더러라 `_ask_close` 로
-      닫을 수 없는 리드가 섞이면 계약이 깨진다(`test_askqueue` 가 그걸 잡았다).
-      단일 큐를 보는 것은 `ask_queue()` 와 `verdict(action='asks')` 다.
+    ★ 2026-09-08 — the default is **the old contract unchanged** (oldest first · ledger questions only). Merging and ranking are
+      **explicit opt-ins**: `ask_window` is a renderer that counts rotation and totals, so mixing in leads that
+      `_ask_close` cannot close would break the contract (`test_askqueue` caught that).
+      What looks at the single queue is `ask_queue()` and `verdict(action='asks')`.
 
-    ★ 심문자 리드를 **합류시키되 저장소는 안 옮긴다**
-      (`reports/breaks/` 를 원장 밖에 둔 이유가 유효하다 — 지휘자가 읽을 것이 폭증한다).
-      **큐가 하나라는 것은 뷰가 하나라는 뜻이지 저장소가 하나라는 뜻이 아니다.**
-      닫는 길이 다르므로 `_close_via` 를 실어 보낸다.
+    ★ Interrogator leads are **merged in, but their store does not move**
+      (the reason `reports/breaks/` lives outside the ledger still holds — the conductor's reading would explode).
+      **One queue means one view, not one store.**
+      The way to close them differs, so `_close_via` is sent along.
     """
     S = state if state is not None else STATE
     out = [a for a in (S.get("asks") or []) if (a.get("status") or "open") == "open"]
     if include_leads:
-        # ★ 2026-09-11 — **표적이 안 잡히면 리드를 아예 싣지 않는다.**
-        #   `breaks(None)` 은 "전 표적"이라는 뜻이다(운영자 큐에서는 옳다). 그런데 여기로
-        #   `None` 이 흘러들면 **남의 표적 큐가 이 표적의 이어받기에 실린다.**
-        #   실측(bfs.sys 첫 회차 00:18): 원장 0행짜리 새 표적의 SEED 에 열린 질문 **52건**이
-        #   실렸고 전부 msquic·ahcache 것이었다. 첫 접촉 세션이 남의 질문부터 읽는다.
-        #   ⇒ 부재를 "전체"로 해석하지 마라. 표적을 모르면 **0건이 정답**이다.
-        #   ★ 그리고 원장의 `target` 은 **스테이징 전체 경로**다(`work/night/x.sys/x.sys`)
-        #     반면 `reports/breaks/` 는 basename 으로 산다. 정규화 없이는 필터가
-        #     조용히 0건을 내고(안전한 방향) 표적이 비면 전체를 낸다(위험한 방향).
+        # ★ 2026-09-11 — **if the target cannot be pinned down, carry no leads at all.**
+        #   `breaks(None)` means "every target" (right for the operator queue). But if `None` flows
+        #   in here, **another target's queue gets carried into this target's handoff.**
+        #   Measured (bfs.sys first round 00:18): the SEED of a new target with 0 ledger rows carried **52**
+        #   open questions, all of them msquic's and ahcache's. The first-contact session read someone else's questions first.
+        #   => do not read an absence as "everything". When the target is unknown, **zero is the right answer.**
+        #   ★ And the ledger's `target` is **the full staging path** (`work/night/x.sys/x.sys`),
+        #     while `reports/breaks/` lives by basename. Without normalisation the filter
+        #     quietly yields zero (the safe direction), and an empty target yields everything (the dangerous direction).
         _tgt = os.path.basename(str(S.get("target") or "").strip()) or None
         try:
             for b in (breaks(_tgt, open_only=True, queue="lead") if _tgt else []):
                 out.append({"id": b.get("id"), "target": b.get("target"),
-                            "why": "심문자가 이 기각을 깼다 [%s] %s"
+                            "why": "the interrogator broke this rejection [%s] %s"
                                    % (b.get("klass") or "-", str(b.get("reason") or "")[:160]),
                             "method": b.get("next_method") or b.get("reason") or "",
                             "klass": b.get("klass"), "cfg": None, "status": "open",
@@ -1950,7 +1958,7 @@ def open_asks(state=None, audience=None, rank=False, include_leads=False):
                             "_close_via": "verdict(action='lead', id=%s, how=…, why=…)"
                                           % b.get("id")})
         except Exception:
-            pass                        # 리드 저장소 실패가 원장 질문을 죽이면 안 된다
+            pass                        # a lead-store failure must not kill the ledger questions
     if audience:
         out = [a for a in out if ask_audience(a) == audience]
     if not rank:
@@ -1960,18 +1968,18 @@ def open_asks(state=None, audience=None, rank=False, include_leads=False):
 
 
 def ask_window(state=None, n=6, audience="analyst"):
-    """이어받기에 실을 **회전 창**. (창, 전체수, 시작오프셋)
+    """The **rotating window** carried into the handoff. (window, total, start offset)
 
-    ★ 옛 동작은 `asks[:4]` — 오래된 순 **고정**이었다. 실측: ahcache 는 열린 질문이
-      115건인데 매 회차 보이는 것은 항상 같은 4건(CQ65~68, 09-05 16:02 생성)이었고
-      나머지 111건은 **한 번도 노출된 적이 없다**. 생성은 회차당 3~5건인데 노출이
-      4건 고정이라 대역폭이 안 맞았다 — 답한 비율이 낮은 게 아니라 도달을 안 했다.
-      그 증거: 09-07 에 지휘자가 CQ182 `harness / CQ66`, CQ184 `harness / CQ66 klass
-      vocabulary` 를 새로 만들었다. 창에 갇힌 CQ66 을 두고 같은 주제를 재발행한 것이다.
+    ★ The old behaviour was `asks[:4]` — **fixed**, oldest first. Measured: ahcache had 115 open
+      questions, yet every round showed the same 4 (CQ65~68, created 09-05 16:02), and
+      the other 111 **were never exposed once.** 3~5 were created per round while exposure was
+      fixed at 4, so the bandwidth did not match — the answered ratio was not low, they were never reached.
+      The evidence: on 09-07 the conductor newly created CQ182 `harness / CQ66` and CQ184 `harness / CQ66 klass
+      vocabulary`. It reissued the same topic while CQ66 sat trapped in the window.
 
-    ★ 회전 키는 **회차 수**다. 새 상태를 안 만든다 — `shown` 카운터를 두면 이어받기가
-      원장을 써야 하는데, 이어받기는 파일에서 읽은 사본으로 도는 렌더링이라 쓸 수 없다
-      (임시 경로로 `save()` 를 무해화해 둔 자리다).
+    ★ The rotation key is **the round count.** No new state is created — a `shown` counter would require the handoff
+      to write the ledger, but the handoff is a rendering that runs on a copy read from a file, so it cannot write
+      (it is the place where `save()` was neutralised via a temporary path).
     """
     S = state if state is not None else STATE
     A = open_asks(S, audience=audience)
@@ -1984,22 +1992,22 @@ def ask_window(state=None, n=6, audience="analyst"):
 
 
 def backfill_graveyard_trust(state=None):
-    """묘지 행에 **심문 결과를 되찍는다.** 멱등이고, 판정 쪽 기록만 옮긴다.
+    """**Stamp interrogation results back onto graveyard rows.** Idempotent, and it only moves what the verdict side recorded.
 
-    ★ 왜 (2026-09-07 실측): 묘지 616행 중 `broke` 표식이 있는 것은 **12행**뿐이었다.
-      표식을 박기 시작한 것이 09-06 이라 그 이전 행에는 필드 자체가 없다. 그런데
-      `verdicts` 쪽에는 43건이 `interrogation.broke=True` 로 남아 있다 —
-      **같은 사실이 한 저장소에만 있었다.** 묘지를 읽는 소비자(프라이밍·`lessons`·
-      `_resolve_row` 폴백)에게는 그 행들이 전부 동등한 음성으로 보인다.
+    ★ Why (measured 2026-09-07): of 616 graveyard rows only **12** carried a `broke` mark.
+      Stamping started on 09-06, so earlier rows do not have the field at all. Yet on the
+      `verdicts` side 43 remain with `interrogation.broke=True` —
+      **the same fact existed in only one store.** To the consumers that read the graveyard (priming, `lessons`,
+      the `_resolve_row` fallback), those rows all look like equal negatives.
 
-    ★ 새 사실을 만들지 않는다. `verdicts[i].interrogation` 을 같은 **id** 의 묘지 행에
-      복사할 뿐이다. 충돌(두 저장소가 다른 값)이면 **건드리지 않고 센다** — 조용히 덮으면
-      어느 쪽이 옳은지 영원히 못 가린다.
+    ★ It creates no new facts. It only copies `verdicts[i].interrogation` onto the graveyard row with the same **id**.
+      On a conflict (the two stores disagree) it **leaves it alone and counts it** — overwriting quietly would make it
+      forever impossible to tell which side is right.
     """
     S = state if state is not None else STATE
     src = {}
     for v in (S.get("verdicts") or []):
-        if v.get("status") != "기각" or v.get("id") is None:
+        if v.get("status") != "rejected" or v.get("id") is None:
             continue
         ig = v.get("interrogation") if isinstance(v.get("interrogation"), dict) else {}
         if ig.get("broke") is not None or v.get("interrogated") is not None:
@@ -2026,17 +2034,17 @@ def backfill_graveyard_trust(state=None):
 
 
 def breaks(target=None, limit=0, open_only=False, queue=None):
-    """기록부를 읽고 **닫힘 레코드를 접는다.** target 이 없으면 전 표적.
+    """Read the record files and **fold in the close records.** With no target, every target.
 
-    ★ 2026-09-07 — 옛 행에는 `id`/`status`/`queue` 가 없다(누적 71건 전부).
-      읽을 때 백필한다: id 는 파일 안 **순번**으로 결정론적으로 만들고
-      (닫힘 레코드는 순번에서 제외한다 — 안 그러면 닫을 때마다 id 가 밀린다),
-      queue 는 klass 에서 유도한다.
+    ★ 2026-09-07 — old rows have no `id`/`status`/`queue` (all 71 accumulated so far).
+      They are backfilled on read: the id is derived deterministically from the **ordinal**
+      within the file (close records are excluded from the ordinal — otherwise every close
+      would shift the ids), and the queue is derived from the klass.
     """
     import glob as _g
     _d = _break_dir()
     os.makedirs(_d, exist_ok=True)
-    files = ([_break_path(target)] if target      # 여기서의 target 은 **이미지**다
+    files = ([_break_path(target)] if target      # target here is an **image**
              else sorted(_g.glob(os.path.join(_d, "*.jsonl"))))
     out = []
     for fp in files:
@@ -2079,11 +2087,11 @@ def breaks(target=None, limit=0, open_only=False, queue=None):
 
 
 def open_leads(target=None):
-    """열린 **리드**만, 오래된 것부터. WIP cap 과 이어받기가 같은 함수를 본다.
+    """Only the open **leads**, oldest first. The WIP cap and the carry-over read the same function.
 
-    ★ 2026-09-23 — **승격된 재제출도 리드로 친다.** 같은 표적에서 %d회 깨진 행은
-      서류 문제가 아니라 작업이다(mrxsmb 09-22: 한 함수에서 10회). 다만 `queue` 칸은
-      건드리지 않는다 — `break_digest` 가 그 칸으로 재제출 건수를 센다.
+    ★ 2026-09-23 — **an escalated refile counts as a lead too.** A row broken %d times on the
+      same target is work, not paperwork (mrxsmb 09-22: 10 times on one function). The `queue`
+      field is left alone, though — `break_digest` counts refiles from that field.
     """ % _BREAK_ESCALATE_AT
     L = breaks(target, open_only=True, queue="lead")
     _esc = [r for r in breaks(target, open_only=True)
@@ -2092,14 +2100,14 @@ def open_leads(target=None):
 
 
 def break_digest(target=None, n=None, width=260):
-    """★ 다음 회차 분석가에게 줄 **리드 큐**. 요약이 아니라 작업 목록이다.
+    """★ The **lead queue** handed to the next round's analyst. A work list, not a summary.
 
-    ★ 2026-09-07 재설계 — 옛 동작은 `B[-n:]`, n=3 이었다. 즉 **최신 3건 LIFO**.
-      누적 71건에 새 break 가 3건 생기면 그 전 것은 **영영 안 보인다** —
-      큐를 만들어 놓고 큐의 앞쪽을 버리고 있었다. 이제 오래된 미해결부터 준다.
+    ★ Redesigned 2026-09-07 — the old behaviour was `B[-n:]` with n=3, i.e. **the newest 3, LIFO.**
+      With 71 accumulated, 3 new breaks made everything before them **invisible forever** —
+      it built a queue and then threw away the front of it. Now the oldest unresolved come first.
 
-    ★ 두 큐를 가른다(`break_kind`): `wrong_pair` 는 짝을 다시 선언하면 되는
-      **서류 문제**라 리드 큐에 있으면 실질 20건이 71건처럼 보인다. 건수만 알려준다.
+    ★ It splits two queues (`break_kind`): `wrong_pair` is **paperwork** fixed by re-declaring
+      the pair, and in the lead queue it makes 20 real rows look like 71. Only its count is given.
     """
     n = int(n if n is not None else getattr(_cfgmod(), "LEAD_DIGEST_N", 8))
     B = breaks(target)
@@ -2112,28 +2120,28 @@ def break_digest(target=None, n=None, width=260):
                 key=lambda r: str(r.get("t") or ""))
     Rc = sum(1 for x in R if x.get("status") != "closed")
     done = sum(1 for x in B if x.get("status") == "closed")
-    c = _c.Counter(b.get("klass") or "(미기재)" for b in Lo)
-    out = ["## ⟂ 리드 큐 — 심문자가 깬 기각 (reports/breaks/)", "",
-           "  열린 리드 **%d** · 재제출 대기 %d · 닫힘 %d  (누적 %d)"
+    c = _c.Counter(b.get("klass") or "(not stated)" for b in Lo)
+    out = ["## ⟂ Lead queue — rejections the interrogator broke (reports/breaks/)", "",
+           "  open leads **%d** · awaiting refile %d · closed %d  (cumulative %d)"
            % (len(Lo), Rc, done, len(B)), ""]
     if c:
         out += ["  " + " · ".join("%s %d" % kv for kv in c.most_common(8)), ""]
-    _hint = {"wrong_pair": "네가 선언한 가드/싱크 짝이 주장과 다른 것을 가리키고 있다",
-             "other_constructor": "같은 객체의 **다른 생성자**가 그 필드를 다르게 세운다 — 인구 절반이 면제다",
-             "door_only": "검사가 open/create 에서 **한 번만** 돈다 — 연산마다 재적용되는지 봐라",
-             "indirect_entry": "함수포인터·vtable·디스패치가 가드를 우회한다. `callers()` 는 직접호출만 본다",
-             "bound_wrong": "지배는 증명됐지만 **경계 상수**가 틀렸다",
-             "window_too_short": "고정 크기 창 안에서 '있다/없다'를 판단했다 — 한 홉 옆을 봐라",
-             "not_measured": "정적 기각이다. 핸들러가 **실행되기는 하는가** — 실측 한 번이면 갈린다"}
+    _hint = {"wrong_pair": "the guard/sink pair you declared points at something other than your claim",
+             "other_constructor": "a **different constructor** of the same object sets that field differently — half the population is exempt",
+             "door_only": "the check runs **only once**, at open/create — see whether it is re-applied on every operation",
+             "indirect_entry": "function pointers, vtables or dispatch bypass the guard. `callers()` sees only direct calls",
+             "bound_wrong": "dominance is proven, but the **bound constant** is wrong",
+             "window_too_short": "'present/absent' was judged inside a fixed-size window — look one hop over",
+             "not_measured": "this is a static rejection. **Does the handler even run?** — one measurement settles it"}
     if c:
         top = c.most_common(1)[0][0]
         if top in _hint:
-            out += ["★ 1위 `%s` — %s" % (top, _hint[top]), ""]
+            out += ["★ top klass `%s` — %s" % (top, _hint[top]), ""]
     if Rc:
-        out += ["  (`wrong_pair` %d건은 **재제출 큐**다 — 결함이 아니라 짝 선언 문제이므로 "
-                "리드로 세지 않는다)" % Rc, ""]
-    out.append("**오래된 미해결부터 %d건.** 닫는 길은 셋뿐이다 — "
-               "`verdict(action='lead', id=<리드id>, how=refuted|measured|reinterrogated, why=…)`"
+        out += ["  (the %d `wrong_pair` rows are the **refile queue** — a pair-declaration problem, not a defect, so "
+                "they are not counted as leads)" % Rc, ""]
+    out.append("**%d oldest unresolved first.** There are only three ways to close one — "
+               "`verdict(action='lead', id=<lead id>, how=refuted|measured|reinterrogated, why=…)`"
                % min(n, len(Lo)))
     for b in Lo[:n]:
         out.append("- `%s` [%s] %s  (%s)"
@@ -2141,29 +2149,30 @@ def break_digest(target=None, n=None, width=260):
                       str(b.get("t") or "")[:10]))
         nm = (b.get("next_method") or b.get("reason") or "").replace("\n", " ")
         if nm:
-            out.append("    다음 수: %s" % nm[:width])
+            out.append("    next move: %s" % nm[:width])
     if len(Lo) > n:
-        out.append("  … 그리고 %d건 더 (전부 `verdict(action='leads')`)" % (len(Lo) - n))
+        out.append("  … and %d more (all of them: `verdict(action='leads')`)" % (len(Lo) - n))
     return "\n".join(out)
 
 
-# ── L1 · 원재료 통합 ──────────────────────────────────────────
-# ★ 세 곳에 흩어져 있던 실패/돌파 기록을 한 모양으로 읽는다.
-#   answered  — 그 벽을 **실제로 뚫은** 기록. 가장 값지고, 지금까지 아무 데도 안 실렸다
-#   exhausted — 뚫지 못하고 닫힌 기록. "이 방법은 이미 죽었다"
-#   break     — 심문자가 기각을 깬 기록 (reports/breaks/, 2026-09-04 신설)
+# ── L1 · unifying the raw material ──────────────────────────────────────────
+# ★ Reads the failure/breakthrough records that were scattered across three places in one shape.
+#   answered  — records that **actually broke through** that wall. The most valuable, and until now carried nowhere
+#   exhausted — records closed without breaking through. "This method is already dead"
+#   break     — records of the interrogator breaking a rejection (reports/breaks/, added 2026-09-04)
 #
-# ★ 원재료는 **상한다.** 실측: `sink_gates` 고장 불만이 소진 기록 3건에 남아 있는데
-#   그 버그는 09-02 에 고쳐졌다(`tools.py` 의 사후 기록). 낡은 부정 지식을 그대로
-#   먹이면 문헌이 말하는 "틀린 절차의 전파"가 **부정 방향으로** 일어난다.
-#   ⇒ 날짜를 같이 싣고, 오래된 것은 그렇게 표시한다.
+# ★ Raw material **goes stale.** Measured: complaints that `sink_gates` was broken remain in 3
+#   exhausted records, but that bug was fixed on 09-02 (the post-mortem note in `tools.py`). Feeding
+#   stale negative knowledge as-is causes what the literature calls "propagation of a wrong procedure"
+#   — **in the negative direction.**
+#   => the date is carried along, and old entries are marked as such.
 _LESSON_SKIP = ("dbg", "dbg2", "e2e", "demo", "rt", "bench", "bench_gate", "niede",
                 "GOALTEST.sys", "GOALBY.sys", "XIMG.sys", "KslD.sys")
 
 
 def _lesson_ledgers():
-    # ★ 네임스페이스를 따른다. `state/` 를 하드코딩하면 **벤치가 프로덕션에서 학습**한다 —
-    #   이 저장소는 이미 그 반대 방향으로 사고를 냈다(벤치가 pcw.sys 원장을 오염, 08-24).
+    # ★ Follows the namespace. Hard-coding `state/` makes **the bench learn from production** —
+    #   this repository has already had the incident in the opposite direction (the bench polluted the pcw.sys ledger, 08-24).
     import glob as _g
     d = _ns_dir()
     out = []
@@ -2177,9 +2186,9 @@ def _lesson_ledgers():
 
 def lessons(cfg_verdict=None, srcs=("answered", "exhausted", "break", "graveyard"),
             min_len=60):
-    """원재료를 한 모양으로. `cfg_verdict` 를 주면 그 벽의 것만.
+    """Raw material in one shape. Given `cfg_verdict`, only that wall's records.
 
-    `min_len` — 짧은 것은 버린다. 테스트 원장의 `resolution` 이 "c" 같은 한 글자였다.
+    `min_len` — short ones are dropped. A test ledger's `resolution` was a single character like "c".
     """
     out = []
     for nm, fp in _lesson_ledgers():
@@ -2187,14 +2196,14 @@ def lessons(cfg_verdict=None, srcs=("answered", "exhausted", "break", "graveyard
             d = json.load(open(fp, encoding="utf-8"))
         except Exception:
             continue
-        # ★ ① 그 표적이 결국 어떻게 끝났는가 — 같은 벽이 **정반대 두 결말**을 갖기 때문이다.
-        #   dominates_only 돌파 25건을 읽어보면 절반은 "기각이 섰다"(오퍼랜드가 공격자 것이
-        #   아니었다)이고 절반은 "그게 결함이었다"(제약이 아예 없었다). 한쪽만 보여주면
-        #   편향이 아니라 **오답을 가르치는 것**이 된다.
-        # ★ 링크는 **`resolved_by` → 판정 id** 로 잡는다. target 문자열로 맞추면 틀린다 —
-        #   실측: `WcPortMessage@0x140035dd0` 하나에 판정이 2건 붙어 있어서, 스택릭 질문에
-        #   **무관한 기각**의 상태가 라벨로 달렸다. 그건 편향이 아니라 오답이다.
-        #   `_ask_close()` 가 남기는 `resolved_by` 는 정확한 링크다(answered 33/33 성립).
+        # ★ ① How did that target end up — because the same wall has **two opposite outcomes.**
+        #   Reading the 25 dominates_only breakthroughs, half are "the rejection stood" (the operand
+        #   was not the attacker's) and half are "that was the defect" (there was no constraint at all).
+        #   Showing only one side is not bias, it is **teaching the wrong answer.**
+        # ★ The link is made through **`resolved_by` → verdict id.** Matching on the target string is wrong —
+        #   measured: `WcPortMessage@0x140035dd0` alone had 2 verdicts attached, so a stack-leak question
+        #   got labelled with the status of an **unrelated rejection.** That is not bias, it is a wrong answer.
+        #   The `resolved_by` that `_ask_close()` leaves is an exact link (holds for answered 33/33).
         _vst = {str(v.get("id")): v.get("status") for v in (d.get("verdicts") or [])}
         for q in (d.get("asks") or []):
             st = (q.get("status") or "").lower()
@@ -2207,13 +2216,13 @@ def lessons(cfg_verdict=None, srcs=("answered", "exhausted", "break", "graveyard
                 continue
             out.append({"src": st, "image": nm, "cfg": q.get("cfg"), "klass": q.get("klass"),
                         "target": q.get("target"), "text": txt,
-                        "outcome": {"기각": "clean", "확정": "defect",
-                                    "경계보류": "defect"}.get(
+                        "outcome": {"rejected": "clean", "confirmed": "defect",
+                                    "boundary-held": "defect"}.get(
                                         _vst.get(str(q.get("resolved_by") or ""))),
                         "t": q.get("resolved_t") or q.get("t") or "",
                         "attempts": len(q.get("attempts") or [])})
-        # ★ ⑥ klass 축 — 묘지는 "이 사유로 죽은 선례"다. 반박자 킬(24) · 심문자 파기(213)
-        #   경로는 cfg 가 아니라 klass 를 키로 쓰는데, 지금까지 그 축엔 회수가 없었다.
+        # ★ ⑥ The klass axis — the graveyard is "precedents that died for this reason". The refuter-kill (24)
+        #   and interrogator-break (213) paths key on klass, not cfg, and until now that axis had no retrieval.
         if "graveyard" in srcs:
             for gy in (d.get("graveyard") or []):
                 if cfg_verdict and gy.get("klass") != cfg_verdict:
@@ -2238,18 +2247,18 @@ def lessons(cfg_verdict=None, srcs=("answered", "exhausted", "break", "graveyard
 
 
 def rules_for(key, n=2, width=300, image=None):
-    """★ 이 벽/이 사유에서 실제로 나온 선례를 회수한다.
+    """★ Retrieve the precedents that actually came out of this wall / this reason.
 
-    회수 시점은 **결정론 게이트가 실패의 종류를 확정하는 순간**이다. 문헌(ProactAgent)이
-    "회수를 학습된 정책 행동으로"라고 하는데 우리는 그럴 필요가 없다 — `cfg`/`klass` 가
-    이미 실패의 이름이라 정확 매칭이면 오회수가 0이다(오버헤드도 0).
+    The moment of retrieval is **the moment a deterministic gate settles the kind of failure.** The
+    literature (ProactAgent) calls for "retrieval as a learned policy action"; we do not need that —
+    `cfg`/`klass` is already the name of the failure, so an exact match gives zero false retrievals (and zero overhead).
 
-    선택 규율 셋 (전부 실측이 만든 것):
-      ① **결말 균형** — 같은 벽이 정반대 두 결말을 갖는다. 한쪽만 뽑으면 오답을 가르친다.
-         `clean`(기각이 섰다) 1건 + `defect`(그게 결함이었다) 1건을 나란히 놓는다.
-      ② **이미지 층화** — 실측: `won[-2:]` 가 둘 다 wcifs 였다. ahcache 를 감사해도
-         ahcache 자체 돌파 11건은 하나도 안 보였다. 현재 표적 것을 먼저 집는다.
-      ⑤ **끌 수 있어야 한다** — `GATE_LESSONS=0`. 안 재면 도움인지 소음인지 영영 모른다.
+    Three selection rules (all of them made by measurement):
+      ① **Outcome balance** — the same wall has two opposite outcomes. Picking only one side teaches the wrong answer.
+         One `clean` (the rejection stood) and one `defect` (that was the defect) are placed side by side.
+      ② **Image stratification** — measured: `won[-2:]` were both wcifs. Auditing ahcache, not one of
+         ahcache's own 11 breakthroughs was visible. The current target's records are picked first.
+      ⑤ **It must be switchable off** — `GATE_LESSONS=0`. Unmeasured, you never learn whether it helps or is noise.
     """
     if not key:
         return ""
@@ -2267,7 +2276,7 @@ def rules_for(key, n=2, width=300, image=None):
     dead = [x for x in L if x["src"] != "answered"]
 
     def _pick(pool):
-        """② 현재 표적 것 우선 → 그다음 다른 이미지. 같은 이미지가 두 번 나오지 않게."""
+        """② The current target's first → then other images. The same image never appears twice."""
         seen, out = set(), []
         for want_mine in (True, False):
             for x in sorted(pool, key=lambda y: y.get("t") or "", reverse=True):
@@ -2278,7 +2287,7 @@ def rules_for(key, n=2, width=300, image=None):
                 out.append(x)
         return out
 
-    # ① 결말 균형 — clean 1 + defect 1 을 먼저 채우고, 모자라면 나머지로 메운다
+    # ① Outcome balance — fill clean 1 + defect 1 first, then top up from the rest if short
     chosen = []
     for oc in ("clean", "defect"):
         c = _pick([x for x in won if x.get("outcome") == oc])
@@ -2292,43 +2301,43 @@ def rules_for(key, n=2, width=300, image=None):
                 break
     chosen = chosen[:n]
 
-    _LBL = {"clean": "기각이 섰다", "defect": "★ 결함이었다", None: "결말 미상"}
+    _LBL = {"clean": "the rejection stood", "defect": "★ it was a defect", None: "outcome unknown"}
     out = []
     if chosen:
-        out.append("\n\n── 이 벽에서 실제로 결말이 난 기록 %d건 중 %d건 ──" % (len(won), len(chosen)))
+        out.append("\n\n── %d records that actually reached an outcome at this wall, %d shown ──" % (len(won), len(chosen)))
         for x in chosen:
             out.append("  · [%s %s · %s] %s"
                        % (x["image"], x["t"][:11] or "-",
-                          _LBL.get(x.get("outcome"), "결말 미상"), x["text"][:width]))
+                          _LBL.get(x.get("outcome"), "outcome unknown"), x["text"][:width]))
         if len({x.get("outcome") for x in chosen}) > 1:
-            out.append("  ↑ **같은 벽이 정반대로 끝난 두 사례다.** 어느 쪽인지가 이 판정의 질문이다.")
+            out.append("  ↑ **Two cases where the same wall ended in opposite ways.** Which one this is, is the question of this verdict.")
     elif dead:
-        # klass 축(묘지·파기)은 돌파 기록이 없다 — 주의 선례로만 쓴다
+        # The klass axis (graveyard, breaks) has no breakthrough records — use them only as cautionary precedents
         d2 = _pick(dead)[:n]
-        out.append("\n\n── 같은 사유로 죽은 선례 %d건 중 %d건 ──" % (len(dead), len(d2)))
+        out.append("\n\n── %d precedents that died for the same reason, %d shown ──" % (len(dead), len(d2)))
         for x in d2:
             out.append("  · [%s] %s" % (x["image"] or "-", x["text"][:width]))
     if won and dead:
-        out.append("  ⚠ 같은 벽에서 소진/파기된 것이 %d건 있다 — 같은 방법을 또 쓰지 마라." % len(dead))
+        out.append("  ⚠ %d at this same wall were exhausted/broken — do not use the same method again." % len(dead))
     if not out:
         return ""
-    out.append("  (선례는 그 시점의 것이다. 도구가 고쳐졌을 수 있으니 재확인하라 — "
-               "실제로 `sink_gates` 고장 불만이 고쳐진 뒤에도 기록에 남아 있었다.)")
+    out.append("  (Precedents are as of their time. Tools may have been fixed since, so re-check — "
+               "complaints about a broken `sink_gates` really did stay in the records after it was fixed.)")
     return "\n".join(out)
 
 
 def ask_refuted(target, claim, klass, reason, would_change):
-    """★ **반박자가 죽인 확정을 열린 질문으로 되돌린다.**
+    """★ **Turn a confirmation the refuter killed back into an open question.**
 
-    지금까지 `would_change_my_mind`("무엇이 있으면 살아남는가")는 에이전트 컨텍스트에 한 번 뜨고
-    사라졌다. 그 결과 반박자에게 죽은 확정 **11건 중 재제출 시도가 0건** — 사실상 반박자가
-    최종심이었다. 문헌([[refs/01]])의 stage-gated 설계에는 judge/adjudicator 가 있는데 우리에겐 없다.
-    큐에 넣어 두면 최소한 **다음 회차가 그 조건을 보고 이어받을 수 있다.**
+    Until now `would_change_my_mind` ("what would let it survive") appeared once in the agent's
+    context and vanished. The result: of **11 confirmations killed by the refuter, 0 refile attempts** —
+    the refuter was effectively the court of last resort. The stage-gated design in the literature
+    ([[refs/01]]) has a judge/adjudicator; we had none. Put in the queue, **the next round can at least see that condition and pick it up.**
     """
     if not would_change and not reason:
         return None
     q = {"id": "RQ%d" % (len(STATE.get("asks") or []) + 1), "target": target,
-         "why": "반박자가 죽인 확정 [%s] %s" % (klass or "-", (reason or "")[:200]),
+         "why": "confirmation killed by the refuter [%s] %s" % (klass or "-", (reason or "")[:200]),
          "method": (would_change or "(the refuter gave no revival condition - change the axis of "
                                     "your evidence)")[:300],
          "cfg": "refuted", "status": "open", "attempts": [],
@@ -2339,53 +2348,54 @@ def ask_refuted(target, claim, klass, reason, would_change):
     return q
 
 
-# ★ ASK 는 두 가지가 섞여 있었다. 그 둘은 **다음 수가 완전히 다르다.**
-#   - need_observation : 관측이 모자란다 (이미지 없음, .pdata 없음, CFG 구성 실패).
-#                        사람/도구가 하나 더 재 와야 한다. LLM 을 불러도 나올 게 없다.
-#   - inexpressible    : **분석은 끝났는데 게이트의 모델이 그 모양을 표현 못 한다.**
-#                        (가드가 clamp 라 분기가 아니다 / 값이 구문상 싱크 오퍼랜드에 안 닿는다 /
-#                         불변식을 여러 블록이 함께 세운다)
-#   2026-09-04 실측: 전 표적 열린 질문의 cfg 사유는 `dominates_only` 가 **62건**으로 압도적 1위다.
-#   그리고 `_gate_verdict` 는 "ASK 는 아직 기각이 아니니 심문하지 않는다"며 **그 62건에서
-#   심문자를 건너뛰었다.** 즉 표현 불가로 막힌 행을 **어떤 LLM 도 본 적이 없고**, 다음 회차의
-#   분석가가 같은 규칙에 다시 부딪히는 루프가 된다. 지휘자가 이걸 09-02 부터 14회 보고했다.
-#   ⇒ 종류를 갈라서 `inexpressible` 은 **적대층에 한 번 넘긴다**(새 역할을 만들지 않는다 —
-#     심문자의 맨데이트가 이미 "애매하면 기각이 서지 않는다"라 방향이 맞다).
-#   ★ `not_a_cut` / `no_escape` 는 여기 넣지 않는다. 그 둘은 **모델의 한계가 아니라
-#     그래프의 확정 반증**이다 — "가드를 하나도 안 거치는 길이 실제로 있다",
-#     "어느 간선도 싱크를 피하지 않는다". 적대층이 뒤집을 수 있게 두면 LLM 이 계산 가능한
-#     사실을 이기게 된다. `both_edges`/`not_dominated` 와 같이 **하드 거부**로 간다.
+# ★ ASK used to mix two things, and the two have **completely different next moves.**
+#   - need_observation : an observation is missing (no image, no .pdata, CFG construction failed).
+#                        A human/tool has to go and measure one more thing. Calling an LLM yields nothing.
+#   - inexpressible    : **the analysis is done but the gate's model cannot express the shape.**
+#                        (the guard is a clamp, not a branch / the value does not syntactically reach the
+#                         sink operand / several blocks establish the invariant together)
+#   Measured 2026-09-04: among open questions across all targets, `dominates_only` is by far the top
+#   cfg reason with **62.** And `_gate_verdict` **skipped the interrogator on those 62**, saying "an ASK is
+#   not a rejection yet, so it is not interrogated." So rows stuck on inexpressibility **had never been seen
+#   by any LLM**, and the next round's analyst hit the same rule again, in a loop. The conductor reported
+#   this 14 times from 09-02 on.
+#   => split the kinds and hand `inexpressible` **to the adversarial layer once** (no new role — the
+#     interrogator's mandate is already "when in doubt, the rejection does not stand", which points the right way).
+#   ★ `not_a_cut` / `no_escape` are not put here. Those two are **not limits of the model but
+#     definite refutations by the graph** — "a path that passes no guard at all really exists",
+#     "no edge avoids the sink". Letting the adversarial layer overturn them would let an LLM beat a
+#     computable fact. Like `both_edges`/`not_dominated`, they go to a **hard refusal.**
 _ASK_INEXPRESSIBLE = ("dominates_only", "cut_needs_judgement", "no_branch")
 
 
 def history_for(target, ask=None):
-    """★ 판결자에게 줄 **전체 이력**. 이 판에서 이걸 보는 것은 판결자뿐이다.
+    """★ The **full history** for the adjudicator. In this panel only the adjudicator sees this.
 
-    반박자·심문자·승격자는 일부러 서로를 못 본다(담합 방지). 그 독립성이 값인데,
-    대가로 **아무도 종합할 수 없다** — 그래서 같은 질문이 4~5회 돌았다.
-    여기서 그 대가를 회수한다.
+    The refuter, interrogator and escalator deliberately cannot see each other (to prevent collusion).
+    That independence is the value, but the price is that **nobody can synthesise** — so the same
+    question ran 4–5 times. This is where that price is recovered.
     """
     L = []
     tgt = str(target or "")
     a = ask or _ask_for(tgt)
     if a:
-        L.append("## 열린 질문 [%s] — %d회 시도, 아직 미종결" % (a.get("id"), len(a.get("attempts") or [])))
+        L.append("## Open question [%s] — %d attempts, still unresolved" % (a.get("id"), len(a.get("attempts") or [])))
         if a.get("why"):
-            L.append("게이트 사유: %s" % str(a["why"])[:400])
+            L.append("gate reason: %s" % str(a["why"])[:400])
         if a.get("method"):
-            L.append("큐가 지시한 방법: %s" % str(a["method"])[:400])
+            L.append("method the queue prescribed: %s" % str(a["method"])[:400])
         for i, at in enumerate(a.get("attempts") or [], 1):
-            L.append("  시도 %d (%s): cfg=%s guard=%s sink=%s"
+            L.append("  attempt %d (%s): cfg=%s guard=%s sink=%s"
                      % (i, at.get("t"), at.get("cfg"), at.get("guard"), at.get("sink")))
-    # 이 행에 붙은 판정 전부 — 기각/확정/반박됨
-    # ★ 2026-09-04: 여기는 **자르면 안 된다.** 판결자의 존재 이유가 "이 판에서 유일하게
-    #   전체 이력을 본다"인데 `[-6:]`/`[-4:]`/`[-3:]` 로 잘려 있었다. 같은 질문에 4~5회
-    #   부딪힌 행을 종결하러 오는데 앞쪽 시도가 안 보이면 그 역할이 성립하지 않는다.
-    #   길이는 **오래된 것을 한 줄로 접어서** 잡는다 — 빠뜨리지는 않는다.
+    # Every verdict attached to this row — rejected/confirmed/refuted
+    # ★ 2026-09-04: this **must not be truncated.** The adjudicator's reason to exist is "the only one
+    #   in this panel that sees the whole history", yet it was cut at `[-6:]`/`[-4:]`/`[-3:]`. It comes
+    #   to close a row that hit the same question 4–5 times; if the early attempts are invisible the role does not hold.
+    #   Length is controlled by **folding the old ones to one line each** — nothing is dropped.
     def _fold(items, keep, render, brief):
         old_n = max(0, len(items) - keep)
         if old_n:
-            L.append("  (오래된 %d건은 한 줄로 접는다 — 빠뜨리지 않는다)" % old_n)
+            L.append("  (the %d older ones are folded to one line each — none are dropped)" % old_n)
             for x in items[:old_n]:
                 L.append("  · " + brief(x))
         for x in items[old_n:]:
@@ -2393,7 +2403,7 @@ def history_for(target, ask=None):
 
     vs = [v for v in (STATE.get("verdicts") or []) if str(v.get("target")) == tgt]
     if vs:
-        L.append("\n## 이 행에 기록된 판정 %d건 (전부)" % len(vs))
+        L.append("\n## All %d verdicts recorded on this row" % len(vs))
         for v in vs[:max(0, len(vs) - 6)]:
             L.append("  · [%s] %s — %s" % (v.get("status"), v.get("id"),
                                            str(v.get("claim"))[:110].replace("\n", " ")))
@@ -2402,27 +2412,27 @@ def history_for(target, ask=None):
             L.append("- [%s] klass=%s cfg=%s (%s)"
                      % (v.get("status"), v.get("klass"), (g.get("cfg") or {}).get("verdict"),
                         v.get("t")))
-            L.append("  주장/사유: %s" % str(v.get("reason") or v.get("claim"))[:400])
+            L.append("  claim/reason: %s" % str(v.get("reason") or v.get("claim"))[:400])
             it = v.get("interrogation")
             if isinstance(it, dict):
-                L.append("  ↳ 심문자: sustained=%s klass=%s — %s"
+                L.append("  ↳ interrogator: sustained=%s klass=%s — %s"
                          % (it.get("sustained"), it.get("klass"), str(it.get("reason"))[:300]))
                 if it.get("next_method"):
-                    L.append("     심문자가 지목한 다음 관측: %s" % str(it["next_method"])[:250])
-    # 반박자가 죽인 것 (묘지)
+                    L.append("     next observation the interrogator named: %s" % str(it["next_method"])[:250])
+    # what the refuter killed (the graveyard)
     gy = [x for x in (STATE.get("graveyard") or []) if str(x.get("target")) == tgt]
     if gy:
-        L.append("\n## 반박자가 죽인 확정 %d건 (전부)" % len(gy))
+        L.append("\n## All %d confirmations the refuter killed" % len(gy))
         for x in gy[:max(0, len(gy) - 4)]:
             L.append("  · [%s] %s" % (x.get("klass"), str(x.get("reason"))[:110].replace("\n", " ")))
         for x in gy[max(0, len(gy) - 4):]:
             L.append("- [%s] %s" % (x.get("klass"), str(x.get("reason"))[:350]))
             if x.get("would_change_my_mind"):
-                L.append("  ↳ 살아남는 조건: %s" % str(x["would_change_my_mind"])[:250])
-    # 게이트가 표현 못 했다는 신고
+                L.append("  ↳ condition for surviving: %s" % str(x["would_change_my_mind"])[:250])
+    # reports that the gate could not express it
     gb = [x for x in (STATE.get("gate_blocks") or []) if str(x.get("target")) == tgt]
     if gb:
-        L.append("\n## 게이트가 막았다는 신고 %d건 (도구 한계이지 코드에 대한 증거가 아니다, 전부)"
+        L.append("\n## All %d reports that the gate blocked it (a tool limit, not evidence about the code)"
                  % len(gb))
         for x in gb[:max(0, len(gb) - 3)]:
             L.append("  · %s — %s" % (x.get("gate"), str(x.get("why"))[:100].replace("\n", " ")))
@@ -2432,7 +2442,7 @@ def history_for(target, ask=None):
 
 
 def record_adjudication(target, v, n_attempts, raw=""):
-    """판결을 **따로** 남긴다. 판정 목록에만 넣으면 내일 채점에서 못 고른다."""
+    """Record an adjudication **separately.** Put only in the verdict list, tomorrow's scoring could not pick it out."""
     rec = {"target": str(target)[:160], "verdict": v.get("verdict"),
            "reason": str(v.get("reason") or "")[:800],
            "decisive": str(v.get("decisive") or "")[:400],
@@ -2447,53 +2457,53 @@ def record_adjudication(target, v, n_attempts, raw=""):
 
 
 def stash_adjudication(target, rec):
-    """판결자는 판정이 **기록되기 전에** 도는 사전 게이트다 ⇒ 붙일 판정이 아직 없다.
-    보관해 두고 `verdict()` 가 기록 시점에 박는다. (심문/승격과 같은 패턴 —
-    훅에서 `inp` 를 고쳐도 툴까지 간다는 보장이 없다.)"""
+    """The adjudicator is a pre-gate that runs **before the verdict is recorded** => there is no verdict to attach to yet.
+    Stash it and let `verdict()` stamp it in at recording time. (The same pattern as interrogation/escalation —
+    there is no guarantee that editing `inp` in a hook reaches the tool.)"""
     STATE.setdefault("pending_adjudication", {})[str(target)] = rec
     save()
 
 
 def adjudicated_confirms():
-    """판결자가 낸 확정만. 채점에서 **분리해서** 세야 한다."""
+    """Only the confirmations the adjudicator issued. Scoring must count them **separately.**"""
     return [v for v in (STATE.get("verdicts") or [])
-            if v.get("status") == "확정" and v.get("decided_by") == "adjudicator"]
+            if v.get("status") == "confirmed" and v.get("decided_by") == "adjudicator"]
 
 
 def adjudication_audit():
-    """★ 내일 채점용. 판결자가 무엇을 어떤 권한으로 뒤집었는지 한 표로."""
+    """★ For tomorrow's scoring. One table of what the adjudicator overturned, and on what authority."""
     A = STATE.get("adjudications") or []
     if not A:
-        return "판결 기록 없음."
+        return "no adjudication records."
     import collections
     c = collections.Counter(x.get("verdict") for x in A)
-    L = ["판결 %d건 — %s" % (len(A), dict(c)),
-         "★ confirm 이 많으면 그것 자체가 신호다: 판결자에게 확정 권한을 준 것은 "
-         "2026-09-04 **하루짜리 운영자 결정**이었다. 되돌리려면 이 표를 보고 결정하라.", ""]
+    L = ["%d adjudications — %s" % (len(A), dict(c)),
+         "★ Many confirms is a signal in itself: giving the adjudicator confirm authority was a "
+         "**one-day operator decision** on 2026-09-04. To roll it back, decide from this table.", ""]
     for x in A:
-        L.append("[%s] %s  (시도 %s회, %s)" % (x.get("verdict"), str(x.get("target"))[:60],
+        L.append("[%s] %s  (%s attempts, %s)" % (x.get("verdict"), str(x.get("target"))[:60],
                                               x.get("attempts"), x.get("t")))
-        L.append("   결정 앵커: %s" % (x.get("decisive") or "(없음)")[:160])
-        L.append("   사유      : %s" % str(x.get("reason"))[:200])
-        L.append("   남는 위험 : %s" % (x.get("residual_risk") or "(안 적음)")[:160])
+        L.append("   decisive anchor: %s" % (x.get("decisive") or "(none)")[:160])
+        L.append("   reason         : %s" % str(x.get("reason"))[:200])
+        L.append("   residual risk  : %s" % (x.get("residual_risk") or "(not stated)")[:160])
         if x.get("downgraded_from"):
-            L.append("   ※ %s 에서 강등됨 (결정적 앵커 없음)" % x["downgraded_from"])
+            L.append("   ※ downgraded from %s (no decisive anchor)" % x["downgraded_from"])
     return "\n".join(L)
 
 
-# ── 심문자가 표현불가 기각을 **깨지 못했다**는 사실의 보관소 ────────
-# ★ 왜 필요한가 (실측 2026-09-04): `inexpressible` 은 심문자를 태우도록 배선돼 있고
-#   실제로 19회 돌아 10건이 `sustained`(= 깨지 못함) 였다. 그런데 훅이 그 사실을
-#   **지역 변수 `_rec` 에** 적었고, 툴 쪽 `verdict()` 는 `_reject_gate` 를 처음부터
-#   다시 계산하므로 그 표시가 사라졌다. 지문 둘로 확인됨:
-#     · 원장 전체에 `passed_by` 마커 0건
-#     · `pending_interrog` 잔류 13건 (ASK 분기가 소비 지점보다 앞에 있어 영영 안 읽힌다)
-#   ⇒ 판결자·승격자가 이미 쓰는 `stash_*` 패턴으로 건넨다. 훅에서 dict 를 고쳐도
-#     툴까지 간다는 보장이 없다는 것은 이 저장소가 이미 아는 사실이다.
+# ── a store for the fact that the interrogator **could not break** an inexpressible rejection ────────
+# ★ Why it is needed (measured 2026-09-04): `inexpressible` is wired to run the interrogator, and it
+#   really ran 19 times with 10 coming back `sustained` (= could not break it). But the hook wrote that
+#   fact **into the local variable `_rec`**, and the tool-side `verdict()` recomputes `_reject_gate`
+#   from scratch, so the mark vanished. Confirmed by two fingerprints:
+#     · zero `passed_by` markers in the entire ledger
+#     · 13 leftovers in `pending_interrog` (the ASK branch comes before the consumption point, so they are never read)
+#   => hand it over with the `stash_*` pattern the adjudicator and escalator already use. That editing a
+#     dict in a hook is not guaranteed to reach the tool is something this repository already knows.
 #
-# ★ 다만 **ASK 를 취소하지는 않는다.** 심문자의 맨데이트는 "애매하면 기각이 서지 않는다"라
-#   `sustained` 는 "옳다"가 아니라 "못 깼다"에 가깝다. 자동 승격은 정밀도 축을 여는 변경이고,
-#   그건 별개 결정이다. 여기서는 **그 사실을 분석가에게 전달**만 한다 — 판단은 분석가가 한다.
+# ★ It does **not cancel the ASK**, though. The interrogator's mandate is "when in doubt, the rejection does
+#   not stand", so `sustained` is closer to "could not break it" than to "it is right". Automatic promotion
+#   would be a change that opens the precision axis, and that is a separate decision. Here it only **passes the fact to the analyst** — the analyst judges.
 def stash_inexpr_pass(target, rec):
     STATE.setdefault("pending_inexpr_pass", {})[str(target)] = {
         "cfg": rec.get("cfg"), "klass": rec.get("klass"),
@@ -2503,7 +2513,7 @@ def stash_inexpr_pass(target, rec):
 
 
 def _take_inexpr_pass(target, cfg_verdict):
-    """같은 벽(cfg)에 대한 것일 때만 꺼낸다 — 다른 질문에 붙으면 거짓 보증이 된다."""
+    """Take it out only when it concerns the same wall (cfg) — attached to a different question it becomes a false assurance."""
     box = STATE.get("pending_inexpr_pass") or {}
     got = box.get(str(target))
     if not got:
@@ -2514,148 +2524,149 @@ def _take_inexpr_pass(target, cfg_verdict):
 
 
 def render_ask(target, a, extra=""):
-    """★ ASK 문구를 **렌더 시점에** 조립한다: 정적 안내문 + 누적 선례 + 심문자 통과 사실.
+    """★ Assemble the ASK text **at render time**: the static guidance + accumulated precedents + the interrogator-pass fact.
 
-    저장된 것은 정적 안내문뿐이므로 원장은 커지지 않고, 선례는 늘 최신이 붙는다.
+    Only the static guidance is stored, so the ledger does not grow and the precedents attached are always current.
     """
     m = str((a or {}).get("method") or "")
     try:
         m += rules_for((a or {}).get("cfg"))
     except Exception:
-        pass                                   # 선례 조회 실패가 안내 자체를 죽이면 안 된다
+        pass                                   # a failed precedent lookup must not kill the guidance itself
     ip = _take_inexpr_pass(target, (a or {}).get("cfg"))
     if ip:
-        m += ("\n\n★ 참고 — **독립 심문자가 이 기각을 깨지 못했다** [%s] %s\n"
-              "   심문자는 주장과 근거만 보고 '애매하면 기각이 서지 않는다'를 기본값으로 돈다. "
-              "그걸 넘겼다는 것은 약한 신호가 아니다.\n"
-              "   게이트가 못 정한 것은 **모양을 표현하지 못해서**이지 네 논증이 틀려서가 아닐 수 있다. "
-              "위 (A)/(B) 중 어느 쪽인지만 한 문장으로 못 박고 같은 표적을 다시 기각하라 — "
-              "아직 부족하다고 판단하면 무엇이 부족한지 적어라."
+        m += ("\n\n★ Note — **an independent interrogator could not break this rejection** [%s] %s\n"
+              "   The interrogator sees only the claim and the evidence, and runs with 'when in doubt, the rejection does not stand' as its default. "
+              "Getting past that is not a weak signal.\n"
+              "   What the gate could not decide may be undecided **because it cannot express the shape**, not because your argument is wrong. "
+              "Pin down in one sentence which of (A)/(B) above it is, and reject the same target again — "
+              "if you judge it still insufficient, write down what is missing."
               % (ip.get("klass") or "-", str(ip.get("reason") or "")[:300]))
     return m + (extra or "")
 
 
 def ask_kind(cfg_verdict):
-    """이 ASK 가 관측 부족인가, 게이트가 표현을 못 하는 것인가."""
+    """Is this ASK a missing observation, or a shape the gate cannot express?"""
     return "inexpressible" if cfg_verdict in _ASK_INEXPRESSIBLE else "need_observation"
 
 
 def ask(rec, why, cfg_verdict=None):
-    """게이트가 판정 불가일 때 **질문을 남긴다**(통과가 아니라)."""
+    """When the gate cannot decide, **leave a question** (not a pass)."""
     rec = rec if isinstance(rec, dict) else {}
-    # ★ 저장하는 것은 **정적 안내문뿐**이다. 선례는 `render_ask()` 가 렌더 시점에 붙인다.
-    #   생성 시점에 이어붙이면 (1) 낡은 선례가 원장에 영구히 얼어붙고(폐기 원칙과 배치),
-    #   (2) ASK 하나당 ~700자씩 원장이 커져 **지휘자가 읽을 것이 늘어난다** —
-    #   `reports/breaks/` 를 원장 밖에 둔 이유를 같은 파일 안에서 어기는 셈이 된다.
+    # ★ Only **the static guidance** is stored. `render_ask()` attaches the precedents at render time.
+    #   Appending them at creation time would (1) freeze stale precedents into the ledger permanently (contrary
+    #   to the disposal principle), and (2) grow the ledger by ~700 chars per ASK, **adding to what the conductor
+    #   reads** — breaking, inside the same file, the very reason `reports/breaks/` is kept outside the ledger.
     rec["ask"] = {"why": why, "cfg": cfg_verdict, "kind": ask_kind(cfg_verdict),
                   "method": ASK_METHOD.get(cfg_verdict or "",
-                                           "판정에 필요한 관측을 하나 더 확보하라."),
+                                           "Obtain one more observation that the verdict needs."),
                   "t": time.strftime("%m-%d %H:%M")}
     return rec
 
 
-# ── 기각 게이트 (R1~R3) ───────────────────────────────────────
-# 왜: 지금까지 게이트는 **확정에만** 걸렸다. 기각은 무료라 거짓 음성이 그냥 통과했다.
-# pcw.sys 실행에서 기각 18건의 앵커 98개는 전부 진짜였지만, 그건 우연이지 강제가 아니었다.
-# 그리고 앵커가 진짜여도 **논증은 샐 수 있다** — fn0x9 의 기각을 떠받친 결정적 명령
-# (`0x14000C262 jmp` = 실패 경로가 싱크에 안 감)은 **인용문에 아예 없었다.**
-# ⇒ 인용에 기대지 말고 **계산**한다.
+# ── the reject gate (R1~R3) ───────────────────────────────────────
+# Why: until now the gate applied **only to confirmations.** Rejection was free, so false negatives just passed.
+# In the pcw.sys run, all 98 anchors of the 18 rejections were genuine, but that was luck, not enforcement.
+# And even with genuine anchors **the argument can leak** — the decisive instruction holding up fn0x9's rejection
+# (`0x14000C262 jmp` = the failure path does not go to the sink) was **not in the citations at all.**
+# => do not rely on citations; **compute.**
 _REJECT_KLASS = {
-    "guarded":        "가드가 싱크를 막는다 — guard=/sink= 필수, CFG 지배를 계산한다",
-    "unreachable":    "도달 불가 — 도달성 근거(callpath/xref) 필요",
-    "not_controlled": "값이 상수 — 그 상수의 정의 지점 앵커 필요",
-    "no_sink":        "위험한 소비처가 없다 — 전수 스캔 근거 필요",
-    "by_design":      "설계 의도 — 문서/출하도구 출처 필요",
-    "delta_zero":     "정상 경로로도 같은 결과 — control() 실측 기록 필요",
-    "decompiler_artifact": "디컴파일러 산물 — 디스어셈블 앵커 필요",
-    # ★ 2026-09-05 추가. 근거: 지휘자의 `unrecordable` 재보고 76건이 **네 모양으로 접힌다**
-    #   (ahcache 8·7·6·5회 / wcifs 7·6·3회). 담을 칸이 없어 여덟 회차분 판정이 증발했다.
-    #   ⇒ 여기 넣는 둘은 **의무가 기계로 검사 가능한 것만**이다. 검사 못 할 의무를 단
-    #   klass 는 자유 통행증이 된다 — klass 의 원래 정의가 "요구할 관측"이기 때문이다.
-    "second_site": "이미 판정된 결함의 **다른 사이트** — origin_id= 로 원본 판정을 대고 그 "
-                   "사이트의 앵커를 evidence 에 넣어라. 등급은 원본을 따른다",
-    "bounded_absence": "**이 범위 안에서는** 전수로 없다 — scope= 로 범위를 명시하고"
-                       "(function/section/image) 그 범위를 실제로 덮은 열거를 돌려라",
-    # ★ 2026-09-05 추가 ②. 근거: wcifs 의 미기록 12건이 **세 요청으로 접히는데 그중 6건이
-    #   같은 말을 한다** — `guarded` 의 건전성 규칙이 하나뿐이라는 것("가드가 읽은 값이 싱크
-    #   오퍼랜드에 흘러야 한다"). 그 규칙에 안 맞는 **구조가 다른 두 가지**가 8회·2회씩
-    #   되돌아왔고, 그 사이 wcifs 는 다섯 회차 연속 판정+0 이었다.
-    #   두 klass 다 의무가 기계로 검사된다 — 인용된 니모닉을 보고 판정한다.
-    # ★ 두 읽기를 **한 칸에** 담는다(어휘를 늘리기보다). 의무가 같기 때문이다 —
-    #   둘 다 "그 상태를 만들 수 있는 분기를 전수로 대라"로 끝난다.
-    #     (a) 가드가 오퍼랜드가 아니라 **상태**를 제약한다
-    #     (b) 위험한 **간선 자체가 불가능**하다 (선행자 전부가 불변식을 세운다)
-    #   (b) 는 wcifs `ABORT-ASYM:WcSetUnionContext@0x140023a2c` 가
-    #   `klass=control-flow-exclusion` 이라는 이름으로 요청한 모양이고, 그 행은
-    #   "분석은 끝났는데 적을 칸이 없다"로 **여섯 회차** 미분석에 머물렀다.
-    "state_precondition": "가드가 싱크 **오퍼랜드**를 제약하는 게 아니라, 싱크가 위험해지는 "
-                          "**상태 자체가 성립 못 하게** 한다 — 또는 위험한 **간선이 불가능**하다"
-                          "(선행자 전부가 불변식을 세운다). sink= 와 함께, 그 상태를 만들 "
-                          "수 있는 분기를 **전수로** evidence 에 조건분기 앵커로 넣어라(2개 이상)",
-    "callsite_guarded": "공유 헬퍼라 **전역 지배는 성립하지 않지만** 이 호출지점에서는 "
-                        "가드가 지배한다 — callsite= 로 그 `call` 명령 앵커를 대고 "
-                        "guard= 를 같이 대라. 다른 호출자에 대해서는 아무 주장도 하지 않는다",
-    # ★ 2026-09-05 추가 ③. 근거는 **사용 실적**이다: 기각 게이트가 꺼진 회차에서
-    #   에이전트가 실제로 쓴 klass 중 `impact_unproven` 8건 · `gated_off` 2건이
-    #   **어휘에 없는 값**이었다(게이트가 켜져 있었으면 전부 거부됐다). 그리고 게이트 신고
-    #   39건 중 셋이 정확히 이 둘을 달라고 적었다. 쓰이고 있는데 없는 칸이다.
-    "gated_off": "취약한 갈래가 **기능/설정 게이트 뒤에 있고 기본값이 안전한 쪽**이다 — "
-                 "gate= 로 그 게이트를 지목하고, evidence 에 **접근자 `call` 앵커**와 "
-                 "**안전한 갈래를 고르는 조건분기 앵커**를 둘 다 넣어라",
-    "impact_unproven": "싱크는 실행되는데 **그 결과를 읽는 소비자가 없다** — sink= 와 함께 "
-                       "scope= 로 **소비자를 어느 범위에서 열거했는지** 밝혀라. 이건 부재 "
-                       "주장이므로 범위 없이는 성립하지 않는다",
-    # ★ 2026-09-06 추가. 근거는 **집계**다: `reports/unrecordable/ahcache.sys.md` 의
-    #   "필요한 칸" 제안 47건을 세면 한 개념이 다섯 이름으로 흩어져 있다 —
+    "guarded":        "a guard blocks the sink — guard=/sink= required; CFG dominance is computed",
+    "unreachable":    "unreachable — needs reachability grounds (callpath/xref)",
+    "not_controlled": "the value is a constant — needs an anchor at the point where that constant is defined",
+    "no_sink":        "there is no dangerous consumer — needs grounds from an exhaustive scan",
+    "by_design":      "intended by design — needs a documentation/shipped-tool source",
+    "delta_zero":     "the normal path gives the same result — needs a control() measurement record",
+    "decompiler_artifact": "a decompiler artifact — needs a disassembly anchor",
+    # ★ Added 2026-09-05. Grounds: the conductor's 76 `unrecordable` re-reports **fold into four shapes**
+    #   (ahcache 8·7·6·5 times / wcifs 7·6·3 times). With no slot to hold them, eight rounds' worth of verdicts evaporated.
+    #   => the two added here are **only ones whose obligation a machine can check.** A klass carrying an
+    #   obligation that cannot be checked becomes a free pass — because a klass is by definition "the observation it demands".
+    "second_site": "a **different site** of a defect already judged — name the original verdict with origin_id= and put "
+                   "this site's anchor in evidence. The grade follows the original",
+    "bounded_absence": "absent, exhaustively, **within this range** — state the range with scope= "
+                       "(function/section/image) and run an enumeration that actually covers it",
+    # ★ Added 2026-09-05 ②. Grounds: wcifs's 12 unrecorded rows **fold into three requests, and 6 of them say
+    #   the same thing** — that `guarded` has only one soundness rule ("the value the guard reads must flow
+    #   into the sink operand"). **Two structurally different shapes** that do not fit that rule came back
+    #   8 and 2 times, and meanwhile wcifs went five rounds in a row with +0 verdicts.
+    #   Both klasses have machine-checked obligations — judged from the cited mnemonics.
+    # ★ Both readings go into **one slot** (rather than growing the vocabulary), because the obligation is the
+    #   same — both end in "enumerate every branch that can produce that state".
+    #     (a) the guard constrains a **state**, not an operand
+    #     (b) the dangerous **edge itself is impossible** (every predecessor establishes the invariant)
+    #   (b) is the shape wcifs `ABORT-ASYM:WcSetUnionContext@0x140023a2c` asked for under the name
+    #   `klass=control-flow-exclusion`, and that row stayed `unanalysed` for **six rounds** with
+    #   "the analysis is done but there is no slot to write it in".
+    "state_precondition": "the guard does not constrain the sink **operand**; it makes the **state in which "
+                          "the sink becomes dangerous impossible** — or the dangerous **edge is impossible** "
+                          "(every predecessor establishes the invariant). Together with sink=, put **every** branch "
+                          "that can produce that state in evidence as conditional-branch anchors (2 or more)",
+    "callsite_guarded": "a shared helper, so **global dominance does not hold**, but at this callsite "
+                        "the guard dominates — give the anchor of that `call` instruction with callsite= "
+                        "and give guard= as well. It makes no claim at all about other callers",
+    # ★ Added 2026-09-05 ③. The grounds are **usage**: in a round with the reject gate switched off, of the
+    #   klasses the agent actually used, `impact_unproven` (8) and `gated_off` (2) were **values not in
+    #   the vocabulary** (with the gate on, all would have been refused). And of 39 gate reports, three
+    #   asked for exactly these two. A slot in use that did not exist.
+    "gated_off": "the vulnerable arm is **behind a feature/configuration gate whose default is the safe side** — "
+                 "name that gate with gate=, and put **both** the **accessor `call` anchor** and "
+                 "**the conditional-branch anchor that selects the safe arm** in evidence",
+    "impact_unproven": "the sink executes but **no consumer reads its result** — together with sink=, "
+                       "state with scope= **over what range you enumerated consumers.** This is a claim "
+                       "of absence, so it does not hold without a range",
+    # ★ Added 2026-09-06. The grounds are a **tally**: counting the 47 "slot needed" proposals in
+    #   `reports/unrecordable/ahcache.sys.md`, one concept is scattered over five names —
     #   bounded_by_saturation 10 · loop_bounded 4 · bounded_nonconstant 3 ·
-    #   partially_controlled 2 · range_bounded 2 = **21제안**. 그 행(n=18)은
-    #   `not_controlled` 로 시도했다가 CFG 검사에 **정당하게** 거절당했다(호출자가 값에
-    #   영향을 주긴 한다). "영향은 주는데 clamp 된다"를 담을 칸이 없었을 뿐이다.
-    #   그리고 privileged_principal 4제안(n=8)은 "도달하는데 경계를 안 넘는다"다.
-    #   ★ 둘 다 의무가 기계로 검사된다. 검사 없는 어휘 추가는 klass 를 자유 통행증으로 만든다.
-    #   ★ immutable_global(3) · intra_function_edge_enumeration(2) 는 **넣지 않았다** —
-    #     그건 종착 klass 가 아니라 기존 klass 의 **근거 유형**이다. 근거를 종착지로
-    #     승격시키면 결론 없이 행이 닫힌다. 그 셋은 검사기가 받아줄 근거를 넓히는 문제고,
-    #     구조 변경이라 운영자 몫으로 남긴다(unrecordable 에 그대로 있다).
-    "bounded_by_saturation": "공격자가 값에 **영향은 주지만** 단조 증가/포화라 범위가 clamp "
-                             "된다 — `not_controlled`(상수)도 `guarded`(지배 분기)도 아니다. "
-                             "sink= 와 함께 **누산 지점**(add/inc/sub/imul 앵커)과 **clamp 를 "
-                             "만드는 조건분기 앵커**를 둘 다 evidence 에 넣고, scope= 에 "
-                             "**무엇이 상한인지**(단조성 + clamp 값)를 적어라. clamp 앵커가 "
-                             "없으면 이 주장은 'not_controlled 에 말을 붙인 것'일 뿐이다",
-    "privileged_principal": "도달은 하는데 **그 싱크에 닿는 최소 principal 이 이미 그 싱크가 "
-                            "주는 권한을 쥐고 있다** — 경계를 안 넘는다. sink= 와 함께 "
-                            "**접근검사 `call` 앵커**를 evidence 에 넣고, scope= 에 그 최소 "
-                            "principal 을 **무엇으로 확정했는지** 적어라(장치 SD / IOCTL 의 "
-                            "RequiredAccess / AC ACE 등). ★ 'Everyone 이니까' 는 근거가 "
-                            "아니다 — 정적 판정이 AppContainer 를 덮은 사례가 있다",
+    #   partially_controlled 2 · range_bounded 2 = **21 proposals**. That row (n=18) tried
+    #   `not_controlled` and was **rightly** refused by the CFG check (the caller does influence the
+    #   value). There was simply no slot for "influenced, but clamped".
+    #   And the 4 privileged_principal proposals (n=8) are "reaches it, but crosses no boundary".
+    #   ★ Both have machine-checked obligations. Adding vocabulary without a check turns a klass into a free pass.
+    #   ★ immutable_global (3) · intra_function_edge_enumeration (2) were **not added** —
+    #     those are not terminal klasses but **kinds of grounds** for existing klasses. Promoting a kind of
+    #     grounds to a destination closes rows with no conclusion. Those are a matter of widening the grounds
+    #     the checker accepts, a structural change left to the operator (they remain in unrecordable as-is).
+    "bounded_by_saturation": "the attacker **influences** the value, but it increases monotonically / saturates "
+                             "so the range is clamped — neither `not_controlled` (a constant) nor `guarded` "
+                             "(a dominating branch). Together with sink=, put **both** the **accumulation point** "
+                             "(an add/inc/sub/imul anchor) and **the conditional-branch anchor that produces "
+                             "the clamp** in evidence, and write in scope= **what the upper bound is** "
+                             "(monotonicity + the clamp value). Without a clamp anchor this claim is "
+                             "just 'not_controlled with words attached'",
+    "privileged_principal": "it is reached, but **the minimum principal that reaches the sink already holds "
+                            "the privilege the sink grants** — no boundary is crossed. Together with sink=, "
+                            "put the **access-check `call` anchor** in evidence, and write in scope= "
+                            "**how you established** that minimum principal (device SD / the IOCTL's "
+                            "RequiredAccess / AC ACE, etc.). ★ 'because it is Everyone' is not "
+                            "grounds — there is a case where a static verdict covered over an AppContainer",
 }
 
-# ★ 2026-09-23 — **상태 의존 klass 는 실측 결박을 요구한다.**
-#   근거(mrxsmb 09-22 밤 실측): `gated_off` 로 낸 기각이 **4번** 깨졌고 파손 사유 4건이
-#   전부 같은 말이었다 — "the rejection never observed the value that selects the arm …
-#   'shipped default 1' is seed metadata, not a measurement of eax". 그 4회 왕복이
-#   23:48~02:09, 즉 **2시간 21분**(4시간 16분 런의 55%)을 먹었다.
-#   klass 의 의무가 "게이트가 있다"까지만 검사하고 "기본값이 안전한 쪽"은 무검사로
-#   통과시켰기 때문이다. 그 항은 런타임 값이라 앵커로는 못 세운다 — **재야 한다.**
-#   ⇒ 문장을 보지 않는다(어휘 의존 금지). `measured(target)` 이 돌려주는 실측 행의
-#      **존재와 kind** 만 본다. `trace` 는 관측이 아니다(closed-axis-trapped-in-notes).
-#   ★ 규칙은 kind 블랙리스트가 아니다 — `trace` 도 하네스가 쏜 관측이다(655행 주석).
-#     대신 **그 실측이 네가 주장하는 게이트를 건드렸는가**를 본다: gated_off 가 이미
-#     기록하는 `gate_anchors`(접근자 call + 안전팔 분기)와 실측의 주소가 겹쳐야 한다.
-#     mrxsmb 밤에 이 표적의 실측은 29건이었지만 **게이트 주소를 건드린 것은 0건**이었다 —
-#     "재긴 쟀다"와 "이 값을 쟀다"를 가르는 자리가 여기다.
-#   ★ delta_zero 는 `GATE_CONTROL_BEFORE_REJECT` 가 따로 양성대조를 요구하므로 넣지 않는다
-#     (두 게이트가 같은 것을 두 번 요구하면 우회를 만든다).
+# ★ 2026-09-23 — **a state-dependent klass requires binding to a measurement.**
+#   Grounds (measured on the mrxsmb night of 09-22): a rejection filed as `gated_off` was broken **4 times**,
+#   and all 4 break reasons said the same thing — "the rejection never observed the value that selects the arm …
+#   'shipped default 1' is seed metadata, not a measurement of eax". Those 4 round trips took
+#   23:48~02:09, i.e. **2 hours 21 minutes** (55% of a 4h16m run).
+#   Because the klass's obligation checked only "there is a gate" and let "the default is the safe
+#   side" through unchecked. That term is a runtime value and cannot be established by an anchor — **it must be measured.**
+#   => it does not look at sentences (no vocabulary dependence). It looks only at the **existence and kind**
+#      of the measurement rows `measured(target)` returns. A `trace` is not an observation (closed-axis-trapped-in-notes).
+#   ★ The rule is not a kind blacklist — a `trace` is also an observation the harness fired (comment at line 655).
+#     Instead it checks **whether that measurement touched the gate you claim**: the `gate_anchors` that
+#     gated_off already records (accessor call + safe-arm branch) must overlap the measurement's addresses.
+#     On the mrxsmb night this target had 29 measurements, but **zero touched the gate's addresses** —
+#     this is where "measured something" is told apart from "measured this value".
+#   ★ delta_zero is not included, because `GATE_CONTROL_BEFORE_REJECT` separately demands a positive control
+#     (two gates demanding the same thing twice creates a bypass).
 _REQUIRES_MEASURE = {"gated_off"}
 
 
-# ★ 2026-09-06. klass 별로 **무엇을 인용해야 하는가**. 게이트를 느슨하게 하지 않는다 —
-#   "인용 1개 이상" 요구는 그대로다. 다만 거절 문구가 일반론이면 재시도가 안 된다.
-#   실측: 케이스 3에서 같은 행(`fn1_AhcApiRemove … AhcpCacheEntryFilter`, klass=impact_unproven)이
-#   **01:24·01:25·01:26 세 번 연속** "인용 0건"으로 막혔다. 회차 반려 5건 중 3건이 이것이다.
-#   `impact_unproven` 은 "아무도 안 읽는다"는 **부재** 주장이라 인용할 명령을 못 찾은 것이다 —
-#   답은 "싱크 명령 자체"인데 문구가 그 말을 안 했다.
+# ★ 2026-09-06. **What to cite**, per klass. This does not loosen the gate —
+#   the "at least 1 citation" requirement stays. But a generic refusal message does not lead to a successful retry.
+#   Measured: in case 3 the same row (`fn1_AhcApiRemove … AhcpCacheEntryFilter`, klass=impact_unproven) was
+#   blocked with "0 citations" **three times in a row at 01:24·01:25·01:26.** 3 of that round's 5 denials were this.
+#   `impact_unproven` is a claim of **absence** ("nobody reads it"), so the agent could not find an instruction to cite —
+#   the answer was "the sink instruction itself", and the message never said so.
 _CITE_HINT = {
     "guarded":            "the conditional branch you call the guard, AND the sink instruction it dominates",
     "unreachable":        "the call/xref sites you enumerated (the ones that do NOT reach it)",
@@ -2687,14 +2698,14 @@ def _img():
         return None
 
 
-_DF_RE = re.compile(r'double[ _-]?fetch|더블\s*페치|두 번 읽|재독|re-?read|같은 읽기|단일 읽기|'
-                    r'ProbeFor|캡처|captur|MmProbe|__try', re.I)
-_RACE_RE = re.compile(r'race|경합|레이스|async|비동기|cancel|취소|work ?item|DPC|타이머|timer|'
-                      r'완료 ?루틴|completion|재검증|revalidat|Interlocked|참조 ?카운트|refcount', re.I)
+_DF_RE = re.compile(r'double[ _-]?fetch|read twice|re-?read|same read|single[ -]read|'
+                    r'ProbeFor|captur|MmProbe|__try', re.I)
+_RACE_RE = re.compile(r'race|async|cancel|work ?item|DPC|timer|'
+                      r'completion|revalidat|Interlocked|reference ?count|refcount', re.I)
 
 
 def _is_neither(tgt):
-    """METHOD_NEITHER 표적인가. 이름 또는 표면 레코드에서 판정한다."""
+    """Is this a METHOD_NEITHER target? Decided from the name or the surface record."""
     t = (tgt or "").upper()
     if "NEITHER" in t:
         return True
@@ -2707,7 +2718,7 @@ def _is_neither(tgt):
 
 
 def _cites(text):
-    """근거 텍스트의 `0xADDR mnem ops` 인용 목록. evidence 모듈이 없으면 빈 목록."""
+    """The `0xADDR mnem ops` citations in an evidence text. An empty list when the evidence module is missing."""
     try:
         import evidence as EV
         return EV.parse(text or "")
@@ -2716,14 +2727,14 @@ def _cites(text):
 
 
 def _reject_open_lead(tgt, args):
-    """이 기각의 앵커가 **이미 깨진(broke) 열린 리드**와 겹치는지 본다. 겹치면 그 리드를
-    돌려준다 — 재도출로 죽은 축을 다시 기각하는 것을 막기 위해서다.
+    """Check whether this rejection's anchors overlap an **open lead that was already broken (broke)**. If they
+    do, return that lead — to stop a dead axis from being rejected again by re-derivation.
 
-    ★ 2026-09-25 — 실제 사건: TDIDRAIN 을 인터로게이터가 4번 깼고 break 마다 reason·
-      next_method 를 남겼는데, 뒤 세션(과 모델 자신)이 그 근거를 **읽지 않고 재도출**해
-      "음성"으로 다시 냈다. reject 게이트는 klass 형태만 봤지 '이 축이 이미 깨졌나'를 안 봤다.
+    ★ 2026-09-25 — the real incident: the interrogator broke TDIDRAIN 4 times, leaving a reason and
+      next_method on every break, yet a later session (and the model itself) **re-derived without reading**
+      those grounds and filed it again as a "negative". The reject gate looked only at the klass's form, never at 'was this axis already broken'.
       (memory: broke-rejections-are-open-not-negative · analysis-outran-measurement)
-    접지: `open_leads(STATE.target)` — 현재 이미지로 스코프(교차오염 없음), 매 호출 재도출.
+    Grounding: `open_leads(STATE.target)` — scoped to the current image (no cross-contamination), re-derived on every call.
     """
     try:
         blob = " ".join(str(args.get(k) or "")
@@ -2742,33 +2753,34 @@ def _reject_open_lead(tgt, args):
 
 
 def _reject_gate(tgt, args):
-    """기각도 실측을 통과해야 한다. (ok, 메시지, 검증기록)"""
+    """A rejection must pass measurement too. Returns (ok, message, verification record)."""
     klass = (args.get("klass") or "").strip().lower()
     ev = args.get("evidence", "") or ""
     rec = {"klass": klass}
     img = _img()
 
-    # ★ 재도출-재기각 차단: 이 축이 이미 깨진 열린 리드면, break 근거를 보여주고
-    #   설계된 출구(action='lead')로 보낸다. contest_lead= 로 명시적 반박은 통과시킨다
-    #   (길 없는 거부는 헛돌기를 만든다 — predicate-cannot-ask).
+    # ★ Block re-derive-and-re-reject: if this axis is an open lead that has already been
+    #   broken, show the break's grounds and send the caller to the designed exit
+    #   (action='lead'). An explicit rebuttal via contest_lead= is let through
+    #   (a refusal with no way forward produces spinning — predicate-cannot-ask).
     _lead = _reject_open_lead(tgt, args)
     if _lead is not None and str(args.get("contest_lead") or "").strip() != str(_lead.get("id")):
         return (False,
-                "⚠ 이 축은 인터로게이터가 이미 깼다 — 열린 리드 %s (klass=%s, attempt=%s).\n"
-                "재도출로 다시 기각하지 마라. 그 break 가 남긴 근거부터 반박하라:\n"
+                "⚠ The interrogator has already broken this axis — open lead %s (klass=%s, attempt=%s).\n"
+                "Do not reject it again by re-deriving it. Rebut the grounds that break left behind first:\n"
                 "  reason: %s\n"
                 "  next_method: %s\n"
-                "설계된 출구는 `verdict(action='lead', id='%s', how='refuted'|'measured'|"
-                "'reinterrogated', why=...)` — 반박·측정·재심문 중 하나로 닫아야 한다.\n"
-                "이 기각이 정말로 그 break 근거를 반박하는 것이라면 `contest_lead='%s'` 를 달고 "
-                "why 에 break 의 **어느 항을 어떻게** 반증했는지 적어라(그러면 통과한다)."
+                "The designed exit is `verdict(action='lead', id='%s', how='refuted'|'measured'|"
+                "'reinterrogated', why=...)` — it must be closed by a refutation, a measurement or a re-interrogation.\n"
+                "If this rejection really does rebut the grounds of that break, attach `contest_lead='%s'` and "
+                "write in why **which term of the break you disproved, and how** (then it passes)."
                 % (_lead.get("id"), _lead.get("klass"), _lead.get("attempt"),
-                   str(_lead.get("reason"))[:400] or "(없음)",
-                   str(_lead.get("next_method"))[:250] or "(없음)",
+                   str(_lead.get("reason"))[:400] or "(none)",
+                   str(_lead.get("next_method"))[:250] or "(none)",
                    _lead.get("id"), _lead.get("id")),
                 rec)
 
-    # ★ second_site — 원본 판정이 실재해야 한다(A/D형: id 조회 + 앵커 기계검증)
+    # ★ second_site — the origin verdict must exist (A/D shape: id lookup + machine-verified anchors)
     if klass == "second_site":
         _oid = str(args.get("origin_id") or "").strip()
         _ids = {str(v.get("id")) for v in (STATE.get("verdicts") or [])}
@@ -2777,10 +2789,10 @@ def _reject_gate(tgt, args):
                            "on this ledger (the site whose defect this repeats).\n"
                            "Known ids: %s" % ", ".join(sorted(_ids)[:12]), rec)
         rec["origin_id"] = _oid
-    # ★ bounded_absence — 범위 선언이 있어야 한다. 전역 부재가 아니라는 것이 요점이다
+    # ★ bounded_absence — a scope declaration is required. The point is that it is not a global absence
     if klass == "bounded_absence" and img is not None:
-        # ★ 2026-09-23 — 부재형에서 여기로 보냈으면(위 R4 (a)), **수를 맞추게** 한다.
-        #   범위를 좁히는 것과 반례를 못 본 척하는 것은 다르다. 문장이 아니라 수로 검사한다.
+        # ★ 2026-09-23 — when an absence-form rejection was sent here (R4 (a) above), **make it match the count.**
+        #   Narrowing the scope is not the same as pretending not to have seen the counterexamples. It is checked by a number, not by a sentence.
         try:
             import icall as _ic2
             _sc2 = _ic2.scan(img)
@@ -2796,12 +2808,12 @@ def _reject_gate(tgt, args):
                 _dec = -1
             if _dec != len(_un2):
                 return (False,
-                        "이 이미지에는 미해소 함수포인터가 **%d개** 있다. 범위 한정 부재를 "
-                        "쓰려면 그 수를 직접 적어라: `excludes_indirect=%d`.\n"
-                        "(적은 값: %s) — 수를 맞추는 것이 '반례를 봤다'의 최소 증명이다. "
-                        "범위를 좁히는 것과 반례를 못 본 척하는 것은 다르다."
+                        "This image has **%d** unresolved function pointers. To file a bounded "
+                        "absence, write that count yourself: `excludes_indirect=%d`.\n"
+                        "(value given: %s) — matching the count is the minimum proof of 'I saw the counterexamples'. "
+                        "Narrowing the scope is not the same as pretending not to have seen the counterexamples."
                         % (len(_un2), len(_un2),
-                           args.get("excludes_indirect") if args.get("excludes_indirect") is not None else "없음"),
+                           args.get("excludes_indirect") if args.get("excludes_indirect") is not None else "none"),
                         rec)
             rec["excludes_indirect"] = len(_un2)
     if klass == "bounded_absence":
@@ -2812,9 +2824,9 @@ def _reject_gate(tgt, args):
                            "whole image)? An absence claim without its range is a global absence "
                            "claim, and that is a different (much stronger) statement.", rec)
         rec["scope_decl"] = _sc[:200]
-    # ★ state_precondition — 상태를 만드는 분기를 **전수로** 대야 한다.
-    #   기계검사: 인용 중 **조건분기**가 2개 이상인가 + sink= 가 있는가.
-    #   (주소 자체의 실재성은 아래 R1 이 이미지 대조로 따로 검증한다.)
+    # ★ state_precondition — the branches that produce the state must be given **exhaustively.**
+    #   Machine check: are there 2+ **conditional branches** among the citations, and is there a sink=?
+    #   (Whether the addresses themselves exist is verified separately against the image by R1 below.)
     if klass == "state_precondition":
         _sk = str(args.get("sink") or "").strip()
         _br = [c for c in _cites(ev)
@@ -2831,13 +2843,13 @@ def _reject_gate(tgt, args):
                            "applies and you should be able to satisfy it."
                     % ("yes" if _sk else "MISSING", len(_br)), rec)
         rec["precondition_branches"] = ["0x%x" % c["va"] for c in _br][:8]
-    # ★ callsite_guarded — 그 호출지점이 실제로 `call` 이어야 한다.
-    #   요점은 **주장의 범위를 좁히는 것**이다: 다른 호출자는 여전히 미분석으로 남는다.
+    # ★ callsite_guarded — that callsite must actually be a `call`.
+    #   The point is **narrowing the scope of the claim**: the other callers stay unanalysed.
     if klass == "callsite_guarded":
         _cs = str(args.get("callsite") or "").strip()
         _gd = str(args.get("guard") or "").strip()
-        # ★ 공백이 아니라 개행으로 잇는다 — CITE 의 ops 는 `[^\n;/]*` 라 한 줄에
-        #   두 인용을 붙이면 뒤엣것이 앞 인용의 오퍼랜드로 먹힌다(방금 실측).
+        # ★ Joined with a newline, not a space — CITE's ops is `[^\n;/]*`, so putting two
+        #   citations on one line makes the second one swallowed as the first one's operands (just measured).
         _calls = [c for c in _cites(ev + "\n" + _cs) if (c["mnem"] or "") == "call"]
         if not _gd or not _calls:
             return (False, "klass='callsite_guarded' scopes the dominance claim to ONE callsite "
@@ -2851,10 +2863,10 @@ def _reject_gate(tgt, args):
                     % ("yes" if _gd else "MISSING", len(_calls)), rec)
         rec["callsite"] = ["0x%x" % c["va"] for c in _calls][:4]
         rec["callsite_scoped"] = True
-    # ★ gated_off — "기본값이 안전한 쪽"은 **두 앵커**로 증명된다: 게이트를 읽는 호출과
-    #   안전한 갈래를 고르는 분기. 하나만으로는 "게이트가 있다"까지밖에 못 간다.
-    #   (실측 근거: ahcache `Feature_EnsureVerBlockCanHoldFixedInfo` 는
-    #    `0x1400558cf call` + `0x1400558d6 je` 두 앵커가 정확히 이 모양이다.)
+    # ★ gated_off — "the default is the safe side" is proven by **two anchors**: the call that reads
+    #   the gate, and the branch that picks the safe arm. One alone only gets as far as "a gate exists".
+    #   (Measured grounds: ahcache `Feature_EnsureVerBlockCanHoldFixedInfo` has exactly this shape,
+    #    the two anchors `0x1400558cf call` + `0x1400558d6 je`.)
     if klass == "gated_off":
         _gt = str(args.get("gate") or "").strip()
         _cs = _cites(ev)
@@ -2873,10 +2885,10 @@ def _reject_gate(tgt, args):
                     % ("yes" if _gt else "MISSING", len(_ca), len(_br)), rec)
         rec["gate_name"] = _gt[:120]
         rec["gate_anchors"] = ["0x%x" % c["va"] for c in (_ca + _br)][:6]
-    # ★ impact_unproven — "소비자가 없다"는 **부재 주장**이다. 범위 없이는 성립 안 한다.
-    #   실측 근거: msquic V-I8-C1-CIBIR 이 "소비자 없음"으로 닫혔는데 소비자가 있었다
-    #   (`0x14002ac68`/`0x14002ac8a`). 게다가 **다른 오프셋을 xref 해서** 그렇게 됐다.
-    #   범위를 적게 하면 어느 오프셋을 훑었는지가 글에 드러나고, 그 오독이 보인다.
+    # ★ impact_unproven — "there is no consumer" is an **absence claim.** It does not hold without a scope.
+    #   Measured grounds: msquic V-I8-C1-CIBIR was closed as "no consumer" while consumers existed
+    #   (`0x14002ac68`/`0x14002ac8a`). Worse, it got there by **xref'ing a different offset.**
+    #   Requiring the scope puts in writing which offset was swept, and that misreading becomes visible.
     if klass == "impact_unproven":
         _sk = str(args.get("sink") or "").strip()
         _sc = str(args.get("scope") or "").strip()
@@ -2893,11 +2905,11 @@ def _reject_gate(tgt, args):
                            "Naming the range is what makes that visible."
                     % ("yes" if _sk else "MISSING", len(_sc)), rec)
         rec["consumer_scope"] = _sc[:200]
-    # ★ bounded_by_saturation — "영향은 주는데 clamp 된다"는 **두 사실**이다.
-    #   (1) 값이 커지는 지점(누산)  (2) 그것을 멈추는 지점(clamp 분기)
-    #   (2) 가 없으면 상한이 없는 것이고, 그러면 이 klass 가 아니라 미판정이다.
-    #   실측 근거: 이 모양을 요청한 행(n=18)이 인용한 것이 정확히 산술 앵커 둘이었다
-    #   (`0x1400277b9 add dword ptr [rbx+0xb0], esi; 0x1400277c6 add ...`) — clamp 는 없었다.
+    # ★ bounded_by_saturation — "it has influence but gets clamped" is **two facts.**
+    #   (1) where the value grows (accumulation)  (2) where it is stopped (the clamp branch)
+    #   Without (2) there is no upper bound, and then it is not this klass but undecided.
+    #   Measured grounds: the row (n=18) that asked for this shape cited exactly two arithmetic anchors
+    #   (`0x1400277b9 add dword ptr [rbx+0xb0], esi; 0x1400277c6 add ...`) — there was no clamp.
     if klass == "bounded_by_saturation":
         _sk = str(args.get("sink") or "").strip()
         _sc = str(args.get("scope") or "").strip()
@@ -2922,11 +2934,11 @@ def _reject_gate(tgt, args):
         rec["saturation_sites"] = ["0x%x" % c["va"] for c in _ar][:4]
         rec["clamp_branches"] = ["0x%x" % c["va"] for c in _br][:4]
         rec["bound_scope"] = _sc[:200]
-    # ★ privileged_principal — 이 klass 는 **가장 오용하기 쉽다**. "어차피 관리자잖아"가
-    #   그대로 통과하면 AppContainer/저권한 호출자가 통째로 사라진다.
-    #   그래서 최소 principal 을 **무엇으로 확정했는지**를 앵커와 함께 요구한다.
-    #   (memory `appcontainer-axis-ace-rule`: Everyone ACE 는 근거가 아니다.
-    #    `wudfrd-boundary-is-umdf-host`: 실제로는 PID 게이트가 먼저 막고 있었다.)
+    # ★ privileged_principal — this klass is **the easiest to misuse.** If "it is admin anyway"
+    #   passes as-is, AppContainer/low-privilege callers vanish wholesale.
+    #   So it requires, with an anchor, **what fixed** the minimum principal.
+    #   (memory `appcontainer-axis-ace-rule`: an Everyone ACE is not grounds.
+    #    `wudfrd-boundary-is-umdf-host`: in reality a PID gate was blocking first.)
     if klass == "privileged_principal":
         _sk = str(args.get("sink") or "").strip()
         _sc = str(args.get("scope") or "").strip()
@@ -2949,13 +2961,13 @@ def _reject_gate(tgt, args):
                     % ("yes" if _sk else "MISSING", len(_sc), len(_ca)), rec)
         rec["principal_check"] = ["0x%x" % c["va"] for c in _ca][:4]
         rec["principal_scope"] = _sc[:200]
-    # R2 — 사유 분류 필수. 사유마다 의무가 다르다.
+    # R2 — a reason class is mandatory. Each reason carries a different obligation.
     if klass not in _REJECT_KLASS:
         return (False, "A rejection REQUIRES a klass — each reason carries a DIFFERENT measurement obligation.\n"
                 + "\n".join("  %-20s %s" % (k, v) for k, v in _REJECT_KLASS.items())
                 + "\n\nWithout choosing one, the harness cannot decide what measurement to demand of you.", rec)
 
-    # R2b — 상태 의존 klass 는 **실측 결박** 없이는 성립하지 않는다 (_REQUIRES_MEASURE).
+    # R2b — a state-dependent klass does not hold without a **binding to a measurement** (_REQUIRES_MEASURE).
     if klass in _REQUIRES_MEASURE:
         _want = {str(x).lower() for x in (rec.get("gate_anchors") or [])}
         _mm = []
@@ -2968,29 +2980,29 @@ def _reject_gate(tgt, args):
                 _mm.append(_m)
         if not _mm:
             return (False,
-                    "klass=%r 의 진리값은 **런타임 상태**에 달려 있다 — 앵커로는 못 세운다.\n"
-                    "이 표적의 실측 중 **네가 지목한 게이트 주소를 건드린 것이 없다**.\n"
-                    "  · gated_off → 게이트의 상태를 실제로 읽어라 (kd: featureState / "
-                    "레지스트리 오버라이드 / probe). 컴파일 기본값 바이트는 메타데이터지 관측이 아니다.\n"
-                    "  · delta_zero → control() 로 정상 경로를 실제로 돌려라.\n"
-                    "**재기 전에는 기각이 아니라 미분석이다** — `verdict(action='gate_blocked', "
-                    "gate='needs-measurement', why=…, would_be=…)` 로 봉하고 그 관측을 다음 회차에 "
-                    "요구하라. (근거: 이 검사가 없어서 같은 행이 4회 왕복하며 2시간 21분을 먹었다.)"
+                    "The truth value of klass=%r depends on **runtime state** — anchors cannot establish it.\n"
+                    "**None of this target's measurements touched the gate address you named.**\n"
+                    "  · gated_off → actually read the gate's state (kd: featureState / "
+                    "registry override / probe). The compiled default byte is metadata, not an observation.\n"
+                    "  · delta_zero → actually run the normal path with control().\n"
+                    "**Until it is measured it is not a rejection, it is unanalysed** — seal it with `verdict(action='gate_blocked', "
+                    "gate='needs-measurement', why=…, would_be=…)` and demand that observation in the next "
+                    "round. (Grounds: without this check the same row bounced back and forth 4 times and ate 2h21m.)"
                     % klass, rec)
         rec["measure_binding"] = [
             "%s/%s" % (str(m.get("kind"))[:12], str(m.get("principal_grade") or "?")[:14])
             for m in _mm[:4]]
 
-    # R7 — METHOD_NEITHER 은 **더블페치 표면**이다. 유저 포인터가 커널 사본 없이 넘어온다.
-    #   실측(WUDFRd 08-31 야간): 표에 NEITHER 항목이 2개 있었는데 코퍼스 전체에서
-    #   `double fetch` 등장 0회. 축 자체가 한 번도 안 돌았다.
+    # R7 — METHOD_NEITHER is a **double-fetch surface.** The user pointer arrives with no kernel copy.
+    #   Measured (WUDFRd, 08-31 overnight): the table had 2 NEITHER entries, yet across the whole corpus
+    #   `double fetch` appeared 0 times. The axis itself never ran once.
     if klass in ("guarded", "not_controlled", "no_sink") and _is_neither(tgt):
         if not _DF_RE.search(ev + " " + (args.get("claim") or "")):
             return (True, "", ask(rec,
                     "You are rejecting a METHOD_NEITHER target on a single-read assumption.",
                     "double_fetch_unchecked"))
 
-    # R8 — 등재된 경합 쌍의 항을 **단일 요청만 보고** 기각하려 하는가.
+    # R8 — is this rejecting one side of a registered race pair **having looked only at a single request**?
     if klass in ("guarded", "not_controlled", "no_sink", "unreachable"):
         _partners = [k for k, v in (STATE.get("surface") or {}).items()
                      if v.get("kind") == "race" and tgt in (v.get("pair") or [])]
@@ -3000,7 +3012,7 @@ def _reject_gate(tgt, args):
                     "This target is one side of a registered race pair: " + _partners[0][:120],
                     "race_axis_unchecked"))
 
-    # R1 — 앵커 기계검증 (확정과 동일한 G1 을 기각에도 적용)
+    # R1 — machine-verify the anchors (the same G1 as for a confirmation, applied to a rejection)
     if img is not None:
         import evidence as EV
         res, summ = EV.check(img, ev, images=_images_for_anchor())
@@ -3023,18 +3035,18 @@ def _reject_gate(tgt, args):
                     + EV.render(res, summ)
                     + "\n\nThis is a hallucinated address, a typo, or a STALE-BUILD ANCHOR. Re-derive it.", rec)
 
-    # R5 — `delta_zero`("정상 경로로도 같은 결과")는 **양성 대조 실측**을 요구한다.
-    # 대조 없는 실측 기각은 하네스 고장과 구분되지 않는다.
+    # R5 — `delta_zero` ("the normal path yields the same result") requires a **positive-control measurement.**
+    # A measured rejection with no control is indistinguishable from a broken harness.
     if klass == "delta_zero" and not has_control("positive"):
         return (False, "klass='delta_zero' is a MEASURED claim: 'the normal path yields the "
                        "same result'. But there is no positive control in the ledger. Record "
                        "'under conditions that should work, it IS observed' first via "
                        "control(kind='positive') — a broken harness and a zero delta produce "
                        "the same output.", rec)
-    # ★ 대조가 **있기는 한데 같은 것을 잰 것인가.** C-029: `has_control` 이 원장 전역이라
-    #   첫 대조 하나가 그 표적의 남은 모든 `delta_zero` 를 면제했다. 여기서는 **막지 않고**
-    #   겹침을 계산해 붙인다(refs/05 — 결정론 층에 억제 권한을 주지 않는다).
-    #   `delta_zero` 는 어차피 승격자가 blocking 으로 받으므로 판단은 거기서 난다.
+    # ★ A control **exists, but did it measure the same thing?** C-029: `has_control` is ledger-wide,
+    #   so the first control exempted every remaining `delta_zero` on that target. Here it **does not block**;
+    #   it computes the overlap and attaches it (refs/05 — the deterministic layer is given no suppression authority).
+    #   The promoter takes `delta_zero` as blocking anyway, so the judgement is made there.
     if klass == "delta_zero":
         try:
             rec["control_overlap"] = control_overlap(
@@ -3042,8 +3054,8 @@ def _reject_gate(tgt, args):
         except Exception as _e:
             rec["control_overlap"] = {"verdict": "error", "why": str(_e)[:120]}
 
-    # R6 — `not_controlled`("값이 상수다")는 그 상수를 **박아넣는 명령**을 앵커로 요구한다.
-    # `mov reg, imm` / `mov [mem], imm` 형태가 아니면 상수 근거가 아니다.
+    # R6 — `not_controlled` ("the value is a constant") requires, as an anchor, **the instruction that plants** that constant.
+    # Anything not of the form `mov reg, imm` / `mov [mem], imm` is not grounds for a constant.
     if klass == "not_controlled" and img is not None:
         import evidence as EV
         cites = EV.parse(ev)
@@ -3063,12 +3075,12 @@ def _reject_gate(tgt, args):
                            "friends). Your basis does not have one — 'it looks constant' and "
                            "'the constant is written HERE' are different claims.", rec)
 
-    # R4 — 부재형 기각(no_sink / unreachable)은 **전 실행섹션 xref** 를 요구한다.
-    # `.text` 만 보고 "호출이 없다"고 쓴 실패가 실제로 있었다(ipt.sys / PAGE).
+    # R4 — an absence-form rejection (no_sink / unreachable) requires an **xref over every executable section.**
+    # A failure that looked only at `.text` and wrote "there is no call" really happened (ipt.sys / PAGE).
     if klass in ("no_sink", "unreachable") and img is not None:
-        # ★ xref 는 **직접 참조만** 본다. WDM/KMDF 디스패치 표가 곧 함수 포인터 배열이므로,
-        #   미해결 함수포인터 저장이 있으면 부재 증명이 성립하지 않는다.
-        #   지금 R4 는 "기각이 문서화됨"만 보장하고 "옳음"은 보장 못 한다.
+        # ★ xref sees **direct references only.** A WDM/KMDF dispatch table is itself an array of function
+        #   pointers, so if unresolved function-pointer stores exist, an absence proof does not hold.
+        #   As it stands R4 only guarantees "the rejection is documented", not "it is right".
         try:
             import icall as _ic
             _sc = _ic.scan(img)
@@ -3077,51 +3089,51 @@ def _reject_gate(tgt, args):
                                  for c in _sc["icalls"])]
             if _unres:
                 rec["indirect_unresolved"] = len(_unres)
-                # ★ 2026-09-10 — **"26개"만 말하면 아무도 못 푼다.** 실측(ahcache 9168):
-                #   26건 중 다수가 `base='rsp'` 즉 `mov [rsp+0x20/0x28/0x30/0x38], rax` 로,
-                #   Windows x64 의 **5번째 이후 호출 인자 슬롯**이다 — 디스패치 표가 아니라
-                #   **콜백을 인자로 넘기는** 코드다. 그런데 매칭은 `off` 를 구조체 오프셋처럼
-                #   비교하므로 rsp 상대 오프셋은 영원히 안 맞는다.
-                #   ★ 그렇다고 제외하지 않는다: 넘겨진 콜백은 **피호출자가 부를 수 있으므로**
-                #     부재 주장에 여전히 유효한 반례다. 게이트는 그대로 두고 **모양만 보여준다** —
-                #     "26" 은 불투명한 벽이고, 분해된 목록은 작업 지시다.
+                # ★ 2026-09-10 — **saying only "26" lets nobody resolve it.** Measured (ahcache 9168):
+                #   most of the 26 are `base='rsp'`, i.e. `mov [rsp+0x20/0x28/0x30/0x38], rax` —
+                #   the Windows x64 **argument slots from the 5th argument on** — code that **passes a
+                #   callback as an argument**, not a dispatch table. But the matching compares `off` as if it
+                #   were a struct offset, so an rsp-relative offset never matches.
+                #   ★ They are still not excluded: a passed callback **can be called by the callee**, so it
+                #     remains a valid counterexample to an absence claim. The gate stays as it is and **only shows the shape** —
+                #     "26" is an opaque wall; a broken-down list is a work order.
                 _byb = {}
                 for _u in _unres:
-                    _byb.setdefault("스택 인자(rsp)" if str(_u.get("base")) == "rsp"
-                                    else "구조체 슬롯(%s)" % _u.get("base"), []).append(_u)
+                    _byb.setdefault("stack argument (rsp)" if str(_u.get("base")) == "rsp"
+                                    else "struct slot (%s)" % _u.get("base"), []).append(_u)
                 def _hx(v):
-                    """VA 는 **16진수**로. 10진수 5368730976 은 분석자에게 아무 의미가 없다."""
+                    """A VA **in hex.** Decimal 5368730976 means nothing to an analyst."""
                     try:
                         return "0x%X" % int(str(v), 0)
                     except (TypeError, ValueError):
                         return str(v)
                 _tf = sorted({_hx(_u.get("func")) for _u in _unres})
                 rec["indirect_shapes"] = {k: len(v) for k, v in _byb.items()}
-                _shape = ("\n분해: " + " · ".join("%s %d" % (k, len(v))
+                _shape = ("\nbreakdown: " + " · ".join("%s %d" % (k, len(v))
                                                  for k, v in sorted(_byb.items()))
-                          + "\n실린 함수 %d개: %s"
+                          + "\n%d functions involved: %s"
                           % (len(_tf), ", ".join(_tf[:8]) + (" …" if len(_tf) > 8 else ""))
-                          + "\n★ `rsp` 저장은 **디스패치 표가 아니라 인자 전달**이다(5번째 이후 "
-                            "인자 슬롯). 그래도 피호출자가 그 콜백을 부를 수 있으므로 부재 "
-                            "주장의 반례로 유효하다 — 푸는 길은 **그 콜백을 받는 피호출자를 "
-                            "짚어 그 안에서 해소**하거나, 주장을 그 함수들이 못 닿는 범위로 "
-                            "좁히는 것이다.")
-                # ★ 한 번에 포맷한다. `A + _shape + B % args` 로 쓰면 `%` 가 `+` 보다
-                #   먼저 묶여 뒤 리터럴에만 붙고 TypeError 가 난다 — 그러면 아래
-                #   `except` 가 그걸 삼켜 **게이트가 통과된다**(조용한 완화).
-                #   실제로 이 수정의 첫 판이 그 모양이었다. [[refactor-loosens-guards]]
+                          + "\n★ An `rsp` store is **argument passing, not a dispatch table** (an argument "
+                            "slot from the 5th on). The callee can still call that callback, so it remains a "
+                            "valid counterexample to the absence claim — the way out is to **point at the callee "
+                            "that receives the callback and resolve it there**, or to narrow the claim to a "
+                            "range those functions cannot reach.")
+                # ★ Format in one go. Written as `A + _shape + B % args`, `%` binds tighter than `+`,
+                #   attaches only to the last literal and raises a TypeError — which the `except`
+                #   below then swallows, and **the gate passes** (a silent loosening).
+                #   The first version of this fix really had that shape. [[refactor-loosens-guards]]
                 _head = ("There are %d UNRESOLVED FUNCTION POINTERS and you are filing "
                          "an absence-form rejection (klass='%s')."
                          % (len(_unres), klass))
                 _eg = ("\ne.g. %s  %s  -> function %s"
                        % (_hx(_unres[0].get("take")), _unres[0].get("insn", "?"),
                           _hx(_unres[0].get("func"))))
-                # ★ 2026-09-23 — 옛 문구는 **막다른 길만** 가리켰다("File it as blocked").
-                #   그 결과 mrxsmb 09-23 에 census 가 실질적으로 끝난 형제 5개가
-                #   "only the verdict FORM is refused" 로 통째로 미기록됐다.
-                #   탈출구는 이미 어휘에 있다 — `bounded_absence`(범위 한정 부재).
-                #   다만 그리로 보내면서 **숫자를 맞추게** 한다: 미해소 포인터 개수를
-                #   `excludes_indirect=` 로 직접 적어야 통과한다(문장이 아니라 수).
+                # ★ 2026-09-23 — the old wording pointed **only at a dead end** ("File it as blocked").
+                #   As a result, on mrxsmb 09-23 five siblings whose census was effectively finished
+                #   went entirely unrecorded with "only the verdict FORM is refused".
+                #   The escape hatch is already in the vocabulary — `bounded_absence` (a scope-bounded absence).
+                #   But sending it there **makes the number match**: it passes only when the count of
+                #   unresolved pointers is written directly as `excludes_indirect=` (a number, not a sentence).
                 _tail = ("\nxref only sees direct references — if those functions can be "
                          "called indirectly, 'there is none' does not hold.\n"
                          "TWO legitimate ways forward — do NOT reword this klass a second time:\n"
@@ -3142,12 +3154,12 @@ def _reject_gate(tgt, args):
                        "and ALL FIVE authorization calls sat in PAGE. Looking only at .text "
                        "makes authorization appear to be zero." % klass, rec)
 
-    # R3 — `guarded` 는 CFG 지배를 계산한다. 짝은 **선언**해야 한다(추론 금지).
+    # R3 — `guarded` computes CFG dominance. The pair must be **declared** (no inference).
     if klass == "guarded":
-        # ★ 2026-09-04: `guards=` (복수) 를 받는다. 불변식을 **여러 블록이 함께** 세우는
-        #   모양(체인/인그레스별 분기)을 단일 지배로는 표현할 수 없어서, 지휘자가 09-02 부터
-        #   14회 같은 것을 보고했다. n=1 이면 `gates()` 와 **verdict 문자열까지** 동일하므로
-        #   옛 판정 재실행이 그대로 회귀 시험이다(test_cutgate.py).
+        # ★ 2026-09-04: accepts `guards=` (plural). A shape where **several blocks together** establish
+        #   the invariant (a chain / a branch per ingress) cannot be expressed as a single dominance, so the
+        #   conductor reported the same thing 14 times from 09-02 on. With n=1 it is identical to `gates()`
+        #   **down to the verdict string**, so re-running old verdicts is itself the regression test (test_cutgate.py).
         _gs = args.get("guards")
         if isinstance(_gs, str):
             _gs = [x.strip() for x in re.split(r'[,\s]+', _gs) if x.strip()]
@@ -3156,40 +3168,40 @@ def _reject_gate(tgt, args):
             try:
                 gset.append(int(str(_x), 0))
             except (TypeError, ValueError):
-                # ★ 2026-09-10 — **`image!VA` 는 오타가 아니라 다른 주장이다.**
-                #   실측: 03:17~03:19 에 한 행(`class1-mask-delta impact rung`)에서 거부가
-                #   4번 연달아 났고 그중 하나가 `guards=['apphelp!0…']` 이었다. 옛 메시지는
-                #   "must be VAs (0x…)" 라고만 해서 분석자가 형식 문제로 읽고 2분간 헛돌다
-                #   그 행을 BLOCKED 로 닫았다. 형식 문제가 아니다 —
-                #   **CFG 지배는 이미지를 가로지를 수 없으므로 `guarded` 가 애초에 틀린 klass 다.**
-                #   허용으로 바꾸지 않는다(그러면 계산할 수 없는 것을 계산했다고 기록하게 된다).
-                #   대신 **갈 길을 댄다.**
+                # ★ 2026-09-10 — **`image!VA` is not a typo, it is a different claim.**
+                #   Measured: from 03:17 to 03:19 one row (`class1-mask-delta impact rung`) was refused
+                #   4 times in a row, and one of them was `guards=['apphelp!0…']`. The old message said only
+                #   "must be VAs (0x…)", so the analyst read it as a format problem, spun for 2 minutes and
+                #   closed the row as BLOCKED. It is not a format problem —
+                #   **CFG dominance cannot cross images, so `guarded` was the wrong klass to begin with.**
+                #   It is not changed to an allowance (that would record having computed something uncomputable).
+                #   Instead it **gives the ways forward.**
                 _m = re.match(r"^\s*([A-Za-z_][\w.-]*)\s*!\s*(0x[0-9A-Fa-f]+|\d+)\s*$", str(_x))
                 if _m:
                     _im, _iva = _m.group(1), _m.group(2)
                     _reg = (STATE.get("images") or {}).get(_im)
                     rec["cross_image_guard"] = {"image": _im, "va": _iva,
                                                 "registered": bool(_reg)}
-                    _known = ("등록돼 있다 (build %s)" % str(_reg.get("guid"))[:8]
-                              if _reg else "이 원장에 **등록돼 있지 않다**")
+                    _known = ("registered (build %s)" % str(_reg.get("guid"))[:8]
+                              if _reg else "**not registered** in this ledger")
                     return (False,
-                            "klass='guarded' 에 **다른 이미지의 가드**를 줬다: %r\n"
-                            "  · `%s` 는 %s.\n"
-                            "이건 형식 문제가 아니다. `guarded` 는 이 이미지의 CFG 로 "
-                            "**지배를 계산**하는 klass인데, CFG 는 이미지 경계를 넘지 않는다 — "
-                            "다른 모듈 안의 분기가 이 모듈의 싱크를 지배하는지는 계산할 수 없다. "
-                            "VA 로 바꿔 적어도 계산은 여전히 거짓이 된다.\n"
-                            "갈 길은 셋이다:\n"
-                            "  ① 주장이 정말 `%s` **안**의 것이면 그건 그 이미지에 대한 주장이다 — "
-                            "그 이미지를 측정 빌드로 놓고 거기서 판정하라.\n"
-                            "  ② 이 이미지 안에 지배하는 분기가 실제로 있으면 **그 VA** 를 대라 "
-                            "(호출 이전에 이 모듈이 스스로 거는 검사).\n"
-                            "  ③ 둘 다 아니면 `blocked` 로 적되 **이 교차이미지 앵커를 그대로 남겨라** "
-                            "— 그러면 다음 회차가 형식 문제로 오해하지 않는다.\n"
-                            "(등록 현황: `images(action='list')` · 등록: "
+                            "klass='guarded' was given **a guard in a different image**: %r\n"
+                            "  · `%s` is %s.\n"
+                            "This is not a format problem. `guarded` is a klass that **computes dominance** "
+                            "with this image's CFG, and a CFG does not cross the image boundary — "
+                            "whether a branch inside another module dominates this module's sink cannot be computed. "
+                            "Rewriting it as a VA would still make the computation false.\n"
+                            "There are three ways forward:\n"
+                            "  ① If the claim is really about something **inside** `%s`, it is a claim about that image — "
+                            "make that image the measured build and decide it there.\n"
+                            "  ② If a dominating branch really exists inside this image, give **that VA** "
+                            "(a check this module makes on its own before the call).\n"
+                            "  ③ If neither, file it as `blocked`, but **keep this cross-image anchor as-is** "
+                            "— then the next round will not mistake it for a format problem.\n"
+                            "(what is registered: `images(action='list')` · to register: "
                             "`images(action='add', name=…, path=…)`)"
                             % (_x, _im, _known, _im), rec)
-                return (False, "klass='guarded': `guards=` must be VAs (0x…): %r 을 못 읽었다."
+                return (False, "klass='guarded': `guards=` must be VAs (0x…): could not read %r."
                         % _x, rec)
         g, sk = args.get("guard"), args.get("sink")
         try:
@@ -3211,23 +3223,23 @@ def _reject_gate(tgt, args):
                            "not yours to assert.\n"
                            "Why the pair is not inferred from your prose: in practice a wrong "
                            "pair produced a false alarm (fn0xD).", rec)
-        # ★ 짝을 **저장한다.** 2026-08-29 까지 R3 은 guard/sink 를 요구해 계산만 하고
-        #   기록하지 않았다. 그래서 나중에 "그 짝이 주장의 짝이었나"를 물을 수 없었고,
-        #   정책이 바뀌어도(예: bound_compare 권한 회수) **옛 판정을 재실행할 수 없었다.**
-        #   실제로 WUDFRd `IOCTL_0x80018483` 는 짝이 없어 sink_block 으로 근사할 수밖에 없었고,
-        #   그 근사가 39건의 가짜 `dominates_only` 를 만들었다.
+        # ★ **Store** the pair. Until 2026-08-29 R3 demanded guard/sink and computed with them but
+        #   never recorded them. So it was impossible to ask later "was that pair the claim's pair",
+        #   and when the policy changed (e.g. revoking bound_compare's authority) **old verdicts could not be re-run.**
+        #   In practice WUDFRd `IOCTL_0x80018483` had no pair and could only be approximated with sink_block,
+        #   and that approximation produced 39 fake `dominates_only` results.
         rec["guard"], rec["sink"] = g, sk
         if len(gset) > 1:
             rec["guards"] = [hex(x) for x in gset]
         if img is None:
             rec["cfg"] = {"verdict": "no_image"}
             return (True, "UNDECIDABLE - no image", ask(rec, "Could not open the target image, so CFG dominance was not computed", "no_image"))
-        # ── R7 — 선언된 싱크가 **실제로 위험 연산인가.**
-        #   R3 은 분석자가 고른 짝을 검증한다. 그 짝이 주장의 짝인지는 아무도 안 봤다.
-        #   WUDFRd `IOCTL_0x80018483`: 주장은 "유저 포인터를 probe 없이 역참조한다"인데
-        #   선언된 싱크는 `mov rdx, r13`(레지스터 이동)이었다. 게이트는 **무관한 짝**에
-        #   `gated` 를 내주었고, 진짜 반박(프로브 헬퍼·MmUserProbeAddress)은 아무도 안 본
-        #   자유 텍스트였다.
+        # ── R7 — is the declared sink **actually a dangerous operation?**
+        #   R3 verifies the pair the analyst picked. Nobody checked whether that pair was the claim's pair.
+        #   WUDFRd `IOCTL_0x80018483`: the claim was "dereferences a user pointer without a probe", but
+        #   the declared sink was `mov rdx, r13` (a register move). The gate granted `gated` to **an unrelated
+        #   pair**, and the real rebuttal (the probe helper, MmUserProbeAddress) was free text nobody
+        #   looked at.
         try:
             import cfg as _CFG
             sc = _CFG.sink_class(img, sk)
@@ -3243,12 +3255,12 @@ def _reject_gate(tgt, args):
                            % (sk, sc.get("insn", "?"), sc.get("why", "")), rec)
         try:
             import cfg as CFG
-            # 단일이면 gates(), 집합이면 gates_cut(). n=1 에서 둘은 동치다 —
-            # 그래도 옛 경로를 그대로 둔다: 재실행 시 **호출된 함수까지** 같아야
-            # "회귀가 아니라 동치"라고 말할 수 있다.
+            # A single guard goes to gates(), a set to gates_cut(). At n=1 the two are equivalent —
+            # the old path is kept anyway: only if **the function called** is also the same on a re-run
+            # can one say "equivalent, not a regression".
             r = (CFG.gates(img, g, sk) if len(gset) <= 1
                  else CFG.gates_cut(img, gset, sk))
-            # 함수 간이면 호출그래프로 넘긴다 — "문에서 한 번만 검사" 모양이 여기 산다.
+            # If it is inter-procedural, hand off to the call graph — the "checked once at the door" shape lives here.
             if r.get("verdict") == "cross_function":
                 import authz as AZ
                 r2 = AZ.gates_inter(img, g, sk)
@@ -3265,15 +3277,15 @@ def _reject_gate(tgt, args):
                            % r["why"], rec)
         if r["verdict"] in ("both_edges", "not_dominated", "other_callers",
                             "not_a_cut", "no_escape", "padded_cut"):
-            # ★ 2026-09-05 실측 — **강등이 절반만 됐었다.** 이 여섯은 `ask` 가 아니라
-            #   `(False, …)` 하드 거부라 GATE_COMPUTE_ONLY 가 안 닿았다.
-            #   점심 실측에서 msquic 이 같은 id 로 **4회 재시도**하다 `gate_blocked` 를 내고
-            #   축을 접었다. 그 신고문이 정확히 이 게이트의 한계를 짚는다:
+            # ★ 2026-09-05, measured — **the downgrade had only been half done.** These six are hard refusals
+            #   `(False, …)`, not `ask`, so GATE_COMPUTE_ONLY never reached them.
+            #   In a lunchtime measurement msquic **retried 4 times** with the same id, then filed `gate_blocked` and
+            #   folded the axis. That report pinpoints exactly this gate's limit:
             #     *"the guard is enforced ONCE AT THE DOOR and carried forward in a FLAG BIT,
             #       so no intra-procedural dominance relation exists for the second arm."*
-            #   ⇒ `not_dominated` 는 **건전한 반증**이지만(간선이 늘면 우회도 는다)
-            #     "문 앞에서 한 번 검사하고 플래그로 나른다" 같은 **함수 간 불변식**을
-            #     표현하지 못하는 것은 여전히 인코딩 한계다. 판단은 적대자가 한다.
+            #   => `not_dominated` is a **sound refutation** (more edges, more bypasses), but being unable to
+            #     express an **inter-procedural invariant** such as "checked once at the door and carried in a
+            #     flag" is still an encoding limit. The adversary does the judging.
             if getattr(_cfgmod(), "GATE_COMPUTE_ONLY", True):
                 rec["cfg_refutes"] = {"verdict": r["verdict"], "why": r.get("why", "")[:400]}
                 return (True, "CFG REFUTES THE PAIR (attached as evidence): %s"
@@ -3289,54 +3301,54 @@ def _reject_gate(tgt, args):
     return (True, "", rec)
 
 
-# ★ 임팩트 필드 안의 **전수 주장**을 잡는다. "소비자는 유저모드뿐" 은 부재 주장인데
-#   지금까지 아무 게이트도 안 걸렸다: G2 부재 게이트는 `claim` 만 보고, 승격자는
-#   `delta=0`/`owner=none` 에서만 돈다. 그 사이로 **"delta 는 non-zero 인데 소비자는 X 뿐"**
-#   이 그대로 빠져나가고, 그 한 문장이 등급 상한을 혼자 정한다.
-#   좁게 잡는다: **전수 단어 + 주체 단어**가 같이 있을 때만 (검출기를 넓히면 게이트가 무력해진다).
-_SOLE_WORD = r"(?:뿐|유일|밖에\s*없|만이|전부(?:다|이다)|only|sole|solely|nothing\s+else|" \
+# ★ Catch **exhaustiveness claims** inside the impact fields. "the only consumer is user mode" is an
+#   absence claim, and until now no gate caught it: the G2 absence gate looks only at `claim`, and
+#   the escalator runs only on `delta=0`/`owner=none`. **"delta is non-zero, but the only consumer is X"**
+#   slips straight through the gap between them, and that one sentence sets the grade ceiling on its own.
+#   Kept narrow: only when **an exhaustiveness word and a subject word** appear together (widening the detector disarms the gate).
+_SOLE_WORD = r"(?:only|sole|solely|nothing\s+else|" \
              r"no\s+other|exclusively|none\s+other)"
-_SOLE_SUBJ = r"(?:소비자|소비|읽는|리더|경로|호출자|매퍼|파서|consumer|reader|caller|mapper|" \
-             r"parser|path|kernel|커널)"
+_SOLE_SUBJ = r"(?:consumer|reader|caller|mapper|" \
+             r"parser|path|kernel)"
 _SOLE = re.compile(r"(?:%s[^.\n]{0,60}%s|%s[^.\n]{0,60}%s)" %
                    (_SOLE_WORD, _SOLE_SUBJ, _SOLE_SUBJ, _SOLE_WORD), re.I)
 
-_NONE_OWNER = ("none", "없음", "no one", "nobody", "n/a", "-")
-_NA_DELTA = ("n/a", "na", "해당없음", "not applicable", "n\\a")
+_NONE_OWNER = ("none", "nothing", "no one", "nobody", "n/a", "-")
+_NA_DELTA = ("n/a", "na", "not-applicable", "not applicable", "n\\a")
 
 
-_DEAD_STATUS = ("기각", "반박됨")
+_DEAD_STATUS = ("rejected", "refuted")
 
 
 def _resolve_row(rid, state=None):
-    """id 하나를 원장 전체에서 찾는다 → (kind, status, klass, reason) 또는 None.
+    """Find one id across the whole ledger → (kind, status, klass, reason) or None.
 
-    verdicts / graveyard / surface 세 곳을 본다. **정확 일치만** 한다 —
-    부분일치를 허용하면 이 검사가 산문 매칭이 되고, 그건 오늘 밤 두 번 측정으로 죽였다.
+    It looks in three places: verdicts / graveyard / surface. **Exact matches only** —
+    allowing partial matches turns this check into prose matching, and that was killed twice by measurement tonight.
     """
     _S = state if state is not None else STATE
-    # ★ 2026-09-06 — 기각에는 **신뢰 등급이 있다.** 심문자가 깼거나 재개 표시가 붙은 행은
-    #   "죽은 주장"이 아니라 "서지 않는 기각"이다. 상태 문자열은 그대로 두고(소비자의
-    #   죽은-전제 판정이 바뀌면 안 된다) 사유 앞에 표식만 붙인다.
+    # ★ 2026-09-06 — rejections **have a trust grade.** A row the interrogator broke, or one carrying a
+    #   reopen mark, is not a "dead claim" but "a rejection that does not stand". The status string is
+    #   left as-is (the consumers' dead-premise verdict must not change); only a marker is prefixed to the reason.
     _gy = {str(g.get("id")): g for g in (_S.get("graveyard") or [])}
 
     def _doubt(rid_, v_=None):
         g_ = _gy.get(rid_) or {}
         ig = v_.get("interrogation") if isinstance((v_ or {}).get("interrogation"), dict) else {}
         if g_.get("reopened") and not g_.get("rekilled"):
-            return "[재개됨 — 이 음성은 철회됐다] "
+            return "[reopened — this negative was withdrawn] "
         if (ig or {}).get("broke") or g_.get("broke"):
-            return "[심문자가 깼다 — 이 음성은 서 있지 않다] "
+            return "[the interrogator broke it — this negative does not stand] "
         return ""
 
     for v in (_S.get("verdicts") or []):
         if str(v.get("id")) == rid:
-            _d = _doubt(rid, v) if v.get("status") == "기각" else ""
+            _d = _doubt(rid, v) if v.get("status") == "rejected" else ""
             return ("verdict", v.get("status"), (v.get("gate") or {}).get("klass"),
                     _d + str(v.get("claim") or "")[:200])
     for g in (_S.get("graveyard") or []):
         if str(g.get("id")) == rid:
-            return ("graveyard", "기각", g.get("klass"),
+            return ("graveyard", "rejected", g.get("klass"),
                     _doubt(rid) + str(g.get("reason") or "")[:200])
     row = (_S.get("surface") or {}).get(rid)
     if isinstance(row, dict):
@@ -3345,34 +3357,34 @@ def _resolve_row(rid, state=None):
 
 
 def _reach_gate(args):
-    """★ **주장 간 정합성.** 확정이 의존하는 전제가 이미 죽어 있는지 본다. (ok, note, ask_why)
+    """★ **Consistency across claims.** Checks whether a premise a confirmation depends on is already dead. (ok, note, ask_why)
 
-    왜 (2026-09-06, wcifs 채점본 §1 이 지목한 하니스 결함):
-      모든 게이트가 **주장-국소적**이다 — *이* 주장의 근거만 본다. 그래서 wcifs 확정 2건이
-      같은 원장이 이미 기각한 전제 위에 서 있었다:
-        · `S13-OP12-FLAGS3` 의 트리거는 포트 opcode 12 인데 `PORT-REACH`(AppContainer 도달)가
-          `by_design` 으로 기각 ⇒ 트리거하려면 이미 특권이 필요하다 ⇒ 경계를 안 넘는다
-        · `S13-UAF-AVLNODE-V2` 의 free 팔은 `WcRemoveUnionContext` 인데 `S13-R5-PORT8b`
-          (비특권이 그걸 부를 수 있다)가 기각된 바로 그 경로다
-      G0~G4 어디도 이걸 못 본다. 확정 등재 때 **그 확정이 기대는 전제의 생사**를 안 물었다.
+    Why (2026-09-06, a harness defect named in §1 of the graded wcifs write-up):
+      Every gate is **claim-local** — it looks only at *this* claim's grounds. So two wcifs
+      confirmations stood on premises the same ledger had already rejected:
+        · the trigger of `S13-OP12-FLAGS3` is port opcode 12, but `PORT-REACH` (AppContainer reach) was
+          rejected as `by_design` ⇒ triggering it already requires privilege ⇒ no boundary is crossed
+        · the free arm of `S13-UAF-AVLNODE-V2` is `WcRemoveUnionContext`, which is exactly the path
+          `S13-R5-PORT8b` (an unprivileged caller can call it) was rejected on
+      None of G0~G4 sees this. Filing a confirmation never asked **whether the premises it leans on are alive.**
 
-    ★ **자동 탐지는 만들지 않았다. 두 번 재고 두 번 버렸다** (2026-09-06 실측):
-      · 심볼/VA 토큰 겹침(임계 1/2/3): wcifs 는 2건 중 1건만 잡고, ahcache 는 확정당
-        **19~22건**이 뜬다(141개 기각이 같은 코드 영역에 몰려 토큰이 공유된다). 과대탐지.
-      · 방향형(기각의 *표적* 심볼이 확정의 *주장문*에 등장): wcifs 2건 중 **0건** —
-        `S13-R5-PORT8b` 의 표적에는 그 심볼이 없고 주장문에 있었다. ahcache 는 7~13건.
-      ⇒ 읽는 쪽에서 못 고르면 **쓰는 쪽이 선언한다**(C-037 과 같은 결론).
+    ★ **No automatic detection was built. It was measured twice and discarded twice** (measured 2026-09-06):
+      · symbol/VA token overlap (thresholds 1/2/3): catches only 1 of the 2 in wcifs, and ahcache raises
+        **19~22 per confirmation** (141 rejections crowd into the same code region and share tokens). Over-detection.
+      · directional (a rejection's *target* symbol appears in a confirmation's *claim text*): **0 of 2** in wcifs —
+        the symbol was not in `S13-R5-PORT8b`'s target but in its claim text. ahcache gives 7~13.
+      ⇒ when the reader cannot pick them out, **the writer declares them** (the same conclusion as C-037).
 
-    의무: `depends_on=` 에 이 확정이 **도달성·가용성을 빌려오는 행/판정의 id** 를 댄다.
-    빌려오는 게 없으면 `depends_on='none'` 이라고 **명시**한다(임팩트 게이트의 `owner='none'`
-    과 같은 탈출구 — 만족 불가능한 게이트는 에이전트를 blocked 로 도망가게 만든다).
+    Obligation: `depends_on=` names the **ids of the rows/verdicts this confirmation borrows reachability/availability from.**
+    If it borrows nothing, state `depends_on='none'` **explicitly** (the same escape hatch as the impact gate's `owner='none'`
+    — an unsatisfiable gate makes the agent run off to blocked).
     """
     raw = str(args.get("depends_on") or "").strip()
     if not raw:
-        # ★ **막지 않는다.** 임팩트 게이트가 이미 기록해 둔 교훈이다 — "게이트를 만족
-        #   불가능하게 만들면 에이전트가 blocked 로 도망가고 그게 더 나쁘다". 확정은 587행 중
-        #   3건인 귀한 자리라 거기서 하드 브레이크를 걸면 손해가 더 크다.
-        #   대신 **선언 안 한 확정을 셀 수 있게** 만든다(`dependency_audit` 의 두 번째 통).
+        # ★ **It does not block.** This is a lesson the impact gate already recorded — "make a gate
+        #   unsatisfiable and the agent runs off to blocked, which is worse". Confirmations are a rare slot
+        #   (3 of 587 rows), so a hard brake there costs more than it saves.
+        #   Instead, **confirmations that declared nothing are made countable** (the second bucket of `dependency_audit`).
         return (True, "",
                 "THIS CONFIRMATION DID NOT DECLARE WHAT IT BORROWS REACHABILITY FROM.\n"
                 "  depends_on=<id>[,<id>...]  the rows/verdicts whose reachability or "
@@ -3385,7 +3397,7 @@ def _reach_gate(args):
                 "Naming the dependency is what makes that checkable, and it is what lets "
                 "`dependency_audit()` re-flag this row if the premise dies LATER. "
                 "Undeclared confirmations are counted separately and stay visible.")
-    if raw.lower() in ("none", "-", "없음"):
+    if raw.lower() in ("none", "-", "nothing"):
         return (True, "", "")
 
     ids = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
@@ -3426,17 +3438,17 @@ def _reach_gate(args):
 
 
 def surface_sites(state=None):
-    """★ **행이 아니라 사이트로 센다.** 반환: (사이트수, 행수, 중복행수, 최다중복 목록)
+    """★ **Count by site, not by row.** Returns: (site count, row count, duplicate row count, top duplicates)
 
-    ★ 2026-09-07 실측 — 표면 키가 자유 문자열이라 같은 주소를 여러 행이 문다:
-      ahcache 620행 / 고유주소 309 / 중복을 문 행 267, wcifs 583행 / 333 / 377.
-      `0x140038850` 하나를 여러 행이 각각 문다
+    ★ Measured 2026-09-07 — surface keys are free strings, so several rows bite the same address:
+      ahcache 620 rows / 309 unique addresses / 267 rows biting a duplicate, wcifs 583 rows / 333 / 377.
+      A single `0x140038850` is bitten separately by several rows
       (`IOCTL f6 -> 0x140038850`, `0x140038850`, `S14-AZ-f6_…_ungated`).
-      결과가 두 겹이다: ① **분모가 구조적으로 부풀려진다** — "620행 중 미분석 607" 의
-      620 은 고유 조사 대상 수가 아니다 ② **한 사이트의 이력이 분산된다** — 같은 주소인데
-      한 행은 판정, 다른 행은 미분석이다.
-    ★ 합치지 않는다. 원장을 자동으로 병합하는 것은 되돌릴 수 없고, 어느 행의 판정이
-      사이트 전체를 대표하는지는 기계가 정할 일이 아니다. **세는 방법만 고친다.**
+      The result is twofold: ① **the denominator is structurally inflated** — the 620 in "607 of 620 rows
+      unanalysed" is not the number of unique things to investigate ② **one site's history is scattered** — the same
+      address is a verdict in one row and unanalysed in another.
+    ★ It does not merge. Merging the ledger automatically cannot be undone, and which row's verdict represents
+      the whole site is not for the machine to decide. **Only the counting is fixed.**
     """
     _S = (state if state is not None else STATE).get("surface") or {}
     import collections as _c
@@ -3452,12 +3464,12 @@ def surface_sites(state=None):
     dup_rows = {k for ks in own.values() if len(ks) > 1 for k in ks}
     top = sorted(((a, ks) for a, ks in own.items() if len(ks) > 1),
                  key=lambda x: -len(x[1]))[:5]
-    # 사이트 수 = 고유 주소 + 주소 없는 행(각자 하나의 사이트로 센다)
+    # site count = unique addresses + rows with no address (each counted as its own site)
     return len(own) + noaddr, len(_S), len(dup_rows), top
 
 
 def site_history(va, state=None):
-    """한 주소를 문 행들의 **상태를 한 줄로** 모은다. 이력 분산을 눈으로 보게 한다."""
+    """Collect **the states of the rows biting one address into one line.** Makes the scattered history visible."""
     _S = (state if state is not None else STATE).get("surface") or {}
     a = str(va).lower()
     out = []
@@ -3468,27 +3480,27 @@ def site_history(va, state=None):
 
 
 def graveyard_trust(state=None, limit=40):
-    """★ **묘지를 등급별로 센다.** 에이전트는 묘지를 사실로 읽는다 — 그러면 묘지가 틀린 만큼
-    다음 회차가 틀린다. 반환: (counts, suspect_rows, n_suspect)
+    """★ **Count the graveyard by grade.** The agent reads the graveyard as fact — so the next round is wrong
+    exactly as much as the graveyard is. Returns: (counts, suspect_rows, n_suspect)
 
-    등급 (배타적, 위에서부터):
-      · `orphan`      판정 레코드가 아예 없다 — 사유·심문 이력을 대조할 수 없다
-      · `reopened`    재개 표시가 붙었는데 묘지에 그대로 있다(= 철회된 음성)
-      · `broke`       심문자가 깼는데 그대로 있다(= 서지 않는 음성)
-      · `unexamined`  적대자를 **한 번도 안 거쳤다**
-      · `verified`    심문자가 못 깼다 — 이것만이 검증된 음성이다
+    Grades (exclusive, top first):
+      · `orphan`      there is no verdict record at all — the reason and interrogation history cannot be cross-checked
+      · `reopened`    carries a reopen mark yet is still in the graveyard (= a withdrawn negative)
+      · `broke`       the interrogator broke it yet it is still there (= a negative that does not stand)
+      · `unexamined`  **never once went through an adversary**
+      · `verified`    the interrogator could not break it — only this is a verified negative
 
-    ★ 왜 이게 필요한가 (2026-09-06 실측): ahcache 묘지 167행 중 `verified` 는 **54행(32%)**,
-      wcifs 76행 중 **25행(33%)** 뿐이었다. 나머지가 같은 무게로 프라이밍에 실려
-      "CLAIMS ALREADY KILLED (do not resurrect)" 로 나갔다.
+    ★ Why this is needed (measured 2026-09-06): of ahcache's 167 graveyard rows only **54 (32%)** were `verified`,
+      and of wcifs's 76 only **25 (33%)**. The rest were loaded into the priming with the same weight and went out as
+      "CLAIMS ALREADY KILLED (do not resurrect)".
     """
     _S = state if state is not None else STATE
     V = {str(v.get("id")): v for v in (_S.get("verdicts") or [])}
-    # ★ 2026-09-07 자기 정정 — 첫 판에서 `orphan` 이 **후보 집합에서 닫힌 행을 잡아먹었다.**
-    #   `close_candidate` 는 후보 id(`C<n>`)로 묘지에 넣는다. 그 행의 근거는 `verdicts` 가 아니라
-    #   `candidates` 에 산다(claim/basis/evidence/anchors 다 있다). 실측: ahcache 10 · wcifs 14
-    #   전부 그 경우였고 **진짜 미아는 0** 이었다. 다른 저장소를 안 보고 "판정이 없다"고 세면
-    #   그건 [[queue-mixes-two-kinds]] 와 같은 오류다.
+    # ★ Self-correction 2026-09-07 — in the first version `orphan` **swallowed rows closed from the candidate set.**
+    #   `close_candidate` puts them in the graveyard under the candidate id (`C<n>`). That row's grounds live in
+    #   `candidates`, not `verdicts` (claim/basis/evidence/anchors are all there). Measured: ahcache 10 · wcifs 14 were
+    #   all that case, and **real orphans were 0**. Counting "no verdict" without looking at the other store
+    #   is the same error as [[queue-mixes-two-kinds]].
     CAND = {str(c.get("id")): c for c in (_S.get("candidates") or [])}
     counts = {"orphan": 0, "candidate": 0, "reopened": 0, "broke": 0,
               "unexamined": 0, "verified": 0}
@@ -3498,7 +3510,7 @@ def graveyard_trust(state=None, limit=40):
         v = V.get(gid)
         ig = v.get("interrogation") if isinstance((v or {}).get("interrogation"), dict) else {}
         if v is None and gid in CAND:
-            # 후보로 닫힌 행. 적대자를 거쳤는지는 origin 이 말한다.
+            # A row closed as a candidate. Whether it went through an adversary is told by origin.
             k = "verified" if g.get("origin") == "refuted" else "candidate"
         elif v is None:
             k = "orphan"
@@ -3520,20 +3532,20 @@ def graveyard_trust(state=None, limit=40):
 
 
 def untouched_regions(image_path, state=None, page=0x1000, limit=12):
-    """판정·표면 **어느 행도 주소로 언급한 적 없는** 실행 영역. (구간, 함수수, 총바이트)
+    """Executable regions that **no verdict or surface row has ever mentioned by address.** (ranges, function count, total bytes)
 
-    ★ 왜 (2026-09-09 야간런 실측): 지휘자의 pick 스키마는 *"lead id or track name **that
-      exists in the digest**"* 인데 digest 에 **헌팅 땅이 아예 없다.** 그래서 운영자 목표가
-      "근본원인의 변종을 인구 단위로 찾아라"일 때조차 지휘자는 리드/트랙 밖으로 라우팅할
-      **수단이 없었다** — 케이스 1·2·3 이 연속으로 리드/트랙을 골랐고, 3회차는 목표를 읽고
-      *"표류: 다섯 회차가 인접 축의 음성만 닫았다"* 라고 **스스로 진단하면서도** 리드를 골랐다.
-      불복종이 아니라 구조적 불능이다.
+    ★ Why (measured in the 2026-09-09 night run): the conductor's pick schema is *"lead id or track name **that
+      exists in the digest**"*, yet the digest had **no hunting ground at all.** So even when the operator's goal
+      was "find variants of the root cause population-wide", the conductor **had no means** to route outside
+      leads/tracks — cases 1·2·3 picked a lead/track in a row, and round 3 read the goal and **diagnosed it itself**
+      as *"drift: five rounds closed only negatives on adjacent axes"* while still picking a lead.
+      Not disobedience but a structural inability.
 
-    ★ **표면 행으로 등재하지 않는다.** 이건 뷰이지 분모가 아니다 — 등재하면 하니스가
-      시드가 금지한 "분모 팽창"을 스스로 하게 된다. 지휘자에게 **보여주기만** 한다.
+    ★ **It is not filed as surface rows.** This is a view, not a denominator — filing it would have the harness
+      itself commit the "denominator inflation" the seed forbids. It is only **shown** to the conductor.
 
-    ★ 계기의 한계를 같이 말한다: "언급됐다"는 판정/표면 **문자열에 그 주소가 나타났다**는
-      뜻이지 그 코드가 분석됐다는 뜻이 아니다. 과소·과대 둘 다 가능하다.
+    ★ The instrument's limit is stated alongside: "mentioned" means **the address appeared in a verdict/surface
+      string**, not that the code was analysed. Both under- and over-counting are possible.
     """
     import struct
     _S = state if state is not None else STATE
@@ -3573,7 +3585,7 @@ def untouched_regions(image_path, state=None, page=0x1000, limit=12):
             runs[-1].append(b)
         else:
             runs.append([b])
-    # .pdata 로 각 구간의 함수 수를 센다 — "몇 KB 남았나"보다 "몇 함수냐"가 고를 수 있는 단위다
+    # Count the functions in each range from .pdata — "how many functions" is a unit you can choose by, "how many KB left" is not
     fns = []
     try:
         import pe as _PE
@@ -3593,51 +3605,50 @@ def untouched_regions(image_path, state=None, page=0x1000, limit=12):
 
 
 def untouched_digest(image_path, state=None, n=6):
-    """`untouched_regions` 를 지휘자 digest 에 실을 문자열로. 비어 있으면 빈 문자열."""
+    """`untouched_regions` as a string to carry in the conductor digest. An empty string when there is nothing."""
     try:
         rows, tf, tb = untouched_regions(image_path, state)
     except Exception as e:
-        return "\n[미접촉 실행영역: 계산 실패 %s]" % type(e).__name__
+        return "\n[untouched executable regions: computation failed %s]" % type(e).__name__
     if not rows:
         return ""
-    L = ["", "[★ 아직 아무 행도 주소로 언급하지 않은 실행 영역 — %d구간 · 함수 %d개 · %dKB]"
+    L = ["", "[★ executable regions no row has mentioned by address yet — %d ranges · %d functions · %dKB]"
          % (len(rows), tf, tb // 1024),
-         "  이건 **표면 행이 아니다**(분모가 아니다). 헌팅 목표일 때 `pick.what='row'` 로",
-         "  이 중 한 구간을 지목할 수 있다 — 리드/트랙 밖으로 나가는 유일한 길이다.",
-         "  ※ '언급됨'은 문자열에 주소가 나타났다는 뜻이지 분석됐다는 뜻이 아니다."]
+         "  These are **not surface rows** (not a denominator). Under a hunting goal, `pick.what='row'`",
+         "  can name one of these ranges — the only way out of leads/tracks.",
+         "  ※ 'mentioned' means the address appeared in a string, not that it was analysed."]
     for r in rows[:n]:
-        L.append("  0x%x–0x%x [%s] 함수 %d개 · %dKB"
+        L.append("  0x%x–0x%x [%s] %d functions · %dKB"
                  % (r["lo"], r["hi"], r["sec"], r["funcs"], r["bytes"] // 1024))
     return "\n".join(L)
 
 
 def resisted(target=None, state=None, min_n=2, limit=40):
-    """★ **죽이려다 실패한 행.** (rows, counts) — 이 하네스에 없던 방향의 큐다.
+    """★ **Rows somebody tried to kill and failed.** (rows, counts) — a queue in a direction this harness did not have.
 
-    왜 (2026-09-08 실측, 전 원장):
-      이 하네스의 압력은 전부 "죽이기"다. 확정은 반박자가, 기각은 심문자가 죽이러 온다.
-      그런데 **죽이려다 실패한 사건은 아무 데도 안 간다.** 기각 시도가 게이트에 반려되면
-      `denials` 평면 로그에 규칙별로만 쌓이고(`denial_report` 는 "어느 규칙이 잡았나"를
-      답하지 "어느 행이 버텼나"를 답하지 않는다), CFG 가 짝을 반증해도
-      `GATE_COMPUTE_ONLY` 가 증거로 첨부만 하고 지나간다.
-      실측: 기각 시도가 **2회 이상** 반려된 표적 30개(최대 12회), `cfg_refutes` 27건.
-      그리고 축이 **겹치는** 행이 있다 — `dispatcher 0x140038360` 은 반려 4회 +
-      cfg_refutes(no_escape) + 심문자 파기 + reopened 를 동시에 갖고 있었다.
+    Why (measured 2026-09-08, the whole ledger):
+      All the pressure in this harness is "killing". The refuter comes for confirmations, the interrogator for rejections.
+      But **a failed kill goes nowhere.** When a rejection attempt is denied by a gate it piles up only per rule
+      in the flat `denials` log (`denial_report` answers "which rule caught it", not "which row held out"),
+      and when the CFG refutes a pair, `GATE_COMPUTE_ONLY` just attaches it as evidence and moves on.
+      Measured: 30 targets with a rejection attempt denied **2+ times** (12 at most), 27 `cfg_refutes`.
+      And some rows **overlap** on axes — `dispatcher 0x140038360` held 4 denials +
+      cfg_refutes(no_escape) + an interrogator break + reopened all at once.
 
-    ★ 자동 승격은 **하지 않는다.** 여기서 상태를 바꾸면 "양을 질의 대리변수"로 쓰는 것이다
-      (`threshold-triggers-audit-not-rollback`). 이 함수는 큐만 만든다 — 재분석은 사람/
-      다음 회차가 한다.
+    ★ There is **no** automatic promotion. Changing state here would use "quantity as a proxy for quality"
+      (`threshold-triggers-audit-not-rollback`). This function only builds the queue — re-analysis is for a human /
+      the next round.
 
-    ★ 같은 klass 로 5번 반려된 것과 **서로 다른 klass 3개**로 반려된 것은 다른 사건이다.
-      전자는 서류 문제(짝 선언·인용 형식)고, 후자는 **여러 사망 가설이 전부 안 먹혔다**는
-      뜻이다. 그래서 `klasses` 를 따로 세고 랭킹의 1순위로 쓴다.
+    ★ Denied 5 times under the same klass and denied under **3 different klasses** are different events.
+      The former is a paperwork problem (pair declaration, citation format); the latter means **several death
+      hypotheses all failed.** So `klasses` is counted separately and used as the top ranking key.
 
-    ★ `broke` 축은 **세기만** 한다. 그 큐는 `reports/breaks/` 리드 큐가 이미 갖고 있으므로
-      여기서 다시 닫게 하면 두 큐가 같은 일을 두 번 시킨다(`queue-mixes-two-kinds`).
-      대신 그 행의 리드 id 를 실어 보내 **중복 작업을 막는다.**
+    ★ The `broke` axis is **only counted.** The `reports/breaks/` lead queue already owns that queue, so
+      closing it here again would have two queues ask for the same work twice (`queue-mixes-two-kinds`).
+      Instead the row's lead id is carried along **to prevent duplicate work.**
 
-    ★ 저항 0 인 행은 큐에 **안 나온다** — 0 이 아니라 "시도된 적 없음"이고, 그건
-      `worklist`/`unfinished` 소관이다. 두 값을 한 칸에 섞지 않는다.
+    ★ Rows with zero resistance **do not appear** in the queue — that is not 0 but "never attempted", and it
+      belongs to `worklist`/`unfinished`. Two values are not mixed in one slot.
     """
     _S = state if state is not None else STATE
     K = lambda t: str(t or "")[:100]
@@ -3648,7 +3659,7 @@ def resisted(target=None, state=None, min_n=2, limit=40):
                                       "cfg": [], "broke": 0, "lead_ids": [],
                                       "verdicts": [], "last_t": ""})
 
-    # 축 B — 기각 시도가 게이트에 반려됐다
+    # axis B — a rejection attempt was denied by a gate
     for d in (_S.get("denials") or []):
         if str(d.get("act")) != "reject":
             continue
@@ -3659,11 +3670,11 @@ def resisted(target=None, state=None, min_n=2, limit=40):
         if str(d.get("t") or "") > r["last_t"]:
             r["last_t"] = str(d.get("t") or "")
 
-    # 축 C — CFG 가 짝을 반증했는데 기각이 등재됐다
-    # 축 A — 심문자가 그 기각을 깼다 (세기만 한다)
+    # axis C — the CFG refuted the pair, yet the rejection was filed
+    # axis A — the interrogator broke that rejection (only counted)
     _gy = {str(g.get("id")): g for g in (_S.get("graveyard") or [])}
     for v in (_S.get("verdicts") or []):
-        if str(v.get("status")) != "기각":
+        if str(v.get("status")) != "rejected":
             continue
         g = v.get("gate") or {}
         cr = g.get("cfg_refutes")
@@ -3680,7 +3691,7 @@ def resisted(target=None, state=None, min_n=2, limit=40):
         if str(v.get("t") or "") > r["last_t"]:
             r["last_t"] = str(v.get("t") or "")
 
-    # 리드 id 를 실어 보낸다 (중복 작업 방지)
+    # carry the lead id along (prevents duplicate work)
     try:
         for b in breaks(_S.get("target"), open_only=True, queue="lead"):
             k = K(b.get("target"))
@@ -3695,13 +3706,13 @@ def resisted(target=None, state=None, min_n=2, limit=40):
         r["axes"] = ((1 if r["denied"] else 0) + (1 if r["cfg"] else 0)
                      + (1 if r["broke"] else 0))
         r["score"] = (r["axes"], len(r["klasses"]), r["denied"] + len(r["cfg"]) + r["broke"])
-        # ★ 축마다 문턱이 다르다 — 신호의 세기가 다르기 때문이다.
-        #   · `cfg` 는 **1건이면 든다.** 기계가 "선언한 짝이 지배하지 않는다"를 계산했는데
-        #     기각이 등재된 것이고, 지금 이걸 보는 소비자가 **하나도 없다**.
-        #   · `denied` 는 **min_n 이상**이어야 든다. 한 번은 서류 문제(짝 선언·인용 형식)일
-        #     수 있다. 반복돼야 행의 성질이다.
-        #   · `broke` **단독**은 안 든다 — `reports/breaks/` 리드 큐가 이미 그 일을 시킨다.
-        #     여기서는 다른 축과 **겹칠 때만** 의미가 있다(겹침이 이 큐의 존재 이유다).
+        # ★ Each axis has a different threshold — because the signals differ in strength.
+        #   · `cfg` **gets in with 1.** The machine computed "the declared pair does not dominate", yet
+        #     the rejection was filed, and right now **no consumer at all** looks at that.
+        #   · `denied` gets in only **at min_n or more.** Once can be a paperwork problem (pair declaration, citation
+        #     format). It has to repeat to be a property of the row.
+        #   · `broke` **alone** does not get in — the `reports/breaks/` lead queue already asks for that work.
+        #     Here it only means something **when it overlaps** another axis (the overlap is why this queue exists).
         if r["cfg"] or r["axes"] >= 2 or r["denied"] >= min_n:
             out.append(r)
     out.sort(key=lambda r: r["score"], reverse=True)
@@ -3713,13 +3724,13 @@ def resisted(target=None, state=None, min_n=2, limit=40):
 
 
 def backfill_ask_fields(state=None):
-    """옛 질문에 `kind`/`by` 를 **소급**한다. (kind채움, by채움)
+    """**Backfill** `kind`/`by` onto old asks. (kind filled, by filled)
 
-    ★ 지어내지 않는다 — 둘 다 **이미 있는 칸에서 유도**한다:
-        kind ← `ask_kind(cfg)`   (cfg 가 없으면 손대지 않는다. 0 과 미측정을 안 섞는다)
-        by   ← 기존 `by`, 없으면 id 접두(CQ/RQ/XQ) — 어휘에 없으면 `gate`(옛 기본값)
-    ★ 왜 필요한가: 전수 231/231 · 125/125 가 `kind=None` 이라 **단일 큐를 정렬할 축이
-      없었다.** 새 행만 고치면 옛 356행이 영원히 랭킹 바닥/중간에 깔린다.
+    ★ Nothing is invented — both are **derived from fields already present**:
+        kind ← `ask_kind(cfg)`   (left alone when cfg is missing; 0 and unmeasured are not mixed)
+        by   ← the existing `by`, otherwise the id prefix (CQ/RQ/XQ) — `gate` (the old default) if not in the vocabulary
+    ★ Why it is needed: all 231/231 · 125/125 were `kind=None`, so **there was no axis to sort a single queue
+      by.** Fixing only new rows would leave the old 356 rows stuck at the bottom/middle of the ranking forever.
     """
     S = state if state is not None else STATE
     nk = nb = 0
@@ -3735,12 +3746,12 @@ def backfill_ask_fields(state=None):
 
 
 def ask_queue(state=None, n=10, audience="analyst"):
-    """★ **하나의 큐.** 출처별 실측 수율로 정렬해 렌더한다.
+    """★ **One queue.** Rendered sorted by the measured yield per source.
 
-    ★ 이 함수가 답하는 것: "지금 열린 질문 중 **답해질 가능성이 가장 높은 것**이 무엇인가."
-      출처가 랭킹 축인 근거는 원장 실측이다 — `by=conductor` 는 ahcache 185건 중
-      answered **0건**, 게이트·반박자는 46건 중 15건(32.6%)이었다. 그런데 열린 질문의
-      113/115 가 지휘자 것이라 회전 창이 돌아도 보이는 것은 사실상 지휘자 질문뿐이었다.
+    ★ What this function answers: "of the asks open now, **which is most likely to get answered.**"
+      The grounds for source as the ranking axis are measured on the ledger — `by=conductor` had **0**
+      answered of 185 in ahcache, while gate·refuter had 15 of 46 (32.6%). Yet 113/115 of the open asks
+      were the conductor's, so however the rotating window turned, practically only conductor asks were visible.
     """
     S = state if state is not None else STATE
     Q = open_asks(S, audience=audience, rank=True, include_leads=True)
@@ -3749,50 +3760,50 @@ def ask_queue(state=None, n=10, audience="analyst"):
     y = ask_yield(S)
     import collections as _c
     byo = _c.Counter(normalize_ask_by(a.get("by"), a.get("id")) for a in Q)
-    byk = _c.Counter(str(a.get("kind") or "(미분류)") for a in Q)
-    L = ["## ⟂ 질문 큐 — 열린 질문 %d건 (하나의 큐다: 게이트·반박자·심문자·저항·지휘자)" % len(Q), ""]
-    L.append("  출처: " + " · ".join("%s %d" % kv for kv in byo.most_common()))
-    L.append("  종류: " + " · ".join("%s %d" % kv for kv in byk.most_common()))
-    _yl = [("%s %d/%d닫힘(전체%d)" % (o, d["answered"], d["closed"], d["n"]) +
+    byk = _c.Counter(str(a.get("kind") or "(unclassified)") for a in Q)
+    L = ["## ⟂ Ask queue — %d open asks (it is one queue: gate·refuter·interrogator·resisted·conductor)" % len(Q), ""]
+    L.append("  sources: " + " · ".join("%s %d" % kv for kv in byo.most_common()))
+    L.append("  kinds: " + " · ".join("%s %d" % kv for kv in byk.most_common()))
+    _yl = [("%s %d/%d closed (total %d)" % (o, d["answered"], d["closed"], d["n"]) +
             ("" if d["rate"] is None else " (%.0f%%)" % (d["rate"] * 100)))
            for o, d in sorted(y.items(), key=lambda kv: -(kv[1]["rate"] or 0))]
-    L.append("  이 원장의 출처별 **답해진 비율**: " + " · ".join(_yl))
-    L += ["  ★ 정렬은 수율 > 시도횟수 > 오래된 순이다. `inexpressible` 은 관측 부족이 아니라",
-          "    **게이트가 그 모양을 표현 못 하는 것**이다 — 답이 판정이 아니라 `gate_blocked` 다.", ""]
+    L.append("  this ledger's **answered rate** per source: " + " · ".join(_yl))
+    L += ["  ★ Sort order is yield > attempts > oldest. `inexpressible` is not a lack of observation,",
+          "    it is **the gate being unable to express that shape** — the answer is `gate_blocked`, not a verdict.", ""]
     for a in Q[:n]:
         o = normalize_ask_by(a.get("by"), a.get("id"))
         L.append("- `%s` [%s/%s] %s%s"
                  % (a.get("id"), o, a.get("kind") or "?", str(a.get("target"))[:62],
-                    ("  (시도 %d회)" % len(a.get("attempts") or []))
+                    ("  (%d attempts)" % len(a.get("attempts") or []))
                     if (a.get("attempts") or []) else ""))
         if a.get("why"):
-            L.append("    왜: %s" % str(a["why"]).replace("\n", " ")[:200])
+            L.append("    why: %s" % str(a["why"]).replace("\n", " ")[:200])
         if a.get("method"):
-            L.append("    다음 수: %s" % str(a["method"]).replace("\n", " ")[:260])
+            L.append("    next move: %s" % str(a["method"]).replace("\n", " ")[:260])
         if a.get("_close_via"):
-            L.append("    닫기: %s" % a["_close_via"])
+            L.append("    close: %s" % a["_close_via"])
     return "\n".join(L)
 
 
 def resisted_to_asks(target=None, state=None, save_now=True):
-    """★ 저항 행을 **질문으로 낸다.** 별도 큐를 두지 않는다. (생성수, 시도증가수)
+    """★ **Emit the resisted rows as asks.** No separate queue. (created, attempts bumped)
 
-    ★ 왜 큐가 아니라 질문인가 (2026-09-08 운영자 지적):
-      큐를 종류별로 만들면 회차마다 어느 큐를 볼지가 임의가 되고 큐끼리 경쟁한다.
-      실측이 그 모양이었다 — ahcache 에 저항 31 · 재심 34 · 리드 23 이 겹침 4/12/8 로
-      서 있었고, 45분 케이스가 셋을 다 볼 수 없다.
-      그리고 **단일 질문 큐는 이미 있었다**(`asks`). 필드도(target/claim/klass/guard/sink/
-      cfg/why/method/status/**attempts**) 기제도(같은 행 재질문은 새 행이 아니라 attempts
-      증가, `render_ask` 가 렌더 시점에 선례 조립) 맞다. 없던 것은 **정렬 축**뿐이었고
-      그게 `kind`(계산해놓고 안 저장) 와 `by`(출처) 다.
+    ★ Why asks and not a queue (pointed out by the operator, 2026-09-08):
+      With a queue per kind, which queue each round looks at becomes arbitrary and the queues compete.
+      Measurement showed exactly that — ahcache had resisted 31 · re-audit 34 · leads 23 standing with
+      overlaps of 4/12/8, and a 45-minute case cannot look at all three.
+      And **a single ask queue already existed** (`asks`). The fields (target/claim/klass/guard/sink/
+      cfg/why/method/status/**attempts**) and the mechanism (re-asking the same row bumps attempts instead of
+      adding a row, `render_ask` assembles precedents at render time) fit. What was missing was only **a sort axis**,
+      and that is `kind` (computed but never stored) and `by` (the source).
 
-    ★ 저항이 `asks` 와 **겹치지 않는다**는 것이 이 함수의 존재 이유다: 실측 교집합
-      ahcache 0/31 · wcifs 1/8. `asks` 는 게이트가 UNDECIDABLE 일 때만 질문을 만들고,
-      DENIED(요건 미충족)·CFG반증은 질문을 안 만들었다. 같은 "죽이려다 실패"인데
-      한쪽만 큐를 가졌던 것이다.
+    ★ That resisted rows **do not overlap** `asks` is why this function exists: the measured intersection is
+      ahcache 0/31 · wcifs 1/8. `asks` creates an ask only when a gate is UNDECIDABLE, and
+      DENIED (requirement not met) and CFG refutations created none. The same "failed to kill",
+      yet only one side had a queue.
 
-    ★ 지어내지 않는다: 축이 하나뿐이고 klass 도 하나면 **서류 문제**일 가능성이 높아
-      질문을 내지 않는다(`axes>=2` 또는 klass 2종 이상 또는 CFG반증).
+    ★ Nothing is invented: with only one axis and only one klass it is most likely **a paperwork problem**, so
+      no ask is emitted (needs `axes>=2`, or 2+ klasses, or a CFG refutation).
     """
     S = state if state is not None else STATE
     rows, _ = resisted(target, S)
@@ -3802,35 +3813,35 @@ def resisted_to_asks(target=None, state=None, save_now=True):
         if not (r["axes"] >= 2 or multi_klass or r["cfg"]):
             continue
         tgt = r["target"]
-        # CFG 가 반증했다 = 게이트가 이 불변식을 **표현 못 한다**(함수 간 / 문앞 1회 검사).
+        # The CFG refuted it = the gate **cannot express** this invariant (inter-function / one check at the door).
         kind = "inexpressible" if r["cfg"] else "need_observation"
         if multi_klass:
-            why = ("죽이려다 실패했다 — 서로 다른 사망 가설 %d개(%s)가 전부 안 먹혔다"
+            why = ("failed to kill it — %d different death hypotheses (%s) all failed"
                    % (len(r["klasses"]), ", ".join(r["klasses"][:4])))
-            method = ("반려 사유가 **매번 달랐다**면 서류 문제가 아니다. 이 행이 안 죽는 "
-                      "이유가 결함이기 때문인지 물어라 — `confirm` 의 임팩트 3항을 써 "
-                      "보는 것이 가장 빠른 판별이다(못 쓰면 그건 그것대로 답이다). "
-                      "쓸 수 있으면 그게 답이고, 못 쓰면 `exhaust` 로 정직하게 닫아라.")
+            method = ("If the denial reason **was different every time**, it is not a paperwork problem. Ask whether "
+                      "this row will not die because it is a defect — trying to write the three impact fields of "
+                      "`confirm` is the fastest test (not being able to write them is an answer too). "
+                      "If you can write them, that is the answer; if not, close it honestly with `exhaust`.")
         elif r["cfg"]:
-            why = ("기계가 네 짝을 반증했는데 기각이 등재됐다 (%s)" % ",".join(sorted(set(r["cfg"]))[:3]))
-            method = ("짝을 다시 선언하거나(`guards=` 로 컷 전체), 불변식이 **함수 간**이면 "
-                      "(문 앞에서 한 번 검사하고 플래그로 나르는 모양) 그건 이 게이트가 "
-                      "표현 못 하는 것이다 — `gate_blocked` 로 무엇을 못 적었는지 남겨라.")
+            why = ("the machine refuted your pair, yet the rejection was filed (%s)" % ",".join(sorted(set(r["cfg"]))[:3]))
+            method = ("Re-declare the pair (the whole cut with `guards=`), or if the invariant is **inter-function** "
+                      "(checked once at the door and carried in a flag), that is something this gate "
+                      "cannot express — record what could not be written with `gate_blocked`.")
         else:
-            why = "죽이려다 %d번 실패했다 (반려 %d · 파기 %d)" % (
+            why = "failed to kill it %d times (denied %d · broke %d)" % (
                 r["denied"] + r["broke"], r["denied"], r["broke"])
-            method = "같은 klass 로 반복 반려됐다면 요건을 갖춰 다시 내라. 그것도 닫은 것이다."
+            method = "If it was denied repeatedly under the same klass, meet the requirement and file it again. That closes it too."
         if r["lead_ids"]:
-            method += ("  ★ 이 행은 리드 %s 로도 서 있다 — **거기서** 닫아라(두 큐가 같은 "
-                       "일을 두 번 시키지 않는다)." % ",".join(r["lead_ids"][:2]))
-        # ★ 2026-09-08 자기 정정 — id 가 **위치 기반**(`XQ%d`)이었다. 이 함수는 시드
-        #   렌더(파일 사본)와 라이브 원장 **양쪽에서** 돌기 때문에, 위치 기반이면 같은 행이
-        #   두 곳에서 **다른 id** 를 받는다: 분석가가 SEED 에서 본 `XQ3` 을
-        #   `verdict(action='asks')` 로 못 찾는다. ⇒ **표적에서 결정적으로** 만든다.
+            method += ("  ★ This row also stands as lead %s — close it **there** (two queues do not ask for the same "
+                       "work twice)." % ",".join(r["lead_ids"][:2]))
+        # ★ Self-correction 2026-09-08 — the id was **position-based** (`XQ%d`). This function runs **both** on the
+        #   seed render (a file copy) and on the live ledger, so with position-based ids the same row gets
+        #   **different ids** in the two places: the `XQ3` the analyst saw in the SEED cannot be found
+        #   with `verdict(action='asks')`. ⇒ build it **deterministically from the target.**
         qid = "XQ-" + hashlib.sha1(tgt.encode("utf-8", "replace")).hexdigest()[:8]
-        cur = r["denied"] + len(r["cfg"]) + r["broke"]      # 이 행의 저항 총량
-        # ★ **열린 행만** 잡는다. id 로만 잡으면 닫힌 XQ 에 attempts 를 올리게 되고,
-        #   아래의 "닫힌 것은 되살리지 않는다" 분기에 영영 도달하지 못한다(테스트가 잡았다).
+        cur = r["denied"] + len(r["cfg"]) + r["broke"]      # this row's total resistance
+        # ★ Match **open rows only.** Matching by id alone would bump attempts on a closed XQ,
+        #   and the "closed ones are not revived" branch below would never be reached (a test caught it).
         prev = None
         for q in (S.get("asks") or []):
             if (q.get("status") or "open") != "open":
@@ -3839,9 +3850,9 @@ def resisted_to_asks(target=None, state=None, save_now=True):
                 prev = q
                 break
         if prev is not None:
-            # ★ **재생성으로 시도를 부풀리지 않는다.** 이 함수는 매 회차(그리고 시드 렌더마다)
-            #   돈다 — 무조건 attempts 를 올리면 랭킹 2순위 축이 "몇 번 돌았나"가 되어 버린다.
-            #   저항이 **실제로 늘었을 때만** 올린다.
+            # ★ **Do not inflate attempts by regeneration.** This function runs every round (and on every seed
+            #   render) — bumping attempts unconditionally would turn the second ranking axis into "how many times it ran".
+            #   Bump only when the resistance **actually grew.**
             if cur > int(prev.get("resist_n") or 0):
                 prev.setdefault("attempts", []).append(
                     {"t": time.strftime("%m-%d %H:%M"), "cfg": "resisted", "kind": kind})
@@ -3852,9 +3863,9 @@ def resisted_to_asks(target=None, state=None, save_now=True):
                     prev["kind"] = kind
                 bumped += 1
             continue
-        # ★ 닫힌 XQ 는 **되살리지 않는다.** 저항이 그 뒤로 더 늘었으면 그건 닫은 뒤에 생긴
-        #   새 관측이므로 **새 질문**이다(`-2`). 되살리면 `_ask_close` 의 일괄 종결과 맞물려
-        #   열림↔닫힘을 무한히 오간다.
+        # ★ A closed XQ is **not revived.** If resistance grew after that, it is a new observation made after
+        #   closing, so it is **a new ask** (`-2`). Reviving it would interlock with `_ask_close`'s bulk closing
+        #   and flip between open↔closed forever.
         _closed = [q for q in (S.get("asks") or []) if str(q.get("id")).startswith(qid)]
         if _closed:
             if cur <= max(int(q.get("resist_n") or 0) for q in _closed):
@@ -3874,60 +3885,60 @@ def resisted_to_asks(target=None, state=None, save_now=True):
 
 
 def resisted_digest(target=None, state=None, n=8):
-    """`resisted()` 를 시드·상태블록에 실을 문자열로. 비어 있으면 빈 문자열."""
+    """`resisted()` as a string to carry in the seed/status block. An empty string when there is nothing."""
     try:
         rows, c = resisted(target, state)
     except Exception as _e:
-        return "(⛔ resisted 실패: %s)" % _e
+        return "(⛔ resisted failed: %s)" % _e
     if not rows:
         return ""
-    L = ["## ⟂ 저항 큐 — **죽이려다 실패한 행** %d건 (축 2개 이상: %d)"
+    L = ["## ⟂ Resisted queue — %d **rows somebody tried to kill and failed** (2+ axes: %d)"
          % (c["rows"], c["multi_axis"]), "",
-         "  이 행들은 누군가 이미 죽이려 했고 **실패했다.** 반려는 서류 문제일 수 있지만,",
-         "  **서로 다른 klass 로 반복 반려된 행**은 사망 가설이 여러 개 안 먹혔다는 뜻이다.",
-         "  `cfg` 는 기계가 짝을 반증했는데 기각이 등재된 것이고, `broke` 는 심문자가 깬 것이다.",
-         "  ★ 자동 승격은 없다 — 이건 **재분석 대상 목록**이지 확정 후보 목록이 아니다.", ""]
+         "  Someone already tried to kill these rows and **failed.** A denial may be a paperwork problem, but",
+         "  **a row denied repeatedly under different klasses** means several death hypotheses failed.",
+         "  `cfg` means the machine refuted the pair yet the rejection was filed; `broke` means the interrogator broke it.",
+         "  ★ There is no automatic promotion — this is **a re-analysis list**, not a list of confirmation candidates.", ""]
     for r in rows[:n]:
         bits = []
         if r["denied"]:
-            bits.append("반려 %d회%s" % (r["denied"],
+            bits.append("denied %d times%s" % (r["denied"],
                         (" [klass %s]" % ",".join(r["klasses"][:4])) if r["klasses"] else ""))
         if r["cfg"]:
-            bits.append("CFG반증 %s" % ",".join(sorted(set(r["cfg"]))[:3]))
+            bits.append("CFG refuted %s" % ",".join(sorted(set(r["cfg"]))[:3]))
         if r["broke"]:
-            bits.append("심문자파기 %d" % r["broke"])
+            bits.append("interrogator broke %d" % r["broke"])
         L.append("- %s" % r["target"][:78])
         L.append("    %s%s" % (" · ".join(bits),
-                               ("  (리드 %s — 거기서 닫아라)" % ",".join(r["lead_ids"][:2]))
+                               ("  (lead %s — close it there)" % ",".join(r["lead_ids"][:2]))
                                if r["lead_ids"] else ""))
-    L += ["", "전체는 `verdict(action='resisted')`."]
+    L += ["", "The full list: `verdict(action='resisted')`."]
     return "\n".join(L)
 
 
 def dependency_audit(limit=40, state=None):
-    """확정 중 **선언한 전제가 죽어 있는** 것을 이름째 돌려준다. (rows, n)
+    """Return, by name, the confirmations whose **declared premise is dead.** (rows, n)
 
-    ★ 게이트는 등재 **시점**만 본다. 전제는 나중에 죽는다 — 그때 아무도 다시 안 본다.
-      이 함수가 그 되돌아보기다. `reach_unknown` / `dead_claim_open` 과 같은 계열:
-      **게이트가 요구하는 것을 열거 가능하게 만든다.**
+    ★ The gate looks only at the **moment** of filing. Premises die later — and then nobody looks again.
+      This function is that look back. The same family as `reach_unknown` / `dead_claim_open`:
+      **make what the gate requires enumerable.**
     """
-    # ★ `state=` 로 **스냅샷**을 받는다. `nightrun.build_carryover` 는 파일에서 읽은 dict
-    #   으로 이어받기를 만들고 `ledger.STATE` 를 안 쓴다 — STATE 만 읽게 짜면 부모
-    #   프로세스에서 **조용히 0건**이 나온다. 오늘 이 함정을 두 번 밟았다
-    #   (`verify-through-the-production-path`). 로직은 한 벌, 출처만 인자로.
+    # ★ It takes a **snapshot** via `state=`. `nightrun.build_carryover` builds the carry-over from a dict
+    #   read from a file and does not use `ledger.STATE` — written to read STATE only, it would **quietly
+    #   return 0** in the parent process. This trap was stepped on twice today
+    #   (`verify-through-the-production-path`). One copy of the logic, only the source is an argument.
     _S = state if state is not None else STATE
     out, undeclared = [], []
     for v in (_S.get("verdicts") or []):
-        if v.get("status") != "확정":
+        if v.get("status") != "confirmed":
             continue
         dep = str(v.get("depends_on") or "").strip()
         if not dep:
-            # ★ 두 번째 통: **선언 자체를 안 한 확정.** 막지 않기로 했으므로 이게
-            #   유일한 가시성이다. 안 세면 "선택적 기제는 안 쓰인다"가 그대로 재현된다
-            #   (scope: 560행에 1회, 안내는 104회 나갔다).
+            # ★ Second bucket: **confirmations that made no declaration at all.** Since it was decided not to block,
+            #   this is the only visibility there is. Not counting them would reproduce "optional mechanisms go unused"
+            #   as-is (scope: used once in 560 rows, while the hint went out 104 times).
             undeclared.append({"verdict": str(v.get("id")), "target": str(v.get("target"))[:80]})
             continue
-        if dep.lower() in ("none", "-", "없음"):
+        if dep.lower() in ("none", "-", "nothing"):
             continue
         for rid in [x.strip() for x in dep.replace(";", ",").split(",") if x.strip()]:
             r = _resolve_row(rid, _S)
@@ -3938,23 +3949,23 @@ def dependency_audit(limit=40, state=None):
 
 
 def dead_premise_rejections(limit=20, state=None):
-    """**기각** 중 선언한 전제가 죽어 있는 것. (rows, n)
+    """The **rejections** whose declared premise is dead. (rows, n)
 
-    ★ 2026-09-10 — `dependency_audit` 는 `status == "확정"` 만 본다. 그런데 이 도메인에서
-      **기각 하나는 버그 하나를 영구히 잃는 결정**이고(CLAUDE.md), 전제는 나중에 죽는다.
-      실측: ahcache 기각 195건 중 6건이 전제를 선언했는데 **아무도 그 6건을 다시 안 본다.**
-      `rejaudit` 은 게이트 품질로 등급을 매길 뿐 전제 사망은 안 본다 — 다른 축이다.
+    ★ 2026-09-10 — `dependency_audit` looks only at `status == "confirmed"`. But in this domain
+      **a single rejection is a decision that loses a bug for good** (CLAUDE.md), and premises die later.
+      Measured: 6 of ahcache's 195 rejections declared a premise, and **nobody ever looks at those 6 again.**
+      `rejaudit` only grades by gate quality and does not look at premise death — a different axis.
 
-      확정 쪽과 **같은 규칙**을 쓴다. 반환 형태를 따로 둔 이유는 기존 호출부의 4-튜플
-      언패킹을 안 깨기 위해서다(`built-but-never-wired` 를 피하려다 회귀를 내면 안 된다).
+      It uses **the same rule** as the confirmation side. The return shape is kept separate so as not to break
+      the existing callers' 4-tuple unpacking (avoiding `built-but-never-wired` must not cause a regression).
     """
     _S = state if state is not None else STATE
     out = []
     for v in (_S.get("verdicts") or []):
-        if v.get("status") != "기각":
+        if v.get("status") != "rejected":
             continue
         dep = str(v.get("depends_on") or "").strip()
-        if not dep or dep.lower() in ("none", "-", "없음"):
+        if not dep or dep.lower() in ("none", "-", "nothing"):
             continue
         for rid in [x.strip() for x in dep.replace(";", ",").split(",") if x.strip()]:
             r = _resolve_row(rid, _S)
@@ -3965,21 +3976,21 @@ def dead_premise_rejections(limit=20, state=None):
 
 
 def _impact_gate(args):
-    """★ L2 — **확정은 임팩트 3항을 들고 와야 한다.** (ok, note, impact)
+    """★ L2 — **a confirmation must bring the three impact fields.** (ok, note, impact)
 
-    왜: 이 하네스의 압력은 전부 아래(위양성 방지)였다. 그래서 "검사 우회를 확정"한 지점에서
-    그냥 멈췄고, 실제로 값을 낸 발견들은 거기서 **질문을 한 번 튼** 결과였다.
-    세 항은 `methodology/references/escalation.md` 의 §1~§3 을 그대로 옮긴 것이다.
+    Why: all the pressure in this harness pointed down (preventing false positives). So it simply
+    stopped at "confirmed a check bypass", and the findings that actually paid off were the result of
+    **turning the question once** at that point. The three fields carry over §1~§3 of `methodology/references/escalation.md` as-is.
 
-      owner    이 바이트/리소스의 **소유자**. 없으면 침해할 경계도 없다
-      delta    **정상 경로 대비** 공격자가 더 얻는 것. 0이면 코드 결함이어도 보안 영향 0
-      boundary 침해되는 **경계**를 벤더 문서의 언어로 한 문장
+      owner    the **owner** of these bytes/this resource. With none, there is no boundary to violate either
+      delta    what the attacker gains **compared with the normal path.** If 0, the security impact is 0 even for a code defect
+      boundary the **boundary** violated, in one sentence, in the vendor documentation's language
 
-    거부가 아니라 **상한**으로 처리하는 경우가 둘 있다 — 게이트를 만족 불가능하게 만들면
-    에이전트가 blocked 로 도망가고 그게 더 나쁘다:
-      · owner='none'  → 통과시키되 `grade_cap='경계 없음'` 을 박는다
-      · delta='n/a'   → **더 강한 발견이다**(정상 경로 비교가 성립하지 않는 클래스). 통과
-    유일한 강제 되돌림은 **delta=0 인데 principal 을 안 찾아본 경우**다. 그게 §3 이다.
+    Two cases are handled as a **cap** rather than a refusal — make the gate unsatisfiable and the
+    agent runs off to blocked, which is worse:
+      · owner='none'  → passes, but stamps `grade_cap='no boundary (unowned data)'`
+      · delta='n/a'   → **a stronger finding** (a class where the normal-path comparison does not hold). Passes
+    The only forced bounce-back is **delta=0 without having looked for a principal.** That is §3.
     """
     ow = (args.get("owner") or "").strip()
     dl = str(args.get("delta") or "").strip()
@@ -3999,7 +4010,7 @@ def _impact_gate(args):
                 "remote-authenticated | appcontainer | low-il | standard-user | container-admin "
                 "| admin | system | kernel | hypervisor\n"
                 "  If you cannot establish the MINIMUM principal that reaches the sink, write\n"
-                "  from_principal='unproven' — the row is then recorded as 경계보류, not 확정,\n"
+                "  from_principal='unproven' — the row is then recorded as `boundary-held`, not `confirmed`,\n"
                 "  and the escalator takes exactly that one question.\n"
                 "Missing: %s\n"
                 "'I found a path that skips a check' is not yet a vulnerability. If you cannot "
@@ -4010,8 +4021,8 @@ def _impact_gate(args):
     if pr:
         imp["principal"] = pr[:300]
 
-    # ★ 전수 주장 검문 — "소비자는 유저모드뿐" 류는 **부재 주장**이다.
-    #   이 한 문장이 등급 상한을 혼자 정하는데 지금까지 어떤 게이트도 안 봤다.
+    # ★ Exhaustiveness-claim checkpoint — "the only consumer is user mode" and the like are **absence claims.**
+    #   This one sentence sets the grade ceiling by itself, and until now no gate looked at it.
     _blob = " / ".join((ow, dl, bd))
     _m = _SOLE.search(_blob)
     if _m:
@@ -4038,8 +4049,8 @@ def _impact_gate(args):
     if low_o in _NONE_OWNER:
         imp["grade_cap"] = "no boundary (unowned data)"
     if low_d in _NA_DELTA or low_d.startswith("n/a"):
-        imp["delta_kind"] = "not_applicable"      # 더 강한 클래스
-    elif re.fullmatch(r'0+(\.0+)?|없음|zero|none', low_d):
+        imp["delta_kind"] = "not_applicable"      # the stronger class
+    elif re.fullmatch(r'0+(\.0+)?|zero|none', low_d):
         imp["delta_kind"] = "zero"
         if not pr:
             return (False,
@@ -4063,9 +4074,9 @@ def _impact_gate(args):
                     None)
     else:
         imp["delta_kind"] = "nonzero"
-    # ── 경계: 칸이 있으면 칸이 정본, 없으면 산문 폴백 ────────────────────
-    #   막지 않는다(계산+첨부). 다만 **무엇으로 판정했는지**를 `boundary_src` 로 남겨
-    #   "정규식이 읽어준 것"과 "분석자가 선언한 것"이 원장에서 구분되게 한다.
+    # ── boundary: when the fields are present they are canonical, otherwise fall back to prose ──
+    #   It does not block (compute + attach). But it records **what the judgement was made from** in `boundary_src`
+    #   so that "what the regex read" and "what the analyst declared" can be told apart in the ledger.
     _fp = (args.get("from_principal") or "").strip().lower()
     _tp = (args.get("to_principal") or "").strip().lower()
     if _fp and _tp:
@@ -4085,7 +4096,7 @@ def _impact_gate(args):
             imp["grade_cap"] = (imp.get("grade_cap") or "") + (" · " if imp.get("grade_cap") else "") + \
                 "out-of-scope boundary (%s): %s" % (_lab, _why)
 
-    # ── 선언한 출발 principal 을 실측이 뒷받침하는가 (1순위 T46 의 소비부) ──
+    # ── does a measurement back the declared starting principal (the consumer side of top-priority T46) ──
     _pv, _pnote = principal_evidence(args.get("target") or STATE.get("target"), _fp)
     if _pv != "n/a":
         imp["principal_evidence"] = _pv
@@ -4103,11 +4114,11 @@ def _cfgmod():
 
 
 def _bump(key):
-    """★ 툴 쪽 거부를 계기판에 올린다. 훅의 `deny()` 만 `gate_denials` 를 세고 있어서
+    """★ Put tool-side refusals on the instrument panel. Only the hook's `deny()` was counting `gate_denials`, so
     `[REJECTION REFUSED]` / `[REJECTION HELD - QUESTION]` / `[CONFIRMATION HELD - IMPACT]` /
-    `[VERDICT REFUSED]` 는 **한 번도 세어진 적이 없다**(ledger 전체에 runlog 호출 1곳뿐).
-    2026-09-04 밤 msquic 회차에서 완결된 분석 5건이 사라졌는데 **왜인지 알 수 없었다** —
-    반환값은 모델에게만 가고 stdout·runs.jsonl 어디에도 안 남기 때문이다."""
+    `[VERDICT REFUSED]` **had never once been counted** (one runlog call site in the whole ledger).
+    On the night of 2026-09-04, five finished analyses vanished in the msquic round and **there was no way to tell why** —
+    the return value goes only to the model and is left nowhere in stdout or runs.jsonl."""
     try:
         import runlog as _rl
         _rl.bump(key)
@@ -4116,7 +4127,7 @@ def _bump(key):
 
 
 def _blocked_rows():
-    """표면 행 중 `BLOCKED:` 로 남은 것. 부채의 한 축이다."""
+    """Surface rows left as `BLOCKED:`. One axis of the debt."""
     n = 0
     for r in (STATE.get("surface") or {}).values():
         if isinstance(r, dict) and str(r.get("why") or "").lstrip().upper().startswith("BLOCKED"):
@@ -4125,12 +4136,12 @@ def _blocked_rows():
 
 
 def open_debt():
-    """이번 회차가 **연 것 − 닫은 것**. 세 축을 다 센다.
+    """What this round **opened − closed**. All three axes are counted.
 
-    ★ 한 축만 세면 물량이 옆으로 샌다. 실측 근거: 이 원장에는 이미 `BLOCKED:` 행이
-      546개 있고, 원장 자신이 "blocked 행의 **56%가 '다음 단계 있음'을 뜻하는 어떤 산문
-      술어에도 매칭된다**"고 재놨다 — 즉 blocked 는 기계로 구분되지 않는 값싼 출구다.
-      리드에만 상한을 걸면 그리로 전량이 샌다.
+    ★ Count only one axis and the volume leaks sideways. Measured grounds: this ledger already has 546
+      `BLOCKED:` rows, and the ledger itself measured that "**blocked rows matching some prose predicate
+      meaning 'there is a next step' are 56%**" — i.e. blocked is a cheap exit the machine cannot tell apart.
+      Put a cap on leads alone and the whole volume leaks there.
     """
     _l0 = _RUN.get("leads0") or set()
     try:
@@ -4152,25 +4163,25 @@ def open_debt():
 
 
 def _wip_note():
-    """상한에 걸렸을 때 내보낼 문구. **행을 지목하지 않으면 지시가 아니다** —
-    실측: klass 게이트처럼 행동만 막으면 에이전트는 우회를 찾는다(같은 id 7연속 재제출).
-    종료 게이트가 깊이를 만든 회차는 심문자가 **이름 붙은 다음 수**를 남긴 회차뿐이었다.
+    """The text to emit when the cap is hit. **It is not an instruction unless it names a row** —
+    measured: block only the action, like the klass gate does, and the agent looks for a way around (the same id resubmitted 7 times in a row).
+    The only rounds where the exit gate produced depth were those where the interrogator left **a named next move.**
     """
     d = open_debt()
     cap = int(getattr(_cfgmod(), "WIP_CAP", 12))
-    L = ["[DEBT CAP] 이번 회차가 연 것 %d − 닫은 것 %d = **순증 %d** (상한 %d).\n"
-         "  열림: 리드 +%d · 질문 +%d · blocked +%d   |   닫힘: 리드 %d · 질문 %d"
+    L = ["[DEBT CAP] this round opened %d − closed %d = **net increase %d** (cap %d).\n"
+         "  opened: leads +%d · asks +%d · blocked +%d   |   closed: leads %d · asks %d"
          % (d["opened"], d["closed"], d["net"], cap,
             d["lead_up"], d["ask_up"], d["blocked_up"], d["lead_dn"], d["ask_dn"]),
          "",
-         "새 기각·blocked 는 받지 않는다. **닫아야 연다.** 확정(`confirm`)·실측"
-         "(`measure`)·범위선언(`scope`)·트랙(`track`)은 그대로 열려 있다.", ""]
+         "New rejections and blocked rows are not accepted. **Close to open.** Confirmation (`confirm`), measurement "
+         "(`measure`), scope declaration (`scope`) and tracks (`track`) remain open as they are.", ""]
     try:
         ol = open_leads(STATE.get("target"))
     except Exception:
         ol = []
     if ol:
-        L.append("가장 오래 열려 있는 리드 — 심문자가 남긴 다음 수가 이미 붙어 있다:")
+        L.append("The longest-open leads — the interrogator's next move is already attached:")
         for b in ol[:2]:
             L.append("  · `%s` [%s] %s" % (b.get("id"), b.get("klass") or "-",
                                            str(b.get("target"))[:70]))
@@ -4178,34 +4189,34 @@ def _wip_note():
             if nm:
                 L.append("      %s" % nm[:420])
         L.append("")
-        L.append("닫는 길은 셋뿐이다 — `verdict(action='lead', id=<위 id>, "
-                 "how=refuted|measured|reinterrogated, why=…)`. 소진(exhausted)은 없다.")
+        L.append("There are only three ways to close — `verdict(action='lead', id=<the id above>, "
+                 "how=refuted|measured|reinterrogated, why=…)`. There is no exhausted.")
     else:
-        L.append("열린 리드가 없다 ⇒ 순증은 질문·blocked 에서 났다. "
-                 "연 질문에 답하거나, blocked 행 하나를 판정까지 끌고 가라.")
+        L.append("No open leads ⇒ the net increase came from asks and blocked rows. "
+                 "Answer an ask you opened, or drag one blocked row all the way to a verdict.")
     return "\n".join(L)
 
 
-SURFACE_SCHEMA = 1      # 표면 아티팩트 스키마. 모양이 바뀌면 올린다 → 옛 파일은 자동 무효
+SURFACE_SCHEMA = 1      # surface artifact schema. Bump it when the shape changes → old files become invalid automatically
 
 
 def _env_stamp():
-    """gate_block 을 낸 **그때의 실측 채널 상태**. 나중에 다르면 재확인 대상이다."""
+    """The **measurement channel state at the time** a gate_block was raised. If it differs later, it is due for re-checking."""
     c = _cfgmod()
     return {k: int(bool(getattr(c, k, False)))
             for k in ("ALLOW_PROBE", "ALLOW_VM_PROBE", "ALLOW_KDNET")}
 
 
 def export_surface(state=None, img_path=None, out_dir=None):
-    """원장의 **표면**을 지문 달린 아티팩트로 내보낸다.
+    """Export the ledger's **surface** as a fingerprinted artifact.
 
-    ★ RAPTOR 에서 가져온 것(`/understand` → 스캔 → `/validate` 브리지): 공격면을
-      파일로 내보내 다음 단계가 **자동으로 집어 쓰되**, 아티팩트가 입력의 지문을 들고
-      다니고 소비자가 재계산해 불일치면 재사용을 거부한다.
-      우리 지문은 CodeView GUID 다(파일 md5 보다 빌드 정체에 가깝다).
+    ★ Taken from RAPTOR (the `/understand` → scan → `/validate` bridge): export the attack surface to a
+      file so the next stage **picks it up automatically**, while the artifact carries the fingerprint of its
+      input and the consumer recomputes it and refuses reuse on a mismatch.
+      Our fingerprint is the CodeView GUID (closer to the build identity than a file md5).
 
-    왜: 지금까지 표면은 **원장 안에만** 있었다. 밖으로 못 나가니 ① 빌드 간 diff 가
-      안 되고 ② 다른 도구가 못 읽고 ③ "이 표는 어느 빌드의 것인가"를 아무도 안 물었다.
+    Why: until now the surface lived **only inside the ledger.** It could not get out, so ① cross-build diffs
+      were impossible ② other tools could not read it ③ nobody asked "which build is this table from".
     """
     S = state if state is not None else STATE
     name = str(S.get("target") or "unknown")
@@ -4239,42 +4250,42 @@ def export_surface(state=None, img_path=None, out_dir=None):
 
 
 def load_surface(path, img_path=None):
-    """내보낸 표면을 **신선할 때만** 돌려준다. 반환: (doc, fresh, why).
+    """Return an exported surface **only when it is fresh.** Returns: (doc, fresh, why).
 
-    ★ 규약 3항 (RAPTOR): 지문 불일치면 재사용 거부. 지문을 못 구하면 **재사용하지
-      않는다**(조용한 재사용이 가장 위험하다). 스키마가 다르면 역시 거부.
+    ★ Three-point contract (RAPTOR): refuse reuse on a fingerprint mismatch. If the fingerprint cannot be obtained,
+      **do not reuse** (silent reuse is the most dangerous). A different schema is refused too.
     """
     try:
         doc = json.load(open(path, encoding="utf-8"))
     except (OSError, ValueError) as e:
-        return (None, False, "읽기 실패: %s" % e)
+        return (None, False, "read failed: %s" % e)
     if doc.get("schema") != SURFACE_SCHEMA:
-        return (doc, False, "스키마 %s ≠ %s — 재사용하지 않는다"
+        return (doc, False, "schema %s ≠ %s — not reusing"
                 % (doc.get("schema"), SURFACE_SCHEMA))
     want = ((doc.get("build") or {}).get("cv_guid") or "")
     if not img_path:
-        return (doc, False, "대조할 바이너리가 없다 — 재사용하지 않는다")
+        return (doc, False, "no binary to cross-check against — not reusing")
     got = None
     try:
         import pe as _pe
         cv = _pe.PE(img_path).codeview()
         got = cv[0] if cv else None
     except Exception as e:
-        return (doc, False, "바이너리 지문을 못 읽었다(%s) — 재사용하지 않는다" % e)
+        return (doc, False, "could not read the binary's fingerprint (%s) — not reusing" % e)
     if not want or not got:
-        return (doc, False, "지문이 비었다 — 재사용하지 않는다")
+        return (doc, False, "the fingerprint is empty — not reusing")
     if want.lower() != got.lower():
-        return (doc, False, "빌드가 다르다: 표면 %s… / 바이너리 %s…" % (want[:8], got[:8]))
+        return (doc, False, "different build: surface %s… / binary %s…" % (want[:8], got[:8]))
     return (doc, True, "")
 
 
 def gate_block_digest(state=None, n=8):
-    """지휘자가 볼 gate_block 목록. **오래된 미해결부터** + 같은 벽의 반복 횟수.
+    """The gate_block list the conductor sees. **Oldest unresolved first** + the repeat count of the same wall.
 
-    ★ 왜 (2026-09-23): 옛 출력은 `tax[-4:]` / `oth[-5:]` 즉 **최신 LIFO** 였다.
-      ahcache 는 47건인데 5건만 보였다 — `break_digest` 가 09-07 에 고친 바로 그 병이
-      이 출력에 남아 있었다. 누적 123건 중 아무도 옛것을 못 봤다.
-    반환: (rows, summary) — rows 는 오래된 순, summary 는 {계열라벨: 건수}.
+    ★ Why (2026-09-23): the old output was `tax[-4:]` / `oth[-5:]`, i.e. **newest-first LIFO.**
+      ahcache had 47 but only 5 were visible — the very disease `break_digest` fixed on 09-07 was
+      still in this output. Of 123 accumulated, nobody saw the old ones.
+    Returns: (rows, summary) — rows oldest first, summary is {family label: count}.
     """
     S = state if state is not None else STATE
     gb = [x for x in (S.get("gate_blocks") or []) if isinstance(x, dict)]
@@ -4292,7 +4303,7 @@ def gate_block_digest(state=None, n=8):
         x["repeat"] = cnt.get(str(x.get("gate"))[:40], 1)
         x["stale_env"] = bool(e) and e != now
         out.append(x)
-    # taxonomy 를 먼저(가장 위험), 그 안에서 오래된 순
+    # taxonomy first (the most dangerous), oldest first within it
     out.sort(key=lambda r: (r.get("kind") != "taxonomy", str(r.get("t") or "")))
     return out[:n], cnt
 
@@ -4300,58 +4311,61 @@ def gate_block_digest(state=None, n=8):
 def verdict(args):
     act = (args.get("action") or "").lower()
     tgt = args.get("target", "?")
-    # ★ 2026-09-07 — **부채 상한.** `reject`/`blocked` 만 막는다.
-    #   확정은 막지 않는다: 확정은 행을 여는 것이 아니라 닫는 것이고, 이 하니스의 병목은
-    #   반박자 입력율(17일에 41회)이지 위양성이 아니다.
+    # ★ 2026-09-07 — **The debt cap.** It blocks only `reject`/`blocked`.
+    #   Confirmations are not blocked: a confirmation closes a row rather than opening one, and
+    #   this harness's bottleneck is the refuter's input rate (41 on the 17th), not false positives.
     if act in ("reject", "blocked") and getattr(_cfgmod(), "GATE_WIP", True):
         _cap = int(getattr(_cfgmod(), "WIP_CAP", 12))
         _d = open_debt()
         if _d["net"] >= _cap:
             _bump("wip_blocked")
-            record_denial(tgt, "[DEBT CAP] 순증 %d ≥ 상한 %d" % (_d["net"], _cap),
+            record_denial(tgt, "[DEBT CAP] net increase %d ≥ cap %d" % (_d["net"], _cap),
                           act=act, rule="debt cap: opened-closed >= WIP_CAP")
             return _wip_note()
-    # ★ 2026-09-24 — **patch-anchored census 완결 게이트** (Move 2).
-    #   벤더가 고친 버그의 형제를 census 하는 인구를 `population(invariant=...)` 로 표시하면,
-    #   그 census 를 "완전 수정 / 형제 없음" 으로 닫는 판정은 반드시 `completes=<인구명>` 을
-    #   달아야 하고, 여기서 열거 완전성(미분석 0)과 심문자 SUSTAINED 를 강제한다.
-    #   어젯밤 mrxsmb 과대-닫힘(심문자가 BROKE 했는데도 비차단이라 기각이 먼저 카운트됨)이
-    #   구조적으로 파일 불가가 된다. RI-태그 인구가 없으면 이 블록은 전부 통과(런 무영향).
+    # ★ 2026-09-24 — **The patch-anchored census completion gate** (Move 2).
+    #   When a population that censuses the siblings of a vendor-fixed bug is marked with
+    #   `population(invariant=...)`, any verdict closing that census as "fully fixed / no siblings"
+    #   must carry `completes=<population name>`, and here enumeration completeness (0 unanalysed)
+    #   and an interrogator SUSTAINED are enforced.
+    #   Last night's mrxsmb over-closure (the interrogator BROKE it, but being non-blocking the
+    #   rejection was counted first) becomes structurally unfileable. With no RI-tagged population
+    #   this whole block passes through (no effect on a run).
     _completes = args.get("completes")
     if _completes:
         try:
             _cok, _creason = population_closure_status(str(_completes))
-        except Exception as _e:      # 게이트 자신이 판정을 크래시시키지 않는다
+        except Exception as _e:      # the gate itself never crashes a verdict
             _cok, _creason = True, "closure gate error: %s" % type(_e).__name__
         if not _cok:
             _bump("held_closure")
             record_denial(tgt, "[CLOSURE HELD] completes=%s: %s" % (_completes, _creason[:150]),
                           act=act, rule="patch-anchored census not closable")
             return ("[CLOSURE HELD - PATCH-ANCHORED CENSUS] `%s`\n%s\n\n"
-                    "이 census 는 벤더가 복원한 불변식의 형제 모집단이다. 완결로 닫으려면 "
-                    "① 미분석=0 (알려진 멤버 전수) ② 닫는 서술에 심문자를 돌려 SUSTAINED. "
-                    "심문자가 깨면 그건 열거가 불완전하다는 뜻이니 놓친 멤버를 set_b 에 넣고 다시 세라."
+                    "This census is the sibling population of an invariant the vendor restored. To close it as complete: "
+                    "① unanalysed=0 (every known member) ② run the interrogator on the closing statement and get SUSTAINED. "
+                    "If the interrogator breaks it, the enumeration is incomplete — put the missed members in set_b and count again."
                     % (_completes, _creason))
     if act in ("confirm", "reject"):
         vid = args.get("id") or f"V{len(STATE['verdicts']) + 1}"
-        # ★ basis 검사는 기각 게이트와 무관하다 — confirm 에도 걸려야 하므로 **먼저** 본다.
-        # ★ 2026-09-08 — **거부는 '기록이 아예 없을 때'만이다.**
-        #   09-08 런 실측: 분석가가 라이브 게스트에서 기준선→처치→사후 3단을 **대조군 3/3**
-        #   으로 돌리고(`latch=1 → class-8 요청 → latch=1`, 섹션 핸들 바이트 동일)
-        #   `basis=measured` 로 냈는데 거부됐다. 이유는 `measure(action='classify')` 를 안
-        #   불렀기 때문 — 그 관측은 `kd`+`ioctl` 로 했고 **`kd` 는 원장에 아무것도 안 남겼다**
-        #   (툴 설명은 `target=` 을 "so the ledger can bind it" 이라고 약속하는데 배선이 없었다).
-        #   그 회차의 유일한 등재 판정이 `basis=disassemble` 로 내려앉았다.
-        #   ⇒ ① `kd` 가 `trace` 를 남기고 ② `measured()` 가 주소 겹침으로 찾고
-        #     ③ 여기서는 **무엇이 뒷받침했는지 도장만 찍는다.**
-        #   ★ 느슨해지지 않는 이유: `trace` 도 하네스가 실행한 기록이지 자기 신고가 아니고,
-        #     `basis=measured` 기각은 `GATE_CONTROL_BEFORE_REJECT` 가 **양성 대조를 따로**
-        #     요구한다(agent_sdk:764). 그 검문은 그대로 있다.
-        # ★ 2026-09-08 — **정본화 후 비교한다.** 여기가 `== "measured"` 정확일치라
-        #   `basis="live kd read of the governing feature cache dword…"` 같은 산문이
-        #   **이 검문을 통째로 건너뛰었다**(09-08 2회차 실측: 그렇게 통과한 판정 2건).
-        #   09-07 에 `agent_sdk` 의 `GATE_CONTROL_BEFORE_REJECT` 에서 고친 **바로 그 버그**가
-        #   원장 쪽 쌍둥이에 그대로 남아 있었다 — 그때 수정이 절반만 적용된 것이다.
+        # ★ The basis check is unrelated to the reject gate — it must apply to confirm too, so it is looked at **first**.
+        # ★ 2026-09-08 — **Refusal is only for 'no record at all'.**
+        #   Measured in the 09-08 run: the analyst ran a three-step baseline → treatment → after on a
+        #   live guest **with controls 3/3** (`latch=1 → class-8 request → latch=1`, section handle
+        #   bytes identical) and filed it as `basis=measured`, and was refused. The reason: it had not
+        #   called `measure(action='classify')` — the observation was made with `kd`+`ioctl`, and
+        #   **`kd` left nothing in the ledger** (the tool description promises `target=` is there
+        #   "so the ledger can bind it", but the wiring did not exist).
+        #   That round's only filed verdict fell back to `basis=disassemble`.
+        #   => ① `kd` leaves a `trace`, ② `measured()` finds it by address overlap, and
+        #     ③ here it **only stamps what backed the verdict.**
+        #   ★ Why this is not a loosening: a `trace` is also a record of something the harness ran, not
+        #     a self-report, and a `basis=measured` rejection still has `GATE_CONTROL_BEFORE_REJECT`
+        #     demanding **a separate positive control** (agent_sdk:764). That check stays as it is.
+        # ★ 2026-09-08 — **Compare after canonicalising.** This used to be an exact `== "measured"`
+        #   match, so prose such as `basis="live kd read of the governing feature cache dword…"`
+        #   **skipped this check entirely** (measured in the 09-08 second round: 2 verdicts passed that way).
+        #   **The very bug** fixed on 09-07 in `agent_sdk`'s `GATE_CONTROL_BEFORE_REJECT` was still
+        #   sitting in its ledger-side twin — the fix back then had been applied only halfway.
         if normalize_basis(args.get("basis"))[0] == "measured":
             _mrec = measured(tgt)
             if not _mrec:
@@ -4369,9 +4383,9 @@ def verdict(args):
                         "Without either, 'I measured it' is SELF-REPORTED, and the reason "
                         "measured outranks disassemble in BASIS_RANK disappears.")
             _kinds = {str(m.get("kind") or "classify") for m in _mrec}
-            # ★ 2026-09-10 — **뒷받침 자격을 판정에 박는다.** 안 박으면 이 판정을 3주 뒤에
-            #   읽는 쪽이 "저권한에서 쟀다"와 "어느 토큰인지 아무도 안 적었다"를 구분 못 한다.
-            #   막지 않는다 — 사실만 싣는다(계산+첨부).
+            # ★ 2026-09-10 — **Stamp the backing credentials onto the verdict.** Without it, whoever
+            #   reads this verdict three weeks later cannot tell "measured at low privilege" from
+            #   "nobody wrote down which token". It does not block — it only carries the fact (computed + attached).
             _pg = "unknown"
             _rank = {"verified_low": 5, "verified_default": 4, "verified_elevated": 3,
                      "kernel-debugger": 2, "declared": 1, "unknown": 0}
@@ -4380,9 +4394,9 @@ def verdict(args):
                 if _rank.get(_c, 0) > _rank.get(_pg, 0):
                     _pg = _c
             _pending_meas[0] = {"n": len(_mrec), "kinds": sorted(_kinds),
-                                # ★ 2026-09-13 — 서열 3단. `before_after` 는 채점된
-                                #   관측이므로 `trace`(실행 사실만)와 같은 칸에 넣으면
-                                #   증거 무게가 거짓이 된다.
+                                # ★ 2026-09-13 — three ranks. `before_after` is a graded
+                                #   observation, so putting it in the same slot as `trace`
+                                #   (the fact of execution only) would falsify the weight of the evidence.
                                 "by": ("classify" if "classify" in _kinds
                                        else "before_after" if "before_after" in _kinds
                                        else "trace"),
@@ -4393,8 +4407,8 @@ def verdict(args):
             _ok, _note, impact = _impact_gate(args)
             if not _ok:
                 _bump("held_impact"); return "[CONFIRMATION HELD - IMPACT] %s\n\n%s" % (tgt, _note)
-            # ★ 2026-09-06 — **주장 간 정합성.** 다른 게이트는 전부 주장-국소적이다.
-            #   이 확정이 빌려오는 전제가 이미 죽었는지는 아무도 안 봤다(wcifs 채점본 §1).
+            # ★ 2026-09-06 — **Consistency between claims.** Every other gate is claim-local.
+            #   Nobody checked whether a premise this confirmation borrows had already died (wcifs graded copy §1).
             _rok, _rnote, _rask = _reach_gate(args)
             if not _rok:
                 _bump("held_reach")
@@ -4402,26 +4416,27 @@ def verdict(args):
                               act=act, rule="depends_on: missing or unresolvable")
                 return "[CONFIRMATION HELD - DEPENDENCY] %s\n\n%s" % (tgt, _rnote)
         if act == "reject":
-            # ★ 2026-09-05 실측: `GATE_REJECT=0` 은 **훅 쪽만** 껐다(agent_sdk:614).
-            #   툴 쪽 이 호출은 무조건 돌아서, 껐는데도 기각이 막혔다.
-            #   trust-arm 첫 회차에서 `gate_denials=0` 인데 `refused_reject=1` 로 잡혔다 —
-            #   오늘 만든 계측기가 첫 회차에서 스위치 누수를 찾아냈다.
+            # ★ Measured 2026-09-05: `GATE_REJECT=0` switched off **only the hook side** (agent_sdk:614).
+            #   This tool-side call ran unconditionally, so rejections were blocked even with it off.
+            #   The first trust-arm round showed `gate_denials=0` yet `refused_reject=1` — the
+            #   instrument built that day found a switch leak on its first round.
             if not getattr(_cfgmod(), "GATE_REJECT", True):
                 ok, gate_note, gate_rec = True, "", {"klass": (args.get("klass") or "")}
             else:
                 ok, gate_note, gate_rec = _reject_gate(tgt, args)
             if not ok:
                 _bump("refused_reject"); return "[REJECTION REFUSED] %s\n\n%s" % (tgt, gate_note)
-            # ★ 2026-09-05 재설계 — 게이트를 **계산기로 강등**한다.
-            #   옛 동작: 못 정하면 판정으로 안 세고 질문 큐로 보냈다. 그 결과가 짝 탐색 루프다
-            #   (열린질문 208건 중 72건이 게이트 판정, 짝 붙은 것 66건, 재시도 17건 중 8건이 탐색).
-            #   게이트가 반려한 것은 **결론이 아니라 인코딩**이었다 — 안전한 진짜 이유가
-            #   "분기 하나 + 싱크 하나" 형태가 아니면 만족하는 짝이 존재하지 않는다.
-            #   새 동작: 판정은 **그대로 등재**하고, 게이트가 계산한 것과 **못 한 것**을
-            #   판정에 실어 적대자에게 증거로 넘긴다. 판단은 심문자가 한다.
-            # ★ 예외 하나: **이미지를 못 열면** 아무것도 검증 못 한다. 그건 인코딩 문제가
-            #   아니라 사실 문제이고, 심문자도 바이너리를 못 보니 넘겨도 판단이 안 된다.
-            #   강등 대상은 "게이트 모델이 표현 못 하는 모양"이지 "측정 불가"가 아니다.
+            # ★ Redesigned 2026-09-05 — the gate is **demoted to a calculator.**
+            #   Old behaviour: anything it could not decide was not counted as a verdict and was sent to
+            #   the question queue. The result was a pair-hunting loop (of 208 open questions, 72 were gate
+            #   verdicts, 66 had a pair attached, and 8 of 17 retries were hunting).
+            #   What the gate denied was **the encoding, not the conclusion** — when the real reason a
+            #   thing is safe is not shaped as "one branch + one sink", no satisfying pair exists.
+            #   New behaviour: the verdict is **filed as-is**, and what the gate computed and **what it
+            #   could not** are carried on the verdict and handed to the adversary as evidence. The interrogator judges.
+            # ★ One exception: **if the image cannot be opened**, nothing can be verified. That is a
+            #   matter of fact, not of encoding, and the interrogator cannot see the binary either, so handing it over decides nothing.
+            #   What gets demoted is "a shape the gate model cannot express", not "unmeasurable".
             _ask_kind = ((gate_rec or {}).get("ask") or {}).get("cfg") if isinstance(gate_rec, dict) else None
             if (isinstance(gate_rec, dict) and gate_rec.get("ask")
                     and _ask_kind != "no_image"
@@ -4430,29 +4445,29 @@ def verdict(args):
                 gate_rec["computed_but_unexpressed"] = {
                     "cfg": _a.get("cfg"), "why": _a.get("why"),
                     "guard": gate_rec.get("guard"), "sink": gate_rec.get("sink")}
-                gate_rec.pop("ask", None)          # 질문으로 강등하지 않는다
+                gate_rec.pop("ask", None)          # not demoted to a question
             if isinstance(gate_rec, dict) and gate_rec.get("ask"):
                 a = gate_rec["ask"]
                 prev = _ask_open(tgt)
                 if prev is not None:
-                    # 같은 표적에 이미 열린 질문이 있다 — 새로 쌓지 말고 **시도**를 센다.
+                    # The same target already has an open question — count an **attempt** instead of stacking a new one.
                     prev.setdefault("attempts", []).append(
                         {"t": a.get("t"), "cfg": a.get("cfg"), "kind": a.get("kind"),
                          "guard": gate_rec.get("guard"), "sink": gate_rec.get("sink")})
-                    # ★ `inexpressible` 은 **하네스 부채**다(게이트가 이 모양을 표현 못 한다).
-                    #   뒤늦게 와도 앞선 `need_observation` 에 가려지면 안 된다 — 승격시킨다.
-                    #   반대 방향으로는 안 내린다: 한 번 표현 불가였던 것이 관측으로 바뀌지 않는다.
+                    # ★ `inexpressible` is **harness debt** (the gate cannot express this shape).
+                    #   Even arriving late it must not be masked by an earlier `need_observation` — it is promoted.
+                    #   It is never lowered the other way: something once inexpressible does not turn into an observation.
                     if a.get("kind") == "inexpressible":
                         prev["kind"] = "inexpressible"
                     elif not prev.get("kind"):
                         prev["kind"] = a.get("kind")
                     q = prev
                 else:
-                    # ★ 2026-09-08 — `kind`/`by` 를 **저장한다.** `ask()` 가
-                    #   `ask_kind()` 로 계산해 `rec["ask"]["kind"]` 에 넣는데 이 dict 이
-                    #   안 복사해서 버려지고 있었다: 원장 전수 231/231 · 125/125 가 `None`.
-                    #   그 결과 need_observation(더 재면 된다) 과 inexpressible(게이트가
-                    #   표현 못 한다)이 안 갈렸고, **단일 큐를 정렬할 축이 없었다.**
+                    # ★ 2026-09-08 — **Store `kind`/`by`.** `ask()` computes it with
+                    #   `ask_kind()` and puts it in `rec["ask"]["kind"]`, but this dict did not copy
+                    #   it and it was being thrown away: across the whole ledger 231/231 · 125/125 were `None`.
+                    #   As a result need_observation (measuring more will do) and inexpressible (the gate
+                    #   cannot express it) were not separated, and **the single queue had no axis to sort by.**
                     q = {"id": vid, "target": tgt, "claim": (args.get("claim") or "")[:300],
                          "klass": args.get("klass"), "guard": gate_rec.get("guard"),
                          "sink": gate_rec.get("sink"), "cfg": a.get("cfg"),
@@ -4462,7 +4477,7 @@ def verdict(args):
                     STATE.setdefault("asks", []).append(q)
                 _k = _surface_key(tgt) if "_surface_key" in globals() else tgt
                 if tgt in STATE.get("surface", {}):
-                    STATE["surface"][tgt]["status"] = "미분석"
+                    STATE["surface"][tgt]["status"] = "unanalysed"
                     STATE["surface"][tgt]["blocked"] = True
                     STATE["surface"][tgt]["why"] = "ASK: " + (a.get("why") or "")[:220]
                 save()
@@ -4473,8 +4488,8 @@ def verdict(args):
                 except Exception:
                     _ah = ""
                 _bump("held_ask")
-                # ★ 이 ASK 가 2026-09-05 에 심문자·승격자를 동시에 음소거한 경로다(→ R-05 ②d).
-                #   게이트가 강등된 지금도 **무엇을 못 정했는지**는 남겨야 규칙별 실적이 나온다.
+                # ★ This ASK is the path that muted the interrogator and the promoter at once on 2026-09-05 (→ R-05 ②d).
+                #   Even now that the gate is demoted, **what it could not decide** must be kept, or there are no per-rule results.
                 record_denial(tgt, "[REJECTION HELD] cfg=%s %s"
                               % (a.get("cfg") or "undecidable", str(a.get("why") or "")[:120]),
                               act=act, klass=args.get("klass") or "",
@@ -4488,11 +4503,11 @@ def verdict(args):
                         % (tgt, a.get("cfg") or "undecidable", a.get("why"),
                            render_ask(tgt, a),
                            ("\n" + _ah) if _ah else ""))
-        # ★ 인용 상수 실재 대조 (`claimaudit.constants_cited`).
-        #   2026-08-30 실측: 하니스가 by-design 논거의 초석으로 `0xFFFF00FF` 를 들었는데
-        #   그 즉치는 **이 바이너리에 0건**이었다(실제 마스크는 0xFFFF109F / 0xFFFF013F).
-        #   그 상수가 틀리자 결론이 뒤집혔다. 도구는 이미 있었고 **연결만 안 돼 있었다**
-        #   (`measure.py` 와 같은 상태). 차단은 하지 않는다 — 계산된 값일 수 있다 — 꼬리로 알린다.
+        # ★ Checking that cited constants actually exist (`claimaudit.constants_cited`).
+        #   Measured 2026-08-30: the harness cited `0xFFFF00FF` as the cornerstone of a by-design argument,
+        #   and that immediate occurs **zero times in this binary** (the real masks are 0xFFFF109F / 0xFFFF013F).
+        #   When the constant turned out wrong, the conclusion flipped. The tool already existed and **was simply
+        #   not connected** (the same state as `measure.py`). It does not block — the value may be computed — it warns in the tail.
         _const_note = ""
         try:
             import claimaudit as _CA
@@ -4500,7 +4515,12 @@ def verdict(args):
             if _t and os.path.exists(_t):
                 _cc = _CA.constants_cited(args.get("claim", "") + " " + args.get("evidence", ""),
                                           pe_path=_t)
-                _ghosts = [c for c in (_cc or []) if not c[1] and not c[2]]
+                # `nc == -1` means "corpus not checked", not "zero hits" — the old
+                # filter was `not c[1] and not c[2]`, and since no corpus is passed
+                # here nc is always -1, so **this warning could never fire.**
+                # Treat "not checked" as no vote and let the binary byte count
+                # decide. (Same defect upstream; confirmed by porting claimaudit.)
+                _ghosts = [c for c in (_cc or []) if c[1] <= 0 and not c[2]]
                 if _ghosts:
                     _const_note = ("\nWARNING: the constant %s cited by the claim occurs "
                                    "ZERO times in this binary. If it is a computed value, say "
@@ -4509,12 +4529,12 @@ def verdict(args):
                                    ", ".join("0x%X" % c[0] for c in _ghosts[:4]))
         except Exception:
             pass
-        # ★ 주장↔앵커 연결 (`refs/00-gate-gaming.md`). 외연적 검증만으로는 근거를 게이트 모양에
-        #   맞춰 다시 만드는 것을 못 막는다. 확정에만 건다 — 기각은 klass 별 의무가 따로 있다.
+        # ★ Claim ↔ anchor link (`refs/00-gate-gaming.md`). Extensional verification alone cannot stop the
+        #   grounds being rebuilt to fit the gate's shape. Applied to confirmations only — rejections have per-klass duties of their own.
         _link_note = ""
         _scope_warn = ""
         if act == "confirm" and impact and impact.get("out_of_scope"):
-            _scope_warn = ("\nRECORDED AS `경계보류` (BOUNDARY-HELD), NOT AS A CONFIRMATION "
+            _scope_warn = ("\nRECORDED AS `boundary-held`, NOT AS A CONFIRMATION "
                            "— out-of-scope boundary (%s): %s\n"
                            "THIS IS NOT A REJECTION. The code defect stands and its basis is "
                            "kept. It cannot be promoted because the grade is zero across THIS "
@@ -4535,11 +4555,11 @@ def verdict(args):
                 rec_link = _ul
 
         staged_a, staged_r = _take(tgt, args.get("claim", ""))
-        # ★ 2026-09-07 — basis 를 정본 어휘로 접고, 등록되지 않은 선두 토큰은 **반려한다.**
-        #   산문은 버리지 않고 `basis_note` 로 옮긴다(논증은 claim/reason 이 나른다).
+        # ★ 2026-09-07 — basis is folded into the canonical vocabulary, and an unregistered leading token is **denied.**
+        #   The prose is not thrown away; it moves to `basis_note` (the argument is carried by claim/reason).
         _bcanon, _braw = normalize_basis(args.get("basis"))
-        # ★ **비워둔 것은 잘못 쓴 것이 아니다.** 옛 기본값을 지킨다 —
-        #   안 그러면 `GATE_REJECT=0` 같은 스위치의 약속까지 깨진다(회귀로 잡혔다).
+        # ★ **Leaving it blank is not writing it wrong.** The old default is kept —
+        #   otherwise even the promise of a switch like `GATE_REJECT=0` breaks (caught as a regression).
         if not _braw:
             _bcanon = "decompile"
         if _bcanon is None:
@@ -4564,30 +4584,30 @@ def verdict(args):
                "measured_by": (_pending_meas[0] or {}).get("by"),
                "measured_n": (_pending_meas[0] or {}).get("n"),
                "measured_principal": (_pending_meas[0] or {}).get("principal"),
-               "status": ("경계보류" if (act == "confirm" and (impact or {}).get("out_of_scope"))
-                          else "확정" if act == "confirm" else "기각"),
+               "status": ("boundary-held" if (act == "confirm" and (impact or {}).get("out_of_scope"))
+                          else "confirmed" if act == "confirm" else "rejected"),
                "gate": gate_rec, "impact": impact,
-               # ★ 선언한 전제를 판정에 박는다. 게이트는 **등재 시점**만 보고,
-               #   전제는 나중에 죽는다 — `dependency_audit()` 이 그때 이 필드로 되돌아본다.
+               # ★ The declared premise is stamped onto the verdict. The gate looks only at **filing time**,
+               #   and premises die later — `dependency_audit()` comes back through this field then.
                "depends_on": (str(args.get("depends_on") or "").strip() or None),
                "unlinked_addrs": ["0x%X" % u for u in (locals().get("rec_link") or [])],
                "t": time.strftime("%m-%d %H:%M")}
-        # ★ 사전 게이트가 남겨둔 심문 결과를 **이 판정에 박는다**. 안 박으면
-        #   `verified_negatives()` 와 `rejects_interrogated` 가 심문을 못 본다.
+        # ★ **Stamp onto this verdict** the interrogation result the pre-gate left behind. Without it,
+        #   `verified_negatives()` and `rejects_interrogated` cannot see the interrogation.
         _pe = (STATE.get("pending_escalation") or {}).pop(tgt, None)
         if _pe is not None:
             rec["escalation"] = _pe
-        # ★ 2026-09-04 — 판결자가 낸 확정은 **다른 종류의 확정**이다.
-        #   반박자를 통과한 것이 아니라 종결자가 이력을 보고 낸 것이다. 표시가 없으면
-        #   내일 채점에서 액면가로 세어지고, 하루짜리 권한 실험이 조용히 정책이 된다.
+        # ★ 2026-09-04 — a confirmation issued by the adjudicator is **a different kind of confirmation.**
+        #   It did not pass the refuter; the closer issued it after reading the history. Without a mark it
+        #   is counted at face value in tomorrow's grading, and a one-day permission experiment quietly becomes policy.
         _adj = (STATE.get("pending_adjudication") or {}).pop(tgt, None) \
             or args.get("_adjudicated")
         if isinstance(_adj, dict):
             rec["decided_by"] = "adjudicator"
             rec["adjudication"] = _adj
         _interrog_note = ""
-        # ★ 2026-09-06: id 로 먼저 찾는다. target 폴백은 **그 결과가 이 행 것이라고
-        #   주장하지 않을 때만** 쓴다(`for_id` 가 다른 행을 가리키면 남의 심문이다).
+        # ★ 2026-09-06: look up by id first. The target fallback is used **only when the result does not
+        #   claim to belong to another row** (if `for_id` points at a different row, it is someone else's interrogation).
         _pq = STATE.get("pending_interrog") or {}
         _pi = _pq.pop(vid, None) if vid else None
         if _pi is None:
@@ -4599,9 +4619,9 @@ def verdict(args):
             if _pi.get("ok"):
                 rec["interrogation"] = {"klass": _pi.get("klass"),
                                         "reason": _pi.get("reason"),
-                                        # ★ 산출물 판정의 기준. 없으면 깨진 기각이 산출물로 샌다.
+                                        # ★ The criterion for judging the output. Without it a broken rejection leaks out as output.
                                         "broke": bool(_pi.get("broke"))}
-            # ★ 비차단이라도 **사유는 분석가에게 간다.** 안 그러면 루프 대신 침묵이 된다.
+            # ★ Even though it does not block, **the reason reaches the analyst.** Otherwise it becomes silence instead of a loop.
             if _pi.get("broke") and _pi.get("note"):
                 _interrog_note = "\n\n" + str(_pi.get("note"))
         STATE["verdicts"].append(rec)
@@ -4626,18 +4646,18 @@ def verdict(args):
             _settle(vid, tgt, rec["status"], rec["claim"][:80])
         _closed = _ask_close(tgt, vid, "answered", rec["claim"][:200])
         if act == "reject":
-            # ★ 2026-09-04 실측: 묘지 394건 중 반박자 킬은 **24건(6%)** 뿐이고
-            #   370건이 이 경로 — **분석가 자신의 기각**이다. 그런데 프라이밍 문구는
-            #   양쪽에 똑같이 "CLAIMS ALREADY KILLED (do not resurrect)" 를 쓴다.
-            #   자기 판정이 적대자 판정과 같은 무게로 다음 회차의 자신을 막는다.
-            #   (심문자 파기율 67% 를 생각하면 그 370건 중 상당수는 안 섰을 기각이다.)
-            #   ⇒ 출처를 박는다. 그리고 `t` — close_candidate 에만 넣어서 394/394 가
-            #     날짜 없음이었다. 6% 경로만 고친 셈이었다.
-            # ★ 2026-09-06 — **묘지 행에 심문 상태를 같이 박는다.**
-            #   전에는 `broke` 가 verdicts 레코드에만 있었다. 그래서 묘지를 읽는 소비자
-            #   (이어받기·`_resolve_row` 폴백·프라이밍)에게는 **깨진 기각도 깨끗한 음성**으로
-            #   보였다. 실측: 묘지 167행 중 심문 통과는 54행(32%)뿐인데 표식이 없어
-            #   나머지 113행이 같은 무게로 다음 회차를 막고 있었다.
+            # ★ Measured 2026-09-04: of 394 graveyard rows only **24 (6%)** were refuter kills, and
+            #   370 came through this path — **the analyst's own rejections.** Yet the priming text
+            #   says "CLAIMS ALREADY KILLED (do not resurrect)" identically for both.
+            #   One's own verdict blocks one's self in the next round with the same weight as an adversary's.
+            #   (Given the interrogator's 67% break rate, many of those 370 are rejections that would not have stood.)
+            #   => stamp the origin. And `t` — it was only put in close_candidate, so 394/394 had
+            #     no date. Only the 6% path had effectively been fixed.
+            # ★ 2026-09-06 — **Stamp the interrogation state onto the graveyard row as well.**
+            #   `broke` used to live only on the verdicts record. So to the consumers that read the graveyard
+            #   (carry-over, the `_resolve_row` fallback, priming) **a broken rejection also looked like a clean negative.**
+            #   Measured: of 167 graveyard rows only 54 (32%) passed interrogation, but with no mark the
+            #   other 113 were blocking the next round with the same weight.
             _ig = rec.get("interrogation") if isinstance(rec.get("interrogation"), dict) else {}
             STATE["graveyard"].append({"id": vid, "target": tgt,
                                        "claim": rec["claim"][:120],
@@ -4649,11 +4669,11 @@ def verdict(args):
                                        "t": time.strftime("%m-%d %H:%M")})
         save()
         tail = ""
-        # ★ 2026-09-07 — **실측 축이 판정 사다리에 안 붙어 있었다.**
-        #   실측: ahcache 는 kd·ioctl·vmprobe 로 **97번** 쟀는데 그것을 근거로 올라간 판정은
-        #   2건이고, 확정 7건 중 실측 기반은 **0건**이다(전부 disassemble). 재는 것과
-        #   판정하는 것이 나란히 쌓이기만 하고 승격 경로가 없었다.
-        #   ⇒ 막지 않는다(판단은 쓰는 쪽이 한다). 다만 **같은 표적의 실측을 세어 보여준다.**
+        # ★ 2026-09-07 — **The measurement axis was not attached to the verdict ladder.**
+        #   Measured: ahcache was measured **97 times** with kd, ioctl and vmprobe, yet only 2 verdicts
+        #   rose on that basis, and of 7 confirmations **zero** were measurement-based (all disassemble).
+        #   Measuring and adjudicating just piled up side by side, with no promotion path.
+        #   => it does not block (the writer judges). But it **counts and shows the measurements on the same target.**
         try:
             _va = set(re.findall(r'0x[0-9a-fA-F]{6,16}', str(tgt).lower()))
             _mine_m = []
@@ -4661,7 +4681,7 @@ def verdict(args):
                 _mt = str(m.get("target") or "").lower()
                 if not _mt:
                     continue
-                # 주소가 겹치거나(정확), 이름이 서로를 포함하면 같은 표적으로 본다.
+                # Address overlap (exact), or names containing each other, counts as the same target.
                 if (_va & set(re.findall(r'0x[0-9a-fA-F]{6,16}', _mt))) or \
                         (len(_mt) > 8 and (_mt[:40] in str(tgt).lower()
                                            or str(tgt).lower()[:40] in _mt)):
@@ -4669,22 +4689,22 @@ def verdict(args):
         except Exception:
             _mine_m = []
         if _mine_m and rec["basis"] != "measured":
-            tail += ("\n\n★ 이 표적에는 실측이 %d건 있는데 이 판정의 basis 는 `%s` 다.\n"
-                     "   실측을 근거로 쓸 것이면 `basis='measured …'` 로 올려라 — 그러면 "
-                     "양성 대조 검사(GATE_CONTROL_BEFORE_REJECT)를 받는다.\n"
-                     "   정적으로만 판정하는 것이 맞다면 그대로 두어라. 다만 이 원장에서 "
-                     "실측 97건 대 measured 판정 2건이라는 간극이 이렇게 벌어졌다.\n"
-                     "   최근 실측: %s"
+            tail += ("\n\n★ This target has %d measurements, but this verdict's basis is `%s`.\n"
+                     "   If you are using a measurement as grounds, raise it to `basis='measured …'` — it then "
+                     "goes through the positive-control check (GATE_CONTROL_BEFORE_REJECT).\n"
+                     "   If adjudicating statically is right, leave it. But this is how the gap in this ledger "
+                     "of 97 measurements against 2 measured verdicts opened up.\n"
+                     "   recent measurements: %s"
                      % (len(_mine_m), rec["basis"],
                         " · ".join("%s(%s)" % (str(m.get("target"))[:38], m.get("grade"))
                                    for m in _mine_m[-2:])))
-        # ★ 죽은 전제 위에 선 확정은 **막지 않고 묻는다**. 기각은 주장을 반박하는 게 아니라
-        #   좁히는 경우가 흔하다(형제 호출자 배제, 더 넓은 변종 사망). 판단은 쓰는 쪽이 한다.
+        # ★ A confirmation standing on a dead premise is **asked about, not blocked.** A rejection often narrows a
+        #   claim rather than rebutting it (excluding a sibling caller, a broader variant dying). The writer judges.
         if act == "confirm" and locals().get("_rask"):
             tail += "\n\n★ " + _rask
             rec_dead = True
-        # ★ 앵커 역색인. 방금 낸 판정의 앵커가 원장 어디에 이미 있는지 **자동으로** 보여준다.
-        #   에이전트가 물어봐야만 보이면 안 본다 — 다섯 회차가 그렇게 갔다.
+        # ★ Anchor reverse index. Shows **automatically** where the anchors of the verdict just filed already appear in the ledger.
+        #   If the agent has to ask before it sees them, it does not look — five rounds went that way.
         try:
             _ah = anchor_hits(" ".join(str(args.get(k) or "")
                                        for k in ("claim", "evidence", "reason")), exclude_id=vid)
@@ -4692,18 +4712,18 @@ def verdict(args):
             _ah = ""
         if _ah:
             tail += "\n" + _ah
-            # ★ 툴 **결과**는 transcript 에 안 남는다([tool ] 은 호출만 기록). 이 장치가
-            #   실제로 발화했는지 사후에 확인할 방법이 없어서 한 줄 남긴다. 침묵은 증거가 아니다.
+            # ★ Tool **results** do not stay in the transcript ([tool ] records only the call). There was no way
+            #   to confirm afterwards whether this device actually fired, so it leaves one line. Silence is not evidence.
             try:
                 import runlog as _rl
-                _rl.transcript("[anchoridx] %s — 선행 %d행 제시"
+                _rl.transcript("[anchoridx] %s — showed %d earlier rows"
                                % (str(tgt)[:60], _ah.count("\n   [")))
             except Exception:
                 pass
         if BASIS_RANK.get(rec["basis"], 0) < 3:
             tail = ("\nWARNING: weak basis (decompile/doc). This confirmation may only be used as INFERRED.")
         if act == "reject" and BASIS_RANK.get(rec["basis"], 0) < 4:
-            # 리콜 최대화 목적함수에서 **거짓 기각 = 버그 상실**이다. 확정보다 여기가 더 비싸다.
+            # Under a recall-maximising objective **a false rejection = a lost bug.** That costs more here than a confirmation does.
             tail += ("\nWARNING: this is a STATIC rejection (basis=%s). Do not put this row in "
                      "the same column as 'measured clean' - that makes coverage a lie. Three "
                      "steps to promote it: (1) did the handler actually execute "
@@ -4713,13 +4733,13 @@ def verdict(args):
                      "kernel_ptrs in `measure.py` enforces all three."% rec["basis"])
         tail += _const_note
         if rec["anchors"]:
-            tail += f"\n앵커 {len(rec['anchors'])}건이 이 빌드에서 기계 검증되어 함께 저장됐다."
+            tail += f"\n{len(rec['anchors'])} anchors were machine-verified against this build and stored with it."
         if gate_note:
             tail += "\n" + gate_note
-        # ★ 싱크 하류 게이트 — 확정 게이트(G0~G5)가 전부 앵커·반박 축이라 이 축은 아무도 안 봤다.
-        #   실측 실패 2건이 **둘 다** 여기서 났다(globmerger 언더플로: 할당 호출이 그 뒤에 있었다 /
-        #   cng QUERY_VOLUME: ntoskrnl 이 클래스별 최소 길이를 강제했다).
-        #   차단하지 않는다 — 리콜 최대화 목적함수에서 확정을 더 막을 이유가 없다. **보여만 준다.**
+        # ★ The sink-downstream gate — the confirm gates (G0–G5) are all on the anchor/refutation axes, so nobody looked at this one.
+        #   **Both** of the 2 measured failures happened here (globmerger underflow: the allocation call came after it /
+        #   cng QUERY_VOLUME: ntoskrnl enforced a per-class minimum length).
+        #   It does not block — under a recall-maximising objective there is no reason to block confirmations further. **It only shows.**
         if act == "confirm":
             try:
                 import cfg as _cfg
@@ -4736,46 +4756,46 @@ def verdict(args):
                 f"{_interrog_note}")
 
     if act == "blocked":
-        # 스모크에서 모델이 reason 없이 세 번 재시도했다. claim 을 폴백으로 받는다.
+        # In a smoke test the model retried three times without a reason. claim is accepted as a fallback.
         why = args.get("reason") or args.get("claim") or ""
         if not why:
             return ("`blocked` REQUIRES why you could not adjudicate (reason=). Write in one line "
                     "WHAT YOU WOULD HAVE TO LOOK AT to move this to confirm or reject - that line "
                     "becomes the next session's work list.")
-        # ★ 2026-09-04: 예전엔 `id` 와 `tgt` 를 **둘 다 무조건** 표면 행으로 만들었다.
-        #   그래서 `blocked(id='V-I5-REAL', target='I-5 QuicConnRecvRetry@0x…')` 이
-        #   `V-I5-REAL` 이라는 **가짜 행**을 새로 만들었다. msquic r1 에서 V-I3 / V-I5-REAL /
-        #   V-I5-TOKEN / V-UNOPENED 네 개가 그렇게 생겨 분모를 부풀렸고, 다음 회차는
-        #   닫아야 할 행이 늘어난 표를 물려받는다 — **판정이 다음 회차로 안 이어지는 실체.**
-        #   바로 밑 `scope` 핸들러는 같은 자리에서 이미 올바르게 하고 있었다(`and k in STATE`).
+        # ★ 2026-09-04: `id` and `tgt` used to **both, unconditionally,** become surface rows.
+        #   So `blocked(id='V-I5-REAL', target='I-5 QuicConnRecvRetry@0x…')` created a new
+        #   **fake row** called `V-I5-REAL`. In msquic r1, V-I3 / V-I5-REAL / V-I5-TOKEN /
+        #   V-UNOPENED were born that way and inflated the denominator, and the next round
+        #   inherited a table with more rows to close — **the substance of verdicts not carrying into the next round.**
+        #   The `scope` handler just below was already doing it right at the same spot (`and k in STATE`).
         _bk = [k for k in (args.get("id"), tgt) if k and k in STATE["surface"]] \
             or [k for k in (tgt,) if k]
-        # ★ 2026-09-05 (C-037): 다음 한 걸음을 **칸으로** 받는다. 산문에서 못 뽑기 때문이다.
-        #   측정: blocked 498행에 (동사|물음표)+앵커 를 걸면 278행(56%)이 걸리고,
-        #   앵커 접지(판정이 안 덮은 VA 보유)로 걸면 245행인데 **C-034 가 지목한 4행 중 3행이 탈락**한다.
-        #   ⇒ 산문 분류는 불가능하다는 것이 실측 결과다. 쓰는 쪽에서 칸에 넣게 한다.
-        # ★ `next_step` 은 스키마에 없다 — 일부러 그렇다. 모델에게는 `next` 하나만
-        #   보여 이름을 하나로 유지하되, 모델이 동의어를 뱉는 슬립은 받아준다.
-        #   `agent_sdk._mk` 는 인자를 **필터링하지 않으므로** 미선언 키도 여기 도달한다.
-        #   이 관용은 test_argschema 의 TOLERATED_ALIASES 에 사유와 함께 등재돼 있다.
+        # ★ 2026-09-05 (C-037): take the next step **as a field**, because it cannot be extracted from prose.
+        #   Measured: applying (verb|question mark)+anchor to the 498 blocked rows catches 278 (56%),
+        #   and anchor grounding (holding a VA no verdict covers) catches 245, but **3 of the 4 rows C-034 pointed at drop out.**
+        #   => the measured result is that classifying prose is impossible. The writer is made to put it in a field.
+        # ★ `next_step` is not in the schema — on purpose. The model is shown only `next`,
+        #   keeping a single name, but a slip where the model emits a synonym is accepted.
+        #   `agent_sdk._mk` **does not filter** arguments, so undeclared keys reach this point too.
+        #   This tolerance is listed with its reason in test_argschema's TOLERATED_ALIASES.
         _nx = str(args.get("next") or args.get("next_step") or "").strip()
         _ok, _miss = _next_step_ok(_nx)
         for _k in _bk:
-            surface_set(_k, "미분석", "BLOCKED: " + why)
+            surface_set(_k, "unanalysed", "BLOCKED: " + why)
             if _k in STATE["surface"]:
                 STATE["surface"][_k]["blocked"] = True
                 if _ok:
                     STATE["surface"][_k]["next"] = {"step": _nx[:400],
                                                     "t": time.strftime("%m-%d %H:%M")}
         save()
-        _tail = ("\n★ RETURNABLE: 다음 한 걸음이 칸에 들어갔다 — 이 행은 worklist 상단과 "
-                 "`verdict(action='unfinished')` 목록에 뜬다.\n   next: " + _nx[:200]) if _ok else (
-                "\n★ 이 행에는 **다음 걸음 칸이 비어 있다**(next=). 사유 산문은 다음 회차가 "
-                "기계로 못 고른다 — 측정된 사실이다(498행 표본에서 '사유에 다음 수가 있는가'를 "
-                "묻는 술어는 전부 56%%를 걸거나, 되찾아야 할 행을 떨어뜨렸다). "
-                "칸을 채우면 저수지가 아니라 **작업 목록**이 된다:\n"
-                "   verdict(action='blocked', target=..., reason=..., next='<한 걸음>')\n"
-                "   요건: %s. 예) 'disassemble 0x14004efc0 and check whether "
+        _tail = ("\n★ RETURNABLE: the next step is in its field — this row shows up at the top of the worklist and "
+                 "in the `verdict(action='unfinished')` list.\n   next: " + _nx[:200]) if _ok else (
+                "\n★ This row's **next-step field is empty** (next=). The next round cannot pick reason prose "
+                "by machine — that is a measured fact (on a 498-row sample, every predicate asking 'does the "
+                "reason contain a next step' either caught 56%% or dropped the rows that needed recovering). "
+                "Fill the field and it becomes a **work list** instead of a reservoir:\n"
+                "   verdict(action='blocked', target=..., reason=..., next='<one step>')\n"
+                "   requirements: %s. e.g. 'disassemble 0x14004efc0 and check whether "
                 "SdbpInitializeSearchDBContext admits a caller-chosen absolute directory into "
                 "v15[12*i+2]'" % (_miss or "-"))
         return (str(tgt) + " -> UNAUDITED (BLOCKED). It is NOT removed from the table. "
@@ -4784,23 +4804,23 @@ def verdict(args):
                 "UNAUDITED WORK, not an achievement." + _tail)
 
     if act == "scope":
-        #   기각은 후보 하나를 죽일 뿐이고, 표면은 후보가 전부 죽었을 때만 닫힌다.
+        #   A rejection kills only one candidate; the surface closes only when every candidate is dead.
         items = args.get("items") or []
         method = (args.get("method") or "").strip()
         if isinstance(items, str):
             items = [x.strip() for x in items.split(",") if x.strip()]
         if not items:
-            record_denial(tgt, "[SCOPE REFUSED] items= 누락 — 후보 집합이 없다",
+            record_denial(tgt, "[SCOPE REFUSED] items= missing — no candidate set",
                           act="scope", rule="scope: items= missing")
             return ("`scope` REQUIRES the CANDIDATE SET for this surface (items=['0x14000e4b3 "
                     "ProbeForWrite call site', ...]). If the denominator is sinks, list the "
                     "sinks; if it is the authorization axis, list the gates; if it is races, list "
                     "the shared-object access points.")
-        # ★ 하한 30자. 2026-09-03 번역 때 `len(method) < 30` 이 `not method` 로 줄어
-        #   `method="봤음"` 이 분모로 통과했다. R-A 상 기각은 scope 위에 서므로
-        #   이 한 줄이 풀리면 그 위의 모든 기각이 같이 약해진다.
+        # ★ A 30-char minimum. In the 2026-09-03 translation `len(method) < 30` shrank to `not method`,
+        #   and `method="looked"` passed as a denominator. Under R-A rejections stand on scope, so
+        #   loosening this one line weakens every rejection built on top of it.
         if len(method) < 30:
-            record_denial(tgt, "[SCOPE REFUSED] method= %d자 (30자 하한)" % len(method),
+            record_denial(tgt, "[SCOPE REFUSED] method= %d chars (30-char minimum)" % len(method),
                           act="scope", rule="scope: method< 30 chars")
             return ("`scope` REQUIRES HOW you enumerated (method=, AT LEAST 30 CHARS). "
                     "Name-based xref misses wrappers - say what you swept, behaviourally. "
@@ -4815,7 +4835,7 @@ def verdict(args):
         keys = [k for k in (args.get("id"), tgt) if k and k in STATE["surface"]] or [tgt]
         for k in keys:
             row = STATE["surface"].setdefault(
-                k, {"status": "미분석", "kind": "ad-hoc", "reach": "unknown", "why": ""})
+                k, {"status": "unanalysed", "kind": "ad-hoc", "reach": "unknown", "why": ""})
             prev = (row.get("cand") or {}).get("items") or []
             done = {i["label"]: i.get("done") for i in prev}
             for i in norm:
@@ -4829,54 +4849,54 @@ def verdict(args):
                 "rejection.\n%s"
                 % (tgt, len(norm), "\n".join("  - " + i["label"] for i in norm[:12])))
     if act == "track":
-        # ★ `tgt` 의 기본값이 "?" 라 그대로 쓰면 **이름 없는 트랙이 생긴다.**
-        #   조용히 만들어지는 트랙은 단계표를 오염시킨다 — 거부한다.
+        # ★ `tgt` defaults to "?", so using it as-is **creates an unnamed track.**
+        #   A track created silently pollutes the stage table — refused.
         nm = (args.get("name") or "").strip() or (tgt if tgt not in ("?", "", None) else "")
         nm = (nm or "").strip()
         if not nm or nm == "?":
             return ("`track` REQUIRES name= (the investigation track's name). An unnamed track "
                     "pollutes the stage table.")
-        # ★ 2026-09-05 실측 버그: `of` 가 **두 가지를 겸하고 있었다.**
-        #   `ledger.track()` 의 `of` 는 **단계 이름 배열**(정적확정/트리거/실측/…)인데
-        #   여기서 `evidence_ids` 를 그 자리에 넣었다. 에이전트가 `of='0'` 같은 값을 주면
-        #   **단계표가 ["0"] 으로 통째로 덮여** 5단 사다리가 1/1 완료로 표시된다.
-        #   실측: 트랙 6개가 그 상태였고(quirks-rw · versionblock-parse ·
+        # ★ A bug measured 2026-09-05: `of` **was doing two jobs.**
+        #   In `ledger.track()`, `of` is **the array of stage names** (static-confirm/trigger/measure/…),
+        #   but here `evidence_ids` was being put in that slot. When the agent passed a value like `of='0'`,
+        #   **the stage table was overwritten wholesale with ["0"]** and the 5-rung ladder showed as 1/1 complete.
+        #   Measured: 6 tracks were in that state (quirks-rw · versionblock-parse ·
         #   telemetry-doublefree-gate · uaf-avlnode · lockfree-cacheref · AhcpCacheBuild…),
-        #   `stage_sum` 지표도 그만큼 거짓이었다.
-        #   ⇒ 단계표는 `stages=` 로만 바꾼다. `of`/`evidence_ids` 는 **증거로만** 쓴다.
+        #   and the `stage_sum` metric was false by the same amount.
+        #   => the stage table changes only through `stages=`. `of`/`evidence_ids` are used **only as evidence.**
         _stages = args.get("stages")
         if isinstance(_stages, str):
             _stages = [x.strip() for x in _stages.split(",") if x.strip()]
-        # ★ 2026-09-05 — **`stages=` 에 문장을 넣어 단계표가 깨진 트랙이 31개 중 4개.**
-        #   실측 예: stages=['static-confirm -> trigger(CQ57 answered', 'key is name-only',
+        # ★ 2026-09-05 — **4 of 31 tracks had their stage table broken by a sentence in `stages=`.**
+        #   A measured example: stages=['static-confirm -> trigger(CQ57 answered', 'key is name-only',
         #                    'hit does not re-match) -> measure -> impact -']
-        #   에이전트가 진행 상황을 산문으로 적었고(`a -> b -> c` 에 콤마가 섞임) 그게 콤마로
-        #   쪼개져 **사다리 자체가 됐다.** 그러면 `stage N/M` 이 의미를 잃고,
-        #   "다음 칸은 무엇인가"가 문장 조각으로 나온다(계기판에서 그렇게 나왔다).
-        #   ⇒ **사다리는 라벨이지 서술이 아니다.** 형식으로 거른다: 칸이 너무 길거나
-        #     화살표/괄호가 섞이면 산문이므로 받지 않는다(기존 표를 지키는 쪽이 안전하다).
+        #   The agent wrote its progress as prose (commas mixed into `a -> b -> c`), and that was split
+        #   on the commas and **became the ladder itself.** Then `stage N/M` loses its meaning, and
+        #   "what is the next rung" comes out as a sentence fragment (that is how it showed on the dashboard).
+        #   => **a ladder is labels, not narration.** Filter by form: a rung that is too long or that
+        #     mixes in arrows/parentheses is prose and is not accepted (keeping the existing table is the safe side).
         if _stages:
             _bad = [x for x in _stages
                     if len(str(x)) > 24 or "->" in str(x) or "(" in str(x)]
             if _bad:
-                _stages = None      # 기존 단계표를 보존한다
+                _stages = None      # keep the existing stage table
         of = _stages if (_stages and len(_stages) >= 2) else None
         _more = args.get("evidence_ids") or args.get("of")
         if isinstance(_more, str):
             _more = [x.strip() for x in _more.split(",") if x.strip()]
         _ev = args.get("evidence_ids") or ([args["id"]] if args.get("id") else None)
         _ev = list(_ev or []) + list(_more or [])
-        # ★ 2026-09-06 실측(야간런 케이스 5): **읽기 모양의 호출 하나가 트랙을 4→0 으로 지웠다.**
-        #   모델이 스키마의 모든 칸을 빈값으로 채워 보내면 int 칸은 **0** 이 된다 —
-        #   `stage: int` 는 "바꾸지 마라"를 나를 수 없다(memory `predicate-cannot-ask`
-        #   와 같은 병: 매체가 unknown 을 못 나른다). 그러고서 도구는 "stage 0/5" 를
-        #   돌려주고, 에이전트는 그걸 **원장의 상태로** 읽는다 — 실측된 문장:
-        #   *"The state demoted per-class-authz to 0/5"* (자기가 지운 것을 상태로 오독).
-        #   직전 회차까지 4단까지 쌓은 기록이 눈앞에서 사라졌고, 그 회차는 사라진 것을
-        #   전제로 목표를 잡았다. ⇒ **강등은 이유를 달아야** 통과시킨다.
-        #   지휘자의 강등은 항상 why 를 달고 있고(conductor.apply), 이 도구의 안내문
-        #   ("반박당하면 내리는 게 정직하다")도 이유의 존재를 이미 전제한다.
-        #   올리는 쪽·유지는 영향 없다 — 읽기 모양의 호출은 이제 그대로 읽기다.
+        # ★ Measured 2026-09-06 (overnight run, case 5): **a single read-shaped call wiped a track from 4 to 0.**
+        #   When the model sends every schema field filled with blanks, an int field becomes **0** —
+        #   `stage: int` cannot carry "do not change it" (the same disease as memory `predicate-cannot-ask`:
+        #   the medium cannot carry unknown). The tool then returns "stage 0/5", and the agent reads that
+        #   **as the ledger's state** — the measured sentence:
+        #   *"The state demoted per-class-authz to 0/5"* (misreading what it had erased itself as state).
+        #   A record built up to rung 4 by the previous round vanished in front of it, and that round set its
+        #   goal on the premise of the loss. => **a demotion passes only with a reason attached.**
+        #   The conductor's demotions always carry a why (conductor.apply), and this tool's own guidance
+        #   ("lowering one after a refutation is the honest thing to do") already presumes a reason exists.
+        #   Raising or keeping is unaffected — a read-shaped call is now simply a read.
         _note = args.get("note") or args.get("why") or ""
         _st = args.get("stage")
         _cur = int(((STATE.get("tracks") or {}).get(nm) or {}).get("stage", 0))
@@ -4896,10 +4916,10 @@ def verdict(args):
                 "refutation is the honest thing to do.\nThis table rides in the next session's "
                 "carry-over. FOR SIX SESSIONS TO CLIMB SIX RUNGS, YOU HAVE TO MOVE IT."
                 % (nm, t["stage"], len(t["stages"]),
-                   t["stages"][t["stage"]] if t["stage"] < len(t["stages"]) else "완료",
+                   t["stages"][t["stage"]] if t["stage"] < len(t["stages"]) else "complete",
                    track_render()) + _kept)
     if act == "anchors":
-        # 수동 조회. 자동 부착이 있어도, 판정을 **내기 전에** 물어볼 수 있어야 한다.
+        # A manual lookup. Even with automatic attachment, it must be possible to ask **before** filing a verdict.
         _q = " ".join(str(args.get(k) or "") for k in ("evidence", "claim", "target", "text"))
         r = anchor_hits(_q)
         if not r:
@@ -4912,13 +4932,13 @@ def verdict(args):
         return reopen(args.get("id") or args.get("gid"), args.get("ground"),
                       args.get("why") or args.get("reason"), args.get("evidence") or "")
     if act == "gate_blocked":
-        # ★ 게이트가 **구조적으로** 판정을 막을 때의 신고 채널.
-        #   2026-09-02: 함수포인터 카운터가 부재형 기각을 전면 차단하자 에이전트가
-        #   두 회차를 다른 축으로 돌았다. 우회밖에 길이 없으면 우회한다 — 신고할 데를 만든다.
+        # ★ The reporting channel for when a gate **structurally** blocks a verdict.
+        #   2026-09-02: when the function-pointer counter blocked absence-type rejections outright, the agent
+        #   spent two rounds going around on other axes. If the only way is around, it goes around — so give it somewhere to report.
         g = (args.get("gate") or "").strip()
         w = (args.get("why") or args.get("reason") or "").strip()
         wo = (args.get("would_be") or args.get("claim") or "").strip()
-        # kind: gate(게이트가 막음) · taxonomy(**원장에 적을 칸이 없음**) · tool(도구가 못 함)
+        # kind: gate (a gate blocked it) · taxonomy (**the ledger has no slot to write it in**) · tool (a tool cannot do it)
         kd = (args.get("kind") or "gate").strip().lower()
         if kd not in ("gate", "taxonomy", "tool"):
             kd = "gate"
@@ -4930,22 +4950,22 @@ def verdict(args):
         STATE.setdefault("gate_blocks", []).append(
             {"gate": g[:80], "why": w[:500], "would_be": wo[:400], "target": tgt,
              "kind": kd, "evidence": (args.get("evidence") or "")[:1500],
-             # ★ 2026-09-23 — **환경 도장.** 실측채널 신고 39건이 "그때 채널이 닫혀 있었다"
-             #   인데, 채널이 열린 뒤에도 영원히 쌓여 있었다. 지금 상태를 같이 박아 두면
-             #   나중에 **다르면 재확인 대상**으로 기계가 가른다(문장을 읽지 않는다).
+             # ★ 2026-09-23 — **an environment stamp.** 39 measurement-channel reports said "the channel
+             #   was closed at the time", yet they piled up forever even after the channel opened. Stamping the
+             #   current state alongside lets a machine sort out **the ones that differ, for rechecking** (without reading sentences).
              "env": _env_stamp(),
              "t": time.strftime("%m-%d %H:%M")})
         save()
-        # ★ 2026-09-23 — 영수증이 아니라 **행**으로 남긴다.
-        #   실측: gate_blocks 가 8개 표적에 123건 누적됐는데(09-02~), 소비자는 BRIEF 에
-        #   최근 4건을 찍는 것과 지휘자 화면뿐이다. census·coverage·채점 어디에도 안 잡히고,
-        #   would_be 400자로 잘려 다음 세션이 그 행을 **처음부터 다시 만든다**.
-        #   가장 오래된 신고(09-02 wcifs)가 어젯밤과 **같은 문장**이었다 —
-        #   "no value expresses 'real defect, gated off'". 3주간 아무도 안 봤다는 뜻이다.
-        #   ⇒ 미분석 판정으로 적재한다. 3분류(확정/기각/미분석)의 셋째 칸이 이제 채워진다.
+        # ★ 2026-09-23 — left as **a row**, not a receipt.
+        #   Measured: gate_blocks had piled up to 123 across 8 targets (since 09-02), and the only consumers
+        #   were the last 4 printed in the BRIEF and the conductor's screen. Nothing in census, coverage or
+        #   grading picked them up, and would_be was cut at 400 chars, so the next session **rebuilt that row from scratch.**
+        #   The oldest report (09-02 wcifs) was **the same sentence** as last night's —
+        #   "no value expresses 'real defect, gated off'". It means nobody looked for three weeks.
+        #   => loaded as an unanalysed verdict. The third slot of the three-way split (confirmed/rejected/unanalysed) is now filled.
         STATE.setdefault("verdicts", []).append(
             {"id": "GB-%s" % time.strftime("%m%d%H%M%S"), "target": tgt,
-             "status": "미분석", "basis": "blocked", "blocked_by": g[:80],
+             "status": "unanalysed", "basis": "blocked", "blocked_by": g[:80],
              "blocked_kind": kd, "claim": (wo or w)[:400],
              "evidence": (args.get("evidence") or "")[:1500], "why": w[:500],
              "t": time.strftime("%m-%d %H:%M")})
@@ -4976,8 +4996,8 @@ def verdict(args):
     if act == "status":
         return status_block(None, None)
     if act == "exhaust":
-        # ★ 3-way settle 의 세 번째 칸. **기각이 아니다.**
-        #   "더 쓸 방법이 없다"를 기각으로 세탁하면 재심 전체가 무의미해진다.
+        # ★ The third slot of the 3-way settle. **It is not a rejection.**
+        #   Laundering "there is no method left to use" into a rejection makes the whole re-examination meaningless.
         why = (args.get("reason") or "").strip()
         tried = args.get("tried") or ""
         if len(why) < 20:
@@ -4988,7 +5008,7 @@ def verdict(args):
             return "That target has no open question. (check with `verdict(action='asks')`)"
         n = _ask_close(tgt, args.get("id") or "-", "exhausted", why)
         for _k in [k for k in (tgt,) if k in STATE.get("surface", {})]:
-            STATE["surface"][_k]["status"] = "미분석"
+            STATE["surface"][_k]["status"] = "unanalysed"
             STATE["surface"][_k]["blocked"] = True
             STATE["surface"][_k]["exhausted"] = True
             STATE["surface"][_k]["why"] = "METHOD EXHAUSTED: " + why[:220]
@@ -4997,25 +5017,25 @@ def verdict(args):
                 "questions closed). This is NOT a rejection - the row stays UNAUDITED in the "
                 "table and does not become part of coverage's numerator.\nTried: " + str(tried)[:300])
     if act in ("lead", "leads"):
-        # ★ 2026-09-07 — 리드 큐를 **행동 가능하게** 만든다. 기록부(reports/breaks/)는
-        #   09-04 부터 있었지만 소비 경로가 `break_digest` 최신 3건뿐이었고 닫는 길이
-        #   아예 없었다. 상태 없는 큐는 줄지 않는다.
+        # ★ 2026-09-07 — make the lead queue **actionable.** The record (reports/breaks/) existed
+        #   since 09-04, but its only consumption path was the latest 3 in `break_digest`, and there was
+        #   no way at all to close one. A queue without state never shrinks.
         if act == "leads" or not args.get("id"):
             _ol = open_leads(STATE.get("target"))
             if not _ol:
-                return ("열린 리드 0건. (`reports/breaks/` 누적 %d건, 전부 닫혔거나 "
-                        "재제출 큐다.)" % len(breaks(STATE.get("target"))))
-            L = ["=== 리드 큐 — 열림 %d건, 오래된 것부터 ===" % len(_ol)]
+                return ("0 open leads. (`reports/breaks/` holds %d in total, all closed or "
+                        "in the resubmission queue.)" % len(breaks(STATE.get("target"))))
+            L = ["=== lead queue — %d open, oldest first ===" % len(_ol)]
             for b in _ol:
                 L.append("· `%s` [%s] %s  (%s)"
                          % (b.get("id"), b.get("klass") or "-",
                             str(b.get("target"))[:70], str(b.get("t") or "")[:10]))
                 nm = (b.get("next_method") or b.get("reason") or "").replace("\n", " ")
                 if nm:
-                    L.append("    다음 수: %s" % nm[:300])
-            L += ["", "닫는 길은 셋뿐이다 — `verdict(action='lead', id=…, how=…, why=…)`"]
+                    L.append("    next move: %s" % nm[:300])
+            L += ["", "There are only three ways to close one — `verdict(action='lead', id=…, how=…, why=…)`"]
             L += ["  · %s — %s" % kv for kv in CLOSE_HOWS.items()]
-            L += ["소진(exhausted)은 **없다.** 못 닫으면 열어 둔 채로 두는 것이 정직하다."]
+            L += ["There is **no** exhausted. If you cannot close it, leaving it open is the honest thing."]
             return "\n".join(L)
         _r = close_break(args["id"], args.get("how") or args.get("klass") or "",
                          args.get("why") or args.get("reason") or "")
@@ -5024,31 +5044,31 @@ def verdict(args):
         return _r
 
     if act == "reaudit":
-        # ★ 2026-09-07 — **오기각 방어가 기록 시점 1회뿐이었다.**
-        #   설계 의도는 "오기각은 영구 손실이니 비싸게 막는다"인데, 실제로는 한 번 통과하면
-        #   영원히 다시 안 본다: `reopen()` 은 에이전트가 스스로 근거를 들고 부를 때만 돌고
-        #   `rejaudit.audit()`/`regrade()` 는 라이브 경로에서 **한 번도 호출되지 않는다**
-        #   (`RA.classify` 만 쓰인다 — 등급 계산이지 재심이 아니다).
-        #   실측: 묘지의 `verified` 는 ahcache 34% · wcifs 37% 뿐이고
-        #   `INTERROGATE_RATE=1.0` 인데도 절반이 미심문이다.
-        #   ⇒ **행동 가능한 큐**를 준다. 등급을 세는 것(`graveyard_trust`)은 이미 있었지만
-        #     그것만으로는 아무도 움직이지 않았다.
+        # ★ 2026-09-07 — **the defence against false rejections ran only once, at filing time.**
+        #   The design intent is "a false rejection is a permanent loss, so guard against it expensively",
+        #   but in practice once something passes it is never looked at again: `reopen()` runs only when
+        #   the agent calls it itself with grounds in hand, and `rejaudit.audit()`/`regrade()` are
+        #   **never called once** on the live path (only `RA.classify` is used — a grade calculation, not a re-examination).
+        #   Measured: `verified` in the graveyard is only 34% for ahcache and 37% for wcifs, and
+        #   even with `INTERROGATE_RATE=1.0` half are uninterrogated.
+        #   => give an **actionable queue.** Counting grades (`graveyard_trust`) already existed, but
+        #     that alone moved nobody.
         _c, _rows, _n = graveyard_trust()
-        # ★ 큐가 비어도 **계약은 같은 모양**이어야 한다 — 0 을 안 찍으면 소비자가
-        #   "그 등급이 없다"와 "그 칸이 없다"를 구분 못 한다.
-        L = ["=== 묘지 재심 큐 — 검증된 음성 %d / 전체 %d ==="
+        # ★ Even when the queue is empty **the contract must keep the same shape** — without printing 0 the consumer
+        #   cannot tell "there is no such grade" from "there is no such slot".
+        L = ["=== graveyard re-audit queue — verified negatives %d / total %d ==="
              % (_c.get("verified", 0), sum(_c.values())),
              "  " + " · ".join("%s %d" % (k, _c.get(k, 0)) for k in
                                ("verified", "unexamined", "broke", "reopened",
                                 "candidate", "orphan")), ""]
-        L.append("① 서 있지 않은 기각 %d건 — 이건 부활이 아니라 **정리**다. "
+        L.append("① %d rejections that do not stand — this is not a resurrection but **bookkeeping.** "
                  "`verdict(action='reopen', gid=<id>, ground='new_evidence', why=…)`" % _n)
         if _rows:
             for r in _rows[:8]:
                 L.append("   [%s] %s (%s) — %s"
                          % (r["grade"], r["id"], r.get("klass"), str(r.get("why") or "")[:90]))
         else:
-            L.append("   (없음 — 깨진 기각도 철회 표시도 잔류하지 않는다)")
+            L.append("   (none — no broken rejection or withdrawal mark remains)")
         _un = [g for g in (STATE.get("graveyard") or [])
                if not g.get("reopened")
                and not any(str(v.get("id")) == str(g.get("id"))
@@ -5059,12 +5079,12 @@ def verdict(args):
         if _un:
             import collections as _c2
             _byk = _c2.Counter(g.get("klass") for g in _un)
-            L += ["", "② 적대자를 한 번도 안 거친 기각 %d건 — 사유 분포: %s"
+            L += ["", "② %d rejections that never went through an adversary — reason distribution: %s"
                   % (len(_un), " · ".join("%s %d" % kv for kv in _byk.most_common(6))),
-                  "   ★ '안 검증됨'은 '틀림'이 아니다. 표본으로 확인한 결과 이 버킷은",
-                  "     정확성 결함이 아니라 **절차 결함**이었다 — 새 실측·새 빌드·형제 함수의",
-                  "     반례가 생겼을 때 다시 볼 후보 목록으로 써라.",
-                  "   사유별 대표 1건:"]
+                  "   ★ 'unverified' does not mean 'wrong'. Checked on a sample, this bucket was",
+                  "     a **procedural defect**, not an accuracy defect — use it as a list of candidates to",
+                  "     revisit when a new measurement, a new build or a counterexample in a sibling function appears.",
+                  "   one representative per reason:"]
             _seen = set()
             for g in reversed(_un):
                 if g.get("klass") in _seen:
@@ -5077,41 +5097,41 @@ def verdict(args):
         return "\n".join(L)
 
     if act == "resisted":
-        # ★ 2026-09-08 — **죽이려다 실패한 행.** 이 하네스의 압력은 전부 "죽이기"인데
-        #   그 시도가 실패한 사건에는 소비 경로가 없었다. `denial_report()` 는 규칙별
-        #   집계라 "어느 행이 버텼나"를 답하지 않는다.
+        # ★ 2026-09-08 — **rows that someone tried to kill and failed.** All of this harness's pressure is
+        #   "killing", yet an attempt that failed had no consumption path. `denial_report()` aggregates
+        #   per rule, so it does not answer "which row held out".
         _rw, _c = resisted(STATE.get("target"))
         if not _rw:
-            return ("저항 큐 0건 — 이 표적에서 기각 시도가 반려된 적도, CFG 가 짝을 "
-                    "반증한 적도, 심문자가 깬 기각도 없다. (0 이지 미측정이 아니다: "
-                    "반려 기록 %d건 · 판정 %d건을 봤다.)"
+            return ("resisted queue: 0 — on this target no rejection attempt was ever denied, no CFG "
+                    "refuted a pair, and no interrogator broke a rejection. (This is 0, not unmeasured: "
+                    "%d denial records · %d verdicts were examined.)"
                     % (len(STATE.get("denials") or []), len(STATE.get("verdicts") or [])))
         L = [resisted_digest(STATE.get("target"), n=12), "",
-             "축 %d개 이상 겹친 행 %d건 — 겹침이 1순위 신호다. 한 축(반려만)은 서류 문제일 "
-             "수 있으나, **klass 를 바꿔가며 반복 반려된 행**은 사망 가설이 여러 개 안 "
-             "먹혔다는 뜻이다." % (2, _c["multi_axis"]),
+             "%d or more axes overlap on %d rows — overlap is the top signal. A single axis (denials only) can "
+             "be a paperwork problem, but **a row denied again and again under changing klasses** means several "
+             "death hypotheses did not take." % (2, _c["multi_axis"]),
              "",
-             "★ 이 큐를 닫는 길은 **재분석**뿐이고 셋 중 하나로 끝난다:",
-             "  · 요건을 갖춘 기각을 다시 낸다 (반려가 서류 문제였다면 그것이 정답이다)",
-             "  · `verdict(action='confirm', …)` — 죽지 않는 이유가 결함이기 때문이라면",
-             "  · `verdict(action='exhaust', …)` — 더 쓸 방법이 없다. 기각이 아니다",
-             "리드 id 가 붙은 행은 **거기서** 닫아라 — 같은 일을 두 큐가 시키지 않는다."]
+             "★ The only way to close this queue is **re-analysis**, and it ends in one of three ways:",
+             "  · file a rejection again that meets the requirement (if the denial was a paperwork problem, that is the right answer)",
+             "  · `verdict(action='confirm', …)` — if the reason it will not die is that it is a defect",
+             "  · `verdict(action='exhaust', …)` — there is no method left to use. This is not a rejection",
+             "Close rows carrying a lead id **there** — two queues do not ask for the same work."]
         return "\n".join(L)
 
     if act == "asks":
-        # ★ 2026-09-07 — **수신자로 가른다.** 옛 동작은 전부를 한 통에 쏟았고, 그 통의
-        #   40%가 `harness /…` 로 시작하는 원장·게이트 감사 질문이었다. 분석가가 답할 수
-        #   있는 질문이 아니어서 소진으로 닫혔고, 그게 "포기율 49%"로 계기판에 잡혔다.
+        # ★ 2026-09-07 — **split by recipient.** The old behaviour dumped everything into one bucket, and 40% of
+        #   that bucket were ledger/gate audit questions starting with `harness /…`. They were not questions
+        #   the analyst could answer, so they were closed as exhausted, and that showed on the dashboard as a "49% give-up rate".
         mine = open_asks(audience="analyst", rank=True, include_leads=True)
         ops = open_asks(audience="operator")
         if not mine and not ops:
             return "No open questions."
-        L = ["열린 질문 — 네 몫 %d건 · 운영자 몫 %d건. "
+        L = ["open questions — %d yours · %d the operator's. "
              "THESE ARE NOT NEGATIVES, THEY ARE UNAUDITED." % (len(mine), len(ops))]
         for q in mine:
-            # ★ 2026-09-08 — **출처와 종류를 같이 보여준다.** 이 큐는 정렬이 출처별
-            #   실측 수율이고(지휘자 0/72 대 게이트 15/40), 심문자 리드는 `_ask_close`
-            #   가 아니라 `verdict(action='lead')` 로 닫힌다 — 닫는 길이 다르면 말해줘야 한다.
+            # ★ 2026-09-08 — **show the source and kind alongside.** This queue is sorted by measured yield
+            #   per source (conductor 0/72 against gate 15/40), and interrogator leads close via
+            #   `verdict(action='lead')`, not `_ask_close` — when the way to close differs, it has to be said.
             L.append("\n[%s] (%s/%s) %s  (cfg=%s, %d attempts)\n  why   : %s\n  method: %s%s"
                      % (q["id"], normalize_ask_by(q.get("by"), q.get("id")),
                         q.get("kind") or "?", q["target"], q.get("cfg"),
@@ -5119,13 +5139,13 @@ def verdict(args):
                         (q.get("why") or "")[:200], (q.get("method") or "")[:260],
                         ("\n  close : " + q["_close_via"]) if q.get("_close_via") else ""))
         if ops:
-            L.append("\n— 운영자 몫 %d건 (하니스·원장 감사. **네 일이 아니다** — 답하지도 "
-                     "소진시키지도 마라. 같은 벽을 또 만나면 `gate_blocked` 로 새로 적어라):"
+            L.append("\n— %d for the operator (harness/ledger audits. **Not your job** — do not answer them "
+                     "or exhaust them. If you hit the same wall again, file it fresh with `gate_blocked`):"
                      % len(ops))
             for q in ops[:8]:
                 L.append("  · [%s] %s" % (q["id"], str(q["target"])[:70]))
             if len(ops) > 8:
-                L.append("  · … 그리고 %d건" % (len(ops) - 8))
+                L.append("  · … and %d more" % (len(ops) - 8))
         return "\n".join(L)
     return ("action must be one of: confirm | reject | blocked | scope | goal | track | "
             "gate_blocked | reopen | reaudit | asks | exhaust | lead | leads | "
@@ -5133,8 +5153,8 @@ def verdict(args):
 
 
 def stash_escalation(tgt, v):
-    """승격자는 판정이 기록되기 **전에** 도는 사전 게이트다 ⇒ 붙일 판정이 아직 없다.
-    보관해 두고 `verdict()` 가 기록 시점에 박는다. (심문 결과가 통째로 증발했던 것과 같은 자리)"""
+    """The escalator is a pre-gate that runs **before** the verdict is recorded => there is no verdict to attach to yet.
+    Keep it here and `verdict()` stamps it in at record time. (The same spot where interrogation results used to evaporate wholesale.)"""
     STATE.setdefault("pending_escalation", {})[tgt] = {
         "escalated": bool(v.get("escalated")), "axis": v.get("axis"),
         "principal": (v.get("principal") or "")[:300],
@@ -5148,24 +5168,24 @@ _NEXT_ANCHOR = re.compile(r"0x[0-9a-fA-F]{6,16}|\b[A-Z][a-z]+[A-Z][A-Za-z]{5,}\b
 
 
 def _next_step_ok(s):
-    """`next=` 가 '다음 한 걸음'으로 인정되는가. **산문 분류가 아니라 형식 검사다.**
+    """Does `next=` count as 'the next single step'? **A format check, not a prose classification.**
 
-    산문 분류를 시도했고 실패했다(2026-09-05 실측, C-037): blocked 498행에
-    (방법동사|물음표)+앵커 → 278행(56%), 미판정 앵커 접지 → 245행이고 그마저
-    C-034 가 지목한 4행 중 3행을 떨어뜨린다. 사유가 중앙값 882자라 거의 모든 행에
-    동사와 주소가 들어 있기 때문이다. ⇒ **읽는 쪽에서 못 고르면 쓰는 쪽이 선언한다.**
+    Prose classification was tried and failed (measured 2026-09-05, C-037): over 498 blocked rows,
+    (method verb|question mark)+anchor → 278 rows (56%), grounding in an unjudged anchor → 245 rows, and
+    even that drops 3 of the 4 rows C-034 pointed at. The median reason is 882 chars, so nearly every row
+    contains a verb and an address. => **if the reader cannot pick, the writer declares.**
 
-    요건 둘 (scope 의 method 30자 하한과 같은 계열):
-      · 40자 이상 — "재확인 필요" 같은 한 마디는 다음 회차가 집을 수 없다
-      · 앵커 하나 — VA(0x…) 또는 CamelCase 심볼. **무엇에 대고 할지가 없으면 걸음이 아니다**
+    Two requirements (the same family as scope's 30-char minimum for method):
+      · at least 40 chars — a one-liner like "needs re-check" cannot be picked up by the next round
+      · one anchor — a VA (0x…) or a CamelCase symbol. **With nothing to do it against, it is not a step**
     """
     t = (s or "").strip()
     if not t:
-        return (False, "next= 자체가 비어 있다")
+        return (False, "next= itself is empty")
     if len(t) < 40:
-        return (False, "40자 이상 (지금 %d자)" % len(t))
+        return (False, "at least 40 chars (now %d)" % len(t))
     if not _NEXT_ANCHOR.search(t):
-        return (False, "앵커 하나 — VA(0x14004efc0) 또는 심볼(SdbpInitializeSearchDBContext)")
+        return (False, "one anchor — a VA (0x14004efc0) or a symbol (SdbpInitializeSearchDBContext)")
     return (True, "")
 
 
@@ -5173,35 +5193,35 @@ _ALIAS_MARK = re.compile(r"\bALIAS\b|ALREADY ADJUDICATED", re.I)
 
 
 def _is_alias_row(why):
-    """이 BLOCKED 행이 **부기용 별칭**인가 (판정이 다른 행에 산다).
+    """Is this BLOCKED row a **bookkeeping alias** (its verdict lives on another row)?
 
-    ★ 2026-09-05 최종점검에서 잡은 오제외: 처음엔 `lives on|canonical row` 도 봤는데
-      그건 **코드에 대한 산문**에 걸린다 — 55행 중 3행이 오제외였고 그 셋이 하필
-      되찾아야 할 행이었다("NEXT STEP for…", "the constraint genuinely lives only in the
-      caller"). 내가 방금 C-037 에 적은 병리를 제외 규칙에서 그대로 재현한 것이다.
-    ★ 그리고 **위치를 요구한다**(앞 120자). 별칭 행은 첫 문장이 부기다
+    ★ A false exclusion caught in the 2026-09-05 final check: at first `lives on|canonical row` was also
+      matched, but that catches **prose about code** — 3 of 55 rows were falsely excluded, and those three
+      were exactly the rows that had to be recovered ("NEXT STEP for…", "the constraint genuinely lives only
+      in the caller"). I had reproduced, in the exclusion rule, the very pathology I had just written up in C-037.
+    ★ It also **requires a position** (the first 120 chars). An alias row's first sentence is bookkeeping
       ("DUPLICATE ALIAS from a FRESH=1 restore. Judgement lives on fn2_AhcApiUpdate…").
-      뒤쪽에서만 걸린 1행은 오히려 **정본**이었다 — 자기 밑에 별칭 9개가 있다고 적은 행이라,
-      위치를 안 보면 정본을 지우고 별칭을 남기게 된다.
-    실측: 앞120자 한정 51행 전수 표본이 진짜 별칭 · 오제외 0.
+      The one row matched only further back was in fact the **canonical** row — it said it had 9 aliases
+      under it, so ignoring position would delete the canonical row and keep the aliases.
+    Measured: restricted to the first 120 chars, all 51 sampled rows are real aliases · 0 false exclusions.
     """
     w = re.sub(r"^BLOCKED[:\s—-]*", "", str(why or "")).strip()
     return bool(_ALIAS_MARK.search(w[:120]))
 
 
 def unfinished(n=12, offset=0):
-    """★ **blocked 저수지를 열거한다.** 순위가 아니라 목록이다 — 그게 정직하다.
+    """★ **Enumerate the blocked reservoir.** A list, not a ranking — that is the honest form.
 
-    C-034 는 "사유에 다음 단계가 적힌 BLOCKED 행을 worklist 상단으로 올려라"였다.
-    구현하려고 술어를 셋 만들어 재봤더니 전부 실패했다(C-037):
-      현행 키워드 61/498 · (동사|?)+앵커 278/498(56%) · 미판정앵커 접지 245/498
-      그리고 접지형은 **C-034 가 지목한 바로 그 4행 중 3행을 떨어뜨린다.**
-    ⇒ 기계가 못 고른다. 그래서 **고르는 대신 세어서 보여준다** — 저수지의 진짜 크기를
-      먼저 말하고(수백 행), 페이지로 넘긴다. 고르는 것은 분석가·목표의 일이다.
-      (C-021 의 교훈: 열거할 수 없는 행은 ~150회 이름 탐침으로 되돌아온다.)
+    C-034 said "move BLOCKED rows whose reason states a next step to the top of the worklist".
+    Three predicates were built to implement it and measured, and all of them failed (C-037):
+      current keywords 61/498 · (verb|?)+anchor 278/498 (56%) · unjudged-anchor grounding 245/498
+      and the grounded one **drops 3 of the very 4 rows C-034 pointed at.**
+    => the machine cannot pick. So **instead of picking, it counts and shows** — it states the
+      reservoir's real size first (hundreds of rows) and pages through it. Picking is the analyst's / goal's job.
+      (The lesson of C-021: rows that cannot be enumerated come back as ~150 name probes.)
 
-    제외: 별칭·이미 판정된 행(판정이 다른 행에 산다) · 소진된 행.
-    정렬: `next=` 칸이 있는 행 → 비특권 도달 → 미착수 → 사유가 긴 행.
+    Excluded: aliases / already-judged rows (the verdict lives on another row) / exhausted rows.
+    Order: rows with a `next=` field → unprivileged reach → never picked → longer reason.
     """
     surf = STATE.get("surface") or {}
     V = STATE.get("verdicts") or []
@@ -5227,61 +5247,61 @@ def unfinished(n=12, offset=0):
     withnext = sum(1 for x in rows if x[0])
     tot = len(rows)
     if not tot:
-        return "blocked 저수지가 비어 있다."
+        return "the blocked reservoir is empty."
     off = max(0, int(offset or 0))
     if off >= tot:
-        return ("blocked 저수지 %d행 — offset=%d 는 끝을 넘었다. 마지막 페이지는 offset=%d."
+        return ("blocked reservoir: %d rows — offset=%d is past the end. The last page is offset=%d."
                 % (tot, off, max(0, tot - 12)))
     page = rows[off:off + max(1, int(n or 12))]
-    L = ["blocked 저수지 **%d행** (별칭 %d · 소진 %d 제외) — %d~%d 표시. 더 보려면 offset=%d"
+    L = ["blocked reservoir: **%d rows** (excluding %d aliases · %d exhausted) — showing %d~%d. For more, offset=%d"
          % (tot, alias, exh, off + 1, off + len(page), off + len(page)),
-         "★ 그중 다음 걸음이 **칸에 선언된 것은 %d행**. 나머지는 사유 산문뿐이고, "
-         "어느 것에 다음 수가 적혔는지 **기계는 못 고른다**(측정됨) — 읽고 골라라." % withnext]
+         "★ Of those, **%d rows declare** their next step in the field. The rest have only reason prose, and "
+         "**the machine cannot pick** which of them states a next move (measured) — read and pick." % withnext]
     for hasnx, up, fresh_pick, _wl, k, r, nx, rch, fresh in page:
         w = re.sub(r"^BLOCKED[:\s—-]*", "", str(r.get("why") or "")).strip()
-        head = re.split(r"(?<=[.?!])\s", w)[0] if w else "(사유 없음)"
-        L.append("\n· %s%s\n    reach=%s · 미판정앵커 %d · picks=%s"
-                 % (k[:72], "  [next 칸 있음]" if hasnx else "", rch[:20] or "-", fresh,
+        head = re.split(r"(?<=[.?!])\s", w)[0] if w else "(no reason)"
+        L.append("\n· %s%s\n    reach=%s · unjudged anchors %d · picks=%s"
+                 % (k[:72], "  [next field set]" if hasnx else "", rch[:20] or "-", fresh,
                     r.get("picks") or 0))
-        L.append("    %s: %s" % ("NEXT" if hasnx else "사유", (nx or head)[:220]))
-    L.append("\n이 행들은 커버리지 분모에 남아 있다. 하나를 골라 끝까지 닫거나, "
-             "`verdict(action='blocked', ..., next='<한 걸음>')` 로 칸을 채워 다음 회차가 집게 하라.")
+        L.append("    %s: %s" % ("NEXT" if hasnx else "WHY", (nx or head)[:220]))
+    L.append("\nThese rows remain in the coverage denominator. Pick one and close it to the end, or "
+             "fill the field with `verdict(action='blocked', ..., next='<one step>')` so the next round can pick it up.")
     return "\n".join(L)
 
 
 def _ask_for(target):
-    """표면 키에 걸린 열린 질문. 없으면 None. worklist 점수축이 쓴다."""
+    """The open question attached to a surface key. None if there is none. Used by the worklist's scoring axis."""
     t = str(target)
     best = None
     for a in (STATE.get("asks") or []):
         at = str(a.get("target") or "")
         if at == t or (len(at) > 12 and (at in t or t in at)):
-            # 시도가 많은 쪽을 우선 — 그게 지금 막고 있는 것이다
+            # prefer the one with more attempts — that is what is blocking right now
             if best is None or len(a.get("attempts") or []) > len(best.get("attempts") or []):
                 best = a
     return best
 
 
 def worklist(n=12):
-    """★ **무엇을 다시 까야 하는가.** 전수조사의 반대말.
+    """★ **What should be dug up again.** The opposite of an exhaustive sweep.
 
-    표가 크면(수백 행) "전부 다시 본다"는 실행 불가능하고, 실행해도 값이 안 난다.
-    골라야 하는데 그 고르는 규율이 코드에 없으면 매 회차 즉흥으로 정해진다.
-    여기서 점수는 하나의 축이 아니라 **"이 행이 손에 든 결함의 등급을 움직이는가"** 다.
+    When the table is large (hundreds of rows), "look at everything again" is infeasible, and even done it yields nothing.
+    Rows have to be picked, and if the discipline for picking is not in code, every round improvises it.
+    The score here is not a single axis but **"does this row move the grade of a defect already in hand"**.
 
-    양수 축 — 움직이는 행:
-      +4 살아있는 **확정의 체인 위**에 있다 (확정의 target/claim/impact 가 이 행을 가리킨다)
-      +3 **근거 없는 전수 주장**을 담은 확정 (그 한 문장이 등급 상한을 혼자 정한다)
-      +3 **약한 기각** — klass 는 있는데 CFG 판정도 심문도 없다 (검증된 음성이 아니다)
-      +2 **비특권 도달** (user-direct / user-triggerable)
-      +2 다음 수가 적힌 blocked (움직이는 데 드는 비용이 이미 적혀 있다)
-      +1 `scope` 는 선언됐는데 후보가 남음 (반쯤 닫힌 것 — 마무리가 싸다)
-    음수 축 — 건드려도 값이 안 나는 행:
-      -4 방법 소진(exhaust)  -3 이미 확정  -2 kernel-only 도달
+    Positive axes — rows that move it:
+      +4 sits **on the chain of a live confirmation** (the confirmation's target/claim/impact points at this row)
+      +3 a confirmation holding an **ungrounded exhaustive claim** (that one sentence alone sets the grade cap)
+      +3 a **weak rejection** — has a klass but neither a CFG verdict nor an interrogation (not a verified negative)
+      +2 **unprivileged reach** (user-direct / user-triggerable)
+      +2 a blocked row with a next move written (the cost of moving it is already written down)
+      +1 `scope` declared but candidates remain (half-closed — cheap to finish)
+    Negative axes — rows that yield nothing when touched:
+      -4 method exhausted (exhaust)  -3 already confirmed  -2 kernel-only reach
     """
     surf = STATE.get("surface") or {}
     V = STATE.get("verdicts") or []
-    conf = [v for v in V if v.get("status") == "확정"]
+    conf = [v for v in V if v.get("status") == "confirmed"]
     conftext = " ".join(json.dumps(v, ensure_ascii=False) for v in conf).lower()
     byt = {}
     for v in V:
@@ -5296,85 +5316,85 @@ def worklist(n=12):
         sc, why = 0, []
         kl = k.lower()
         if kl[:60] in conftext or (addrs(k) and any(a.lower() in conftext for a in addrs(k))):
-            sc += 4; why.append("확정의 체인 위")
-        if st == "확정":
+            sc += 4; why.append("on a confirmation's chain")
+        if st == "confirmed":
             sc -= 3
             for v in byt.get(k, []):
                 imp = v.get("impact") or {}
                 if imp.get("sole_claim") and not imp.get("enumerated"):
-                    sc += 3; why.append("근거 없는 전수 주장")
+                    sc += 3; why.append("ungrounded exhaustive claim")
         for v in byt.get(k, []):
-            if v.get("status") != "기각":
+            if v.get("status") != "rejected":
                 continue
             g = v.get("gate") or {}
             if (g.get("klass") in ("not_controlled", "by_design", "delta_zero", "no_sink")
                     and not ((g.get("cfg") or {}).get("verdict"))
                     and not v.get("interrogated")):
-                sc += 3; why.append("약한 기각(%s, CFG·심문 없음)" % g.get("klass")); break
+                sc += 3; why.append("weak rejection (%s, no CFG/interrogation)" % g.get("klass")); break
         rch = (r.get("reach") or "").lower()
         if any(w in rch for w in ("user-direct", "user-triggerable", "unprivileged")):
-            sc += 2; why.append("비특권 도달")
+            sc += 2; why.append("unprivileged reach")
         elif "kernel-only" in rch:
             sc -= 2
-        # ★ 2026-09-03: `asks` 가 점수축에 **아예 없었다.** 원장은 재시도를 세고 있는데
-        #   (`asks[].attempts`) 점수 계산이 그걸 안 읽어서, 같은 질문이 5회까지 다시 뽑혔다
-        #   (ahcache VARIANT-AXIS-S22 5회 / D_axis_quirks_section 4회, 전부 결국 exhausted).
-        #   ⇒ 질문을 **양방향 축**으로 쓴다: 아직 안 해본 질문은 올리고, 반복 실패는 내린다.
+        # ★ 2026-09-03: `asks` was **not on the scoring axes at all.** The ledger counts retries
+        #   (`asks[].attempts`) but the scoring did not read them, so the same question was picked up to 5 times
+        #   (ahcache VARIANT-AXIS-S22 5 times / D_axis_quirks_section 4 times, all eventually exhausted).
+        #   => use the question as a **two-way axis**: raise questions not yet tried, lower repeated failures.
         _aq = _ask_for(k)
         if _aq is not None:
             _at = len(_aq.get("attempts") or [])
             _ast = (_aq.get("status") or "open").lower()
             if _ast == "answered":
-                sc += 3; why.append("★ 열린 질문이 **답해졌다** — 이제 판정 가능하다")
+                sc += 3; why.append("★ the open question **has been answered** — a verdict is now possible")
             elif _ast == "exhausted":
-                sc -= 4; why.append("질문 소진(%d회 시도)" % _at)
+                sc -= 4; why.append("question exhausted (%d attempts)" % _at)
             elif _at == 0:
                 sc += 2; why.append("the question is open WITH A METHOD and has never been "
                                     "attempted")
             else:
                 sc -= min(6, 2 * _at)
-                why.append("같은 질문 %d회 실패 — 같은 방법을 또 쓰지 마라(%s)"
+                why.append("the same question failed %d times — do not use the same method again (%s)"
                            % (_at, str(_aq.get("method"))[:40]))
 
         w = str(r.get("why") or "")
-        # ★ 예전엔 `blocked` + '다음 수' 만으로 무조건 +2 였다. 즉 **막혀 있는 것 자체가
-        #   가산점**이었고, 그래서 blocked 476/518(92%) 인 표에서 같은 행이 계속 위로 왔다.
-        #   ⇒ 다음 수가 적혀 있어도 **뽑혀 나간 뒤 안 움직였으면** 내린다.
+        # ★ It used to be an unconditional +2 for `blocked` + 'next move'. That is, **being blocked was itself
+        #   a bonus**, so in a table with 476/518 (92%) blocked, the same rows kept coming to the top.
+        #   => even with a next move written, lower the row if **it was picked and did not move.**
         _picks = int(r.get("picks") or 0)
-        # ★ 2026-09-05 (C-037): 두 등급으로 가른다. **칸에 선언된 것**(next=)과 산문 매치.
-        #   정규식을 넓히지 않는다 — 넓히면 blocked 의 56%가 걸려 축이 정보를 잃는다(실측).
+        # ★ 2026-09-05 (C-037): split into two grades. **Declared in the field** (next=) vs a prose match.
+        #   The regex is not widened — widen it and 56% of blocked rows match, so the axis loses its information (measured).
         _nxs = r.get("next") if isinstance(r.get("next"), dict) else None
         _nxs = (_nxs or {}).get("step")
-        _prose = bool(re.search(r"TO MOVE|다음 수|다음 방법|next step", w, re.I))
+        _prose = bool(re.search(r"TO MOVE|next move|next step", w, re.I))
         if r.get("blocked") and (_nxs or _prose):
             if _picks == 0:
                 sc += 3 if _nxs else 2
-                why.append(("★ 다음 한 걸음이 **칸에 선언돼 있다**: " + str(_nxs)[:90]) if _nxs
-                           else "다음 수가 사유 산문에 적혀 있다(칸 아님)")
+                why.append(("★ the next single step is **declared in the field**: " + str(_nxs)[:90]) if _nxs
+                           else "a next move is written in the reason prose (not in the field)")
             else:
                 sc -= min(4, _picks)
                 why.append("picked %d times with the next move already written down, and it never "
                            "moved - change the method" % _picks)
         cand = (r.get("cand") or {}).get("items") or []
         if cand and any(not i.get("done") for i in cand):
-            sc += 1; why.append("scope 후보 %d/%d 남음"
+            sc += 1; why.append("scope candidates %d/%d left"
                                 % (sum(1 for i in cand if not i.get("done")), len(cand)))
-        # ★ 차분 축(refs/03): 확정 7건이 전부 **모집단을 세우고 튀는 하나**에서 나왔다.
-        #   같은 계열에 형제가 있고 그중 판정된 게 있으면, 나머지는 비교 대상이 된다 —
-        #   "위험해 보이는 코드"가 아니라 **형제와 다른 코드**가 사냥터다.
+        # ★ The differential axis (refs/03): all 7 confirmations came from **setting up a population and the one that sticks out**.
+        #   When a family has siblings and some of them are judged, the rest become comparison targets —
+        #   the hunting ground is not "code that looks dangerous" but **code that differs from its siblings**.
         fam = re.match(r'^([A-Za-z_][A-Za-z0-9_]{2,}?)[._:@\-]', k)
         if fam:
             sib = [kk for kk in surf if kk != k and kk.startswith(fam.group(1))]
-            done_sib = [kk for kk in sib if surf[kk].get("status") in ("확정", "기각", "경계보류")]
+            done_sib = [kk for kk in sib if surf[kk].get("status") in ("confirmed", "rejected", "boundary-held")]
             if len(sib) >= 2 and done_sib:
                 sc += 2
-                why.append("차분 가능(형제 %d, 판정된 형제 %d)" % (len(sib), len(done_sib)))
+                why.append("differential possible (%d siblings, %d judged)" % (len(sib), len(done_sib)))
         for _v in byt.get(k, []):
             if (_v.get("impact") or {}).get("out_of_scope"):
-                # 내리지 않는다. 남은 질문이 **하나**로 좁혀진 행이고, 그 하나를 채우면
-                # 곧바로 확정이 된다 — 원장에서 가장 싼 확정 후보다.
+                # Not lowered. This row has its remaining question narrowed to **one**, and filling it
+                # makes it a confirmation at once — the cheapest confirmation candidate in the ledger.
                 sc += 3
-                why.append("경계보류(%s) — 더 낮은 권한 principal 하나면 확정된다"
+                why.append("boundary-held (%s) — one lower-privilege principal and it is confirmed"
                            % _v["impact"]["out_of_scope"])
                 break
         if r.get("incidental"):
@@ -5392,8 +5412,8 @@ def worklist(n=12):
     L = ["%d ROWS STILL WORTH DIGGING (this is not an exhaustive sweep - it is the order that "
          "MOVES THE GRADE of a finding you already hold)" % min(n, len(rows))]
     for sc, k, st, why in rows[:n]:
-        # ★ 내보낸 행을 **센다.** 이 카운터가 없으면 "다음 수가 적혀 있다"는
-        #   영원히 가산점이다 — 적혀 있는 것과 시도한 것은 다르다.
+        # ★ **Count** the rows handed out. Without this counter "a next move is written" is
+        #   a bonus forever — having it written is not the same as having tried it.
         _r = surf.get(k)
         if isinstance(_r, dict):
             _r["picks"] = int(_r.get("picks") or 0) + 1
@@ -5407,10 +5427,10 @@ def worklist(n=12):
 
 
 def record_image(meta):
-    """★ 크로스 이미지에서 쓴 **모든** 이미지의 빌드 동일성을 남긴다.
+    """★ Record the build identity of **every** image used cross-image.
 
-    왜 필수인가: `nt!0x14098f670` 이 검증됐다는 기록은, **어느 ntoskrnl 인지**가 같이
-    남지 않으면 재현 불가능하다. 다른 빌드로 검증한 앵커는 검증이 아니라 우연이다.
+    Why it is mandatory: a record that `nt!0x14098f670` was verified cannot be reproduced unless
+    **which ntoskrnl** is recorded with it. An anchor verified against another build is a coincidence, not a verification.
     """
     imgs = STATE.setdefault("images", {})
     imgs[meta["name"]] = dict(meta, t=time.strftime("%m-%d %H:%M"))
@@ -5419,10 +5439,10 @@ def record_image(meta):
 
 
 def record_xref(desc, sections, names, nhits):
-    """전 실행섹션 xref 를 돌렸다는 사실을 남긴다. 부재 주장 게이트가 이걸 요구한다.
+    """Record the fact that an xref over every executable section was run. The absence-claim gate requires it.
 
-    `.text` 만 보고 'API 호출이 없다'고 쓴 실패(ipt.sys / SeSinglePrivilegeCheck @PAGE)가
-    실제로 있었다. 무엇을 어느 섹션에서 훑었는지가 근거의 일부다.
+    A failure where only `.text` was looked at and 'there is no API call' was written (ipt.sys / SeSinglePrivilegeCheck @PAGE)
+    really happened. What was swept, and in which sections, is part of the grounds.
     """
     STATE.setdefault("xrefs", []).append(
         {"desc": desc, "sections": list(sections), "names": list(names)[:40],
@@ -5432,12 +5452,12 @@ def record_xref(desc, sections, names, nhits):
 
 PRIORART_AXES = ("device", "ioctl", "symbol")
 
-# 표적/주장에서 **선행연구로 검색했어야 할 문자열**을 유도하는 패턴.
+# Patterns that derive, from the target/claim, **the strings that should have been searched for as prior art**.
 _DEV_RE = re.compile(r'\\{1,2}(?:Device|GLOBAL\?\?|DosDevices|\?\?)\\{1,2}[A-Za-z0-9_.\-]{2,48}')
-# CTL 코드: `_CODE_RE`(0x8xxxxxxx) 는 좁다 — 이 원장의 실제 확정에 0x2A400C·0x22C00C·
-# 0x39006F 가 있고 전부 안 걸린다. IOCTL/CTRL/FASTIO 문맥의 5~8자리도 같이 본다.
+# CTL codes: `_CODE_RE` (0x8xxxxxxx) is narrow — real confirmations in this ledger include 0x2A400C, 0x22C00C and
+# 0x39006F, and none of them match. Also take 5~8 digits in an IOCTL/CTRL/FASTIO context.
 _IOCTL_CTX = re.compile(r'(?:IOCTL|CTL_CODE|CTRL|FASTIO)[^\n]{0,16}?(0x[0-9a-fA-F]{4,8})', re.I)
-# 핸들러/구조체 이름 후보: 대문자 2개 이상을 포함한 6자 이상의 식별자
+# Handler/struct name candidates: identifiers of 6+ chars containing at least 2 capitals
 _SYMB_RE = re.compile(r'\b(?=[A-Za-z_]*[A-Z][A-Za-z_]*[A-Z])[A-Za-z_][A-Za-z0-9_:]{5,60}\b')
 _SYMB_STOP = {"IOCTL", "METHOD_NEITHER", "METHOD_BUFFERED", "METHOD_IN_DIRECT",
               "METHOD_OUT_DIRECT", "PAGE_READWRITE", "PAGE_WRITECOPY", "FILE_ANY_ACCESS",
@@ -5445,11 +5465,11 @@ _SYMB_STOP = {"IOCTL", "METHOD_NEITHER", "METHOD_BUFFERED", "METHOD_IN_DIRECT",
 
 
 def priorart_tokens(target="", text=""):
-    """이번 확정에서 **선행연구로 찾았어야 할 문자열**을 원장과 주장에서 유도한다.
+    """Derive, from the ledger and the claim, **the strings that should have been searched for as prior art** for this confirmation.
 
-    ★ 유도되지 않는 축은 요구하지 않는다. 만족 불가능한 게이트를 만들면 에이전트가
-      `blocked` 로 도망가고 그게 더 나쁘다 — `_impact_gate` 가 owner='none' 을
-      거부가 아니라 등급 상한으로 처리하는 것과 같은 이유다.
+    ★ An axis that derives nothing is not required. An unsatisfiable gate makes the agent escape
+      into `blocked`, which is worse — the same reason `_impact_gate` handles owner='none' as a
+      grade cap rather than a refusal.
     """
     blob = " ".join([str(target or ""), str(text or ""),
                      " ".join(STATE.get("surface") or {})])
@@ -5458,7 +5478,7 @@ def priorart_tokens(target="", text=""):
     if dev:
         out["device"] = sorted(set(dev))[:4]
     codes = set(_IOCTL_CTX.findall(blob)) | set(_CODE_RE.findall(blob)) | set(code_index())
-    # 표적 자체가 코드 하나를 가리키면 그것만 요구한다(전 표적의 코드를 다 요구하지 않는다)
+    # if the target itself points at one code, require only that one (not every code of every target)
     own = set(_IOCTL_CTX.findall(str(target or ""))) | set(_CODE_RE.findall(str(target or "")))
     if own:
         codes = own
@@ -5467,21 +5487,21 @@ def priorart_tokens(target="", text=""):
     syms = [s for s in _SYMB_RE.findall(blob)
             if s not in _SYMB_STOP and not s.startswith("0x")]
     if syms:
-        # 가장 긴 것 몇 개 — 짧은 약어보다 검색 가치가 있다
+        # the few longest — more search value than short abbreviations
         out["symbol"] = sorted(set(syms), key=len, reverse=True)[:4]
     return out
 
 
 def priorart_gaps(target="", text=""):
-    """(축, 기대 토큰, 사유) 목록. 비어 있으면 확정해도 된다.
+    """A list of (axis, expected tokens, reason). Empty means confirming is allowed.
 
-    ★ 왜 축이냐 — 예전 게이트는 `has_priorart()` 가 **비어 있지 않은가**만 봤다.
-      `priorart(what='x', where='y', result='없음')` 한 줄로 열렸다는 뜻이다.
-      프롬프트는 "최소한 (1) 디바이스 이름 (2) IOCTL 코드 (3) 핸들러/구조체 이름
-      셋 다 찾아라"라고 적어놓고 **코드는 세지 않았다.**
-      ksecdd 는 앵커 32건 기계검증 + 반박자 생존을 통과하고도 2024년 공개물이었고,
-      그 IOCTL 에는 `IOCTL_KSEC_IPC_SET_FUNCTION_RETURN` 이라는 공개된 이름까지 있었다.
-      ⇒ "찾았다고 적었나"가 아니라 **"이 문자열로 찾았나"** 를 본다.
+    ★ Why axes — the old gate only checked whether `has_priorart()` was **non-empty**.
+      That means one line, `priorart(what='x', where='y', result='none')`, opened it.
+      The prompt said "search at least (1) the device name (2) the IOCTL code (3) the handler/struct name,
+      all three" and **the code did not count them.**
+      ksecdd passed 32 machine-verified anchors + survived the refuter and was still a 2024 public writeup,
+      and that IOCTL even had a published name, `IOCTL_KSEC_IPC_SET_FUNCTION_RETURN`.
+      => it checks not "did you write that you searched" but **"did you search with this string"**.
     """
     recs = STATE.get("priorart") or []
     want = priorart_tokens(target, text)
@@ -5492,12 +5512,12 @@ def priorart_gaps(target="", text=""):
             continue
         mine = [r for r in recs if (r.get("axis") or "").lower() == ax]
         if not mine:
-            gaps.append((ax, toks, "이 축으로 검색한 기록이 없다"))
+            gaps.append((ax, toks, "no search recorded on this axis"))
             continue
         blob = " ".join(" ".join(str(r.get(k) or "") for k in ("what", "where", "result"))
                         for r in mine).lower()
         if not any(t.lower() in blob for t in toks):
-            gaps.append((ax, toks, "기록은 있는데 그 문자열이 안 보인다"))
+            gaps.append((ax, toks, "there are records, but that string does not appear in them"))
     return gaps
 
 
@@ -5506,7 +5526,7 @@ def render_priorart_gaps(gaps):
          "Anchors and the refuter cannot catch a published finding — ksecdd passed both and was "
          "a 2024 public writeup with a documented IOCTL name."]
     for ax, toks, why in gaps:
-        L.append("  · axis=%-6s %s — 검색했어야 할 문자열: %s"
+        L.append("  · axis=%-6s %s — strings that should have been searched: %s"
                  % (ax, why, ", ".join(str(t) for t in toks[:4])))
     L.append("Record each with priorart(axis='device'|'ioctl'|'symbol', what=<the exact string "
              "you searched>, where=<source>, result=<what you found>). If an axis genuinely does "
@@ -5516,28 +5536,28 @@ def render_priorart_gaps(gaps):
 
 
 def record_priorart(what, where, result, axis=""):
-    """선행연구 조사 기록. 확정 게이트가 이걸 요구한다.
+    """Prior-art search record. The confirm gate requires it.
 
-    왜: ksecdd.sys 확정이 앵커 32건 기계검증 + 반박자 생존을 통과했는데
-    **2024년에 이미 공개된 것**이었다(KExecDD / SCRT). IOCTL 0x39006F 는
-    `IOCTL_KSEC_IPC_SET_FUNCTION_RETURN` 이라는 이름까지 붙어 있었다.
-    코드만 보는 게이트는 이걸 절대 못 잡는다 — 그래서 별도 기록을 요구한다.
+    Why: a ksecdd.sys confirmation passed 32 machine-verified anchors + survived the refuter, and
+    **had already been published in 2024** (KExecDD / SCRT). IOCTL 0x39006F even carried the name
+    `IOCTL_KSEC_IPC_SET_FUNCTION_RETURN`.
+    A gate that looks only at code can never catch this — hence a separate record is required.
 
-    ★ `axis` 는 셋 중 하나여야 한다. 축 없는 기록은 게이트가 세지 않는다 —
-      한 줄로 세 축을 다 덮었다고 주장하는 것을 막는 것이 이 필드의 존재 이유다.
+    ★ `axis` must be one of three. The gate does not count a record with no axis —
+      stopping a single line from claiming to cover all three axes is why this field exists.
     """
     ax = (axis or "").strip().lower()
     if ax and ax not in PRIORART_AXES:
-        return ("axis 는 %s 중 하나여야 한다 (받은 값: %r)." % (" / ".join(PRIORART_AXES), axis))
+        return ("axis must be one of %s (got: %r)." % (" / ".join(PRIORART_AXES), axis))
     STATE.setdefault("priorart", []).append(
         {"what": what, "where": where, "result": result[:600], "axis": ax,
          "t": time.strftime("%m-%d %H:%M")})
     save()
     tail = ""
     if not ax:
-        tail = ("\n⚠ axis 를 안 줬다 — 이 기록은 **확정 게이트에서 세지 않는다.** "
-                "axis='device'|'ioctl'|'symbol' 로 다시 남겨라.")
-    return ("선행연구 기록됨: %s (%s)%s\n%s" % (what, where, "" if not ax else " [axis=%s]" % ax,
+        tail = ("\n⚠ no axis given — this record **is not counted by the confirm gate.** "
+                "Record it again with axis='device'|'ioctl'|'symbol'.")
+    return ("prior art recorded: %s (%s)%s\n%s" % (what, where, "" if not ax else " [axis=%s]" % ax,
                                             result[:200]) + tail)
 
 
@@ -5545,121 +5565,120 @@ def has_priorart():
     return list(STATE.get("priorart") or [])
 
 
-# ── 범위 정책 (운영자가 정한다) ────────────────────────────────
-# ★ 2026-09-02 사용자 결정: **"어드민 → 커널은 전부 의미 없으니 기각."**
-#   MSRC 도 admin→kernel 을 보안 경계로 서비싱하지 않는다. 그런데 wcifs 확정 4건이 전부
-#   거기 걸려 있었고, 하네스는 그걸 모른 채 계속 그 축에 시간을 썼다.
-#   ⇒ **완전 기각은 하지 않는다** — 같은 싱크에 더 낮은 권한이 닿는 길이 남아 있을 수 있고,
-#     그 길을 찾는 것이 이 축의 유일한 값이다(운영자 결정 2026-09-02).
-#   ⇒ **확정으로만 올리지 않는다.** status=경계보류 로 살려두고 승격자에게 넘긴다.
-# ★ 규칙은 **boundary 필드만** 본다. 그리고 admin 토큰이 화살표 **왼쪽**(출발지)에 있어야 한다.
-#   1차 구현은 owner/principal 까지 이어붙여 훑었고, 우리 원장에서 **즉시 2건을 오탐**했다:
-#     · S13-OP12-FLAGS3 — boundary 는 "컨테이너(서버 사일로) → 호스트 커널"인데
-#       principal 문장이 "…BUILTIN\\Administrators or SYSTEM per the fltMgr default SD —
-#       **including a container-local administrator, which is a different principal**" 라고
-#       적고 있었다. 즉 **논증 안에서 admin 을 언급한 것**을 경계로 오독했다.
-#     · S13-UAF-AVLNODE-V2 — boundary 헤드라인이 "**Unprivileged** file I/O → host kernel
-#       memory corruption"이고, admin 은 "다만 내가 증명한 free 쪽은 특권이다"라는
-#       **스스로 밝힌 한계** 문장에 있었다.
-#   ⇒ 논증이 정교할수록 반대편 주체를 더 많이 언급한다. 넓은 시드는 **잘 쓴 행부터** 죽인다.
-#     (`detector-seed-too-broad` 와 같은 계열)
+# ── scope policy (set by the operator) ─────────────────────────────────
+# ★ User decision 2026-09-02: **"admin → kernel is all meaningless, so reject it."**
+#   MSRC does not service admin→kernel as a security boundary either. Yet all 4 wcifs confirmations
+#   hung on exactly that, and the harness, not knowing it, kept spending time on that axis.
+#   => **it does not reject outright** — a path by which a lower privilege reaches the same sink may remain,
+#     and finding that path is this axis's only value (operator decision 2026-09-02).
+#   => **it just does not promote it to a confirmation.** It keeps it alive as status=boundary-held and hands it to the escalator.
+# ★ The rule looks **only at the boundary field.** And the admin token must be on the **left** of the arrow (the source).
+#   The first implementation also concatenated owner/principal and swept them, and **immediately produced 2 false positives** in our ledger:
+#     · S13-OP12-FLAGS3 — the boundary was "container (server silo) → host kernel", but
+#       the principal sentence said "…BUILTIN\\Administrators or SYSTEM per the fltMgr default SD —
+#       **including a container-local administrator, which is a different principal**".
+#       That is, **a mention of admin inside the argument** was misread as the boundary.
+#     · S13-UAF-AVLNODE-V2 — the boundary headline was "**Unprivileged** file I/O → host kernel
+#       memory corruption", and admin appeared in a **self-declared limit** sentence: "but the free
+#       side I proved is privileged".
+#   => the more careful the argument, the more it mentions the opposing principal. A broad seed kills **the best-written rows first**.
+#     (the same family as `detector-seed-too-broad`)
 _ARROW = re.compile(r'(→|->|=>|➜|\bto\b)')
 _ADMIN = re.compile(r'BUILTIN\\Administrators|S-1-5-32-544|Administrators?\b|'
-                    r'\bSYSTEM\b|elevated|관리자|어드민', re.I)
-# 왼쪽에 이것들이 있으면 **출발지가 admin 이 아니다** — 정책 대상이 아니다.
+                    r'\bSYSTEM\b|elevated', re.I)
+# If any of these is on the left, **the source is not admin** — not subject to the policy.
 _LOWER = re.compile(r'unprivileged|non-?admin|standard user|low(-| )?priv|AppContainer|sandbox|'
-                    r'container|silo|anonymous|unauthenticated|remote|guest|비특권|표준 사용자|'
-                    r'샌드박스|컨테이너|비인증', re.I)
+                    r'container|silo|anonymous|unauthenticated|remote|guest', re.I)
 
 
-# ─── 경계를 칸으로 (2026-09-10, 2순위) ────────────────────────────────────────
-#   ★ 왜: `scope_verdict()` 는 `boundary` **산문**을 정규식으로 읽는다. 실측 — 전 표적
-#     확정 16건 중 boundary 칸 자체가 있는 것이 6건이고, 그 6건에서 정책이 발동한 것은
-#     **1건**이다(분석자가 우연히 "Administrators/SYSTEM -> kernel" 이라고 적은 행).
-#     그리고 그 1건조차 원장에는 `확정` 으로 앉아 있다 — `경계보류` 사용 0건.
-#     ⇒ 산문은 술어를 못 나른다 (memory `prose-cannot-carry-a-predicate`).
+# ─── the boundary as a field (2026-09-10, priority 2) ──────────────────────────────────
+#   ★ Why: `scope_verdict()` reads the `boundary` **prose** with a regex. Measured — of 16 confirmations
+#     across all targets, 6 have a boundary field at all, and of those 6 the policy fired on
+#     **1** (a row where the analyst happened to write "Administrators/SYSTEM -> kernel").
+#     And even that 1 sits in the ledger as `confirmed` — `boundary-held` used 0 times.
+#     => prose cannot carry a predicate (memory `prose-cannot-carry-a-predicate`).
 #
-#   격자는 **호스트 기준 권한 순서**다. 컨테이너 관리자가 standard-user 와 같은 칸인 것은
-#   실수가 아니다 — 호스트 커널 기준으로 둘 다 비특권이고, wcifs 확정 하나가 정확히
-#   그 주장(Windows Server Container → host kernel)이다.
+#   The lattice is the **privilege order as seen from the host.** A container admin sharing a slot with
+#   standard-user is not a mistake — from the host kernel's point of view both are unprivileged, and one wcifs
+#   confirmation is exactly that claim (Windows Server Container → host kernel).
 PRINCIPAL_LATTICE = {
     "remote-anonymous": 0, "remote-authenticated": 1,
     "appcontainer": 2, "low-il": 3,
     "standard-user": 4, "container-admin": 4,
     "admin": 5, "system": 6, "kernel": 7, "hypervisor": 8,
 }
-# 분석자가 확정을 낼 수 없다고 선언하는 값. 통과하되 **확정이 아니라 경계보류**로 간다.
+# A value by which the analyst declares it cannot confirm. It passes, but goes to **boundary-held, not confirmed**.
 PRINCIPAL_UNPROVEN = "unproven"
 
 
 def boundary_typed(frm, to):
-    """선언된 두 principal → (is_boundary, why). `is_boundary` 는 yes | no | unknown.
+    """Two declared principals → (is_boundary, why). `is_boundary` is yes | no | unknown.
 
-    정책 출처: MSRC servicing criteria + 운영자 결정(2026-09-02, admin→kernel 은 경계가
-    아니다). **이건 그래프가 답하는 사실이 아니라 벤더의 정책이다** — 그래서 표로 둔다.
+    Policy source: MSRC servicing criteria + operator decision (2026-09-02, admin→kernel is not a
+    boundary). **This is not a fact the graph answers but the vendor's policy** — hence a table.
     """
     f, t = str(frm or "").strip().lower(), str(to or "").strip().lower()
     if f == PRINCIPAL_UNPROVEN or t == PRINCIPAL_UNPROVEN:
-        return ("unknown", "출발지/도착지 중 하나가 unproven — 최소 principal 이 아직 안 섰다")
+        return ("unknown", "one of source/destination is unproven — the minimum principal is not established yet")
     if f not in PRINCIPAL_LATTICE or t not in PRINCIPAL_LATTICE:
-        return ("unknown", "격자에 없는 principal (%s → %s)" % (frm, to))
+        return ("unknown", "principal not in the lattice (%s → %s)" % (frm, to))
     lf, lt = PRINCIPAL_LATTICE[f], PRINCIPAL_LATTICE[t]
     if lt <= lf:
-        return ("no", "권한이 올라가지 않는다 (%s ≥ %s) — 승격이 아니다" % (f, t))
+        return ("no", "privilege does not go up (%s ≥ %s) — not an escalation" % (f, t))
     if lf >= PRINCIPAL_LATTICE["admin"]:
         # admin→kernel · admin→system · system→kernel …
-        return ("no", "admin 이상에서 출발한다 — MSRC servicing criteria 상 보안 경계가 "
-                      "아니다(운영자 결정 2026-09-02). 같은 싱크에 더 낮은 principal 이 "
-                      "닿는 길이 남아 있으면 그게 이 행의 값이다")
-    return ("yes", "%s → %s 는 벤더가 인정하는 경계다" % (f, t))
+        return ("no", "starts at admin or above — not a security boundary under the MSRC "
+                      "servicing criteria (operator decision 2026-09-02). If a path by which a lower "
+                      "principal reaches the same sink remains, that is this row's value")
+    return ("yes", "%s → %s is a boundary the vendor recognises" % (f, t))
 
 
 def principal_evidence(target, frm, state=None):
-    """선언한 출발 principal 을 **실측이 뒷받침하는가.** (verdict, note)
+    """Does **a measurement back** the declared source principal? (verdict, note)
 
-    ★ 1순위(T46)가 심은 `principal_grade` 를 여기서 처음 소비한다. 이게 이 두 단계를
-      잇는 자리다 — 실측이 어느 토큰에서 났는지 모르면 "저권한이 도달한다"는 확정할 수 없다.
-      실사례: ahcache `S9-D4`/`S10-VA1` 이 `boundary=standard-user → machine-wide integrity`
-      로 확정돼 있는데, 저권한이 실제로 받는 것은 `PAGE_WRITECOPY` 뿐이다
-      (memory `ahcache-authz-population-half`: "근거가 없다 — 등급 재검토 대상").
+    ★ This is the first place that consumes the `principal_grade` planted by priority 1 (T46). It is where those
+      two steps join — without knowing which token a measurement came from, "a low privilege reaches it" cannot be confirmed.
+      A real case: ahcache `S9-D4`/`S10-VA1` are confirmed as `boundary=standard-user → machine-wide integrity`,
+      yet all a low privilege actually gets is `PAGE_WRITECOPY`
+      (memory `ahcache-authz-population-half`: "no grounds — due for a grade review").
     """
     f = str(frm or "").strip().lower()
     if f not in PRINCIPAL_LATTICE:
         return ("n/a", "")
     grade, recs = measured_principal(target, state=state)
     if PRINCIPAL_LATTICE[f] >= PRINCIPAL_LATTICE["admin"]:
-        return ("n/a", "출발지가 admin 이상이라 저권한 실측이 필요 없다")
+        return ("n/a", "the source is admin or above, so no low-privilege measurement is needed")
     if grade == "none":
-        return ("unmeasured", "이 표적에 실측 기록이 없다 — 출발 principal 은 정적 논증뿐이다")
+        return ("unmeasured", "this target has no measurement record — the source principal rests on static argument alone")
     if grade == "verified_low":
-        return ("verified", "비승격 토큰에서 난 실측이 뒷받침한다")
+        return ("verified", "backed by a measurement from a non-elevated token")
     if grade in ("verified_elevated", "verified_default"):
         return ("mismatch",
-                "출발지를 %s 로 선언했는데 뒷받침 실측은 **승격된 토큰**에서 났다(%s). "
-                "저권한이 같은 결과를 받는지는 아직 안 쟀다 — 등급 상한이 걸린다." % (f, grade))
+                "the source was declared as %s but the backing measurement came from an **elevated token** (%s). "
+                "Whether a low privilege gets the same result has not been measured yet — a grade cap applies." % (f, grade))
     return ("unmeasured",
-            "뒷받침 실측의 자격이 %s 다. 어느 토큰에서 났는지 원장에 없으므로 "
-            "'%s 가 도달한다'를 실측이 뒷받침하지 못한다. "
-            "ioctl(where='guest', principal='low') 로 다시 쏘면 하네스가 토큰을 검증한다."
+            "the backing measurement's credentials are %s. The ledger does not say which token it came from, so "
+            "the measurement cannot back '%s reaches it'. "
+            "Fire it again with ioctl(where='guest', principal='low') and the harness verifies the token."
             % (grade, f))
 
 
 def scope_verdict(impact):
-    """**경계가 범위 밖인가.** 반환 (label, why) 또는 (None, '').
+    """**Is the boundary out of scope?** Returns (label, why) or (None, '').
 
-    ★ 2026-09-02 운영자 결정 2단: "어드민 커널은 확정으로 **승격만** 하지 말자."
-      완전 기각이 아니다 — 같은 싱크에 더 낮은 권한이 닿는 길이 남아 있을 수 있고,
-      그 길을 찾는 것이 이 축의 유일한 값이다.
+    ★ Operator decision 2026-09-02, part 2: "just do not **promote** admin→kernel to a confirmation."
+      Not an outright rejection — a path by which a lower privilege reaches the same sink may remain,
+      and finding that path is this axis's only value.
     """
     b = str((impact or {}).get("boundary") or "")
     if not b:
         return None, ""
     m = _ARROW.search(b)
-    left = b[:m.start()] if m else b          # 화살표가 없으면 문장 전체를 출발지로 본다
+    left = b[:m.start()] if m else b          # with no arrow, the whole sentence is taken as the source
     if not _ADMIN.search(left):
         return None, ""
     if _LOWER.search(left):
-        # 출발지에 더 낮은 주체가 같이 적혀 있다 = 이 행은 admin 을 헤드라인으로 주장하지 않는다.
+        # a lower principal is written in the source too = this row does not claim admin as its headline.
         return None, ""
     return ("admin→kernel",
             "admin->kernel is not a security boundary (MSRC servicing criteria; operator decision "
@@ -5670,16 +5689,16 @@ _ADDRLIKE = re.compile(r'0x[0-9a-fA-F]{5,16}')
 
 
 def claim_anchor_link(claim, anchors):
-    """★ **주장이 이름 댄 주소가 앵커에 있는가.** (unlinked_addrs, note)
+    """★ **Are the addresses the claim names among the anchors?** (unlinked_addrs, note)
 
-    왜: 우리 게이트는 전부 **외연적**이다 — "인용한 VA 에 그 명령이 있는가"만 본다.
-    *그 명령이 주장을 뒷받침하는지는 아무도 안 본다.* 그래서 근거를 게이트 모양에 맞춰
-    다시 만드는 것이 통한다(2026-09-02 회차: "게이트가 기계검증 앵커를 원한다. 그대로 다시 가져온다").
-    문헌의 처방은 **동형 검증** — 문제를 변형해도 답이 유지되는지 본다 (`refs/00-gate-gaming.md`).
-    바이너리 판정에서 그 대응물이 이것이다: **주장의 하중을 받는 주소가 검증된 앵커 집합에
-    실제로 들어 있는가.** 없으면 그 주장은 그 앵커로 검증된 것이 아니다.
+    Why: our gates are all **extensional** — they only ask "is that instruction at the cited VA".
+    *Nobody checks whether that instruction supports the claim.* So rebuilding the grounds to fit the
+    gate's shape works (round of 2026-09-02: "the gate wants machine-verified anchors. Bring them back as-is").
+    The literature's prescription is **isomorphic verification** — check that the answer holds when the problem is transformed (`refs/00-gate-gaming.md`).
+    Its counterpart in binary verdicts is this: **are the addresses carrying the claim's weight actually
+    in the set of verified anchors?** If not, the claim was not verified by those anchors.
 
-    주소형(≥5자리 hex)만 본다. 작은 상수까지 요구하면 검출기가 넓어져 게이트가 무력해진다.
+    Only address-shaped values (≥5 hex digits) are considered. Requiring small constants too widens the detector and disarms the gate.
     """
     have = set()
     for a in anchors or []:
@@ -5709,12 +5728,12 @@ def claim_anchor_link(claim, anchors):
 
 
 def _images_for_anchor():
-    """앵커 검증에 쓸 보조 이미지. **순환 임포트를 피하려 지연 임포트**한다.
+    """Auxiliary images for anchor verification. **Imported lazily to avoid a circular import.**
 
-    ★ 2026-09-02 버그: 크로스 이미지 배선 때 확정 경로(`agent_sdk._anchor_gate`)와 `anchor` 툴에는
-      `images=` 를 넘겼는데 **기각 경로(`_reject_gate`)만 빠뜨렸다.** 그래서 같은 `nt!0x…` 인용이
-      `anchor` 툴에서는 9/9 통과하는데 `verdict(action='reject')` 에서는 전부 실패했다
-      — 에이전트가 회차 로그에 그대로 보고했다. 배선은 **모든 경로에 같이** 해야 한다.
+    ★ Bug of 2026-09-02: during the cross-image wiring, `images=` was passed on the confirm path
+      (`agent_sdk._anchor_gate`) and to the `anchor` tool, but **only the reject path (`_reject_gate`) was missed.**
+      So the same `nt!0x…` citation passed 9/9 in the `anchor` tool and failed every time in
+      `verdict(action='reject')` — the agent reported it verbatim in the round log. Wiring must go **into every path together**.
     """
     try:
         import tools as _T
@@ -5733,33 +5752,33 @@ def has_xref(kind=None):
 def control(kind, what, result):
     kind = (kind or "").lower()
     if kind not in ("positive", "negative", "swap"):
-        return "kind 는 positive | negative | swap."
+        return "kind is positive | negative | swap."
     STATE["controls"].setdefault(kind, []).append({"what": what, "result": result})
     save()
-    return f"대조군 기록: {kind} — {what} → {result}"
+    return f"control recorded: {kind} — {what} → {result}"
 
 
-# ── 게이트 반려 기록 (D형 접지: 하네스가 관측한 행위) ────────
-# ★ 왜 (2026-09-05, 운영자 질문 "게이트가 실제로 도움이 되고 있는거야?"):
-#   실측으로 **판정 툴 호출 3,506회 중 692회(20%)가 게이트에 반려됐는데 무엇을 막았는지가
-#   어디에도 없다.** 반려 지점은 49곳(`_reject_gate` 21 · `_gate_verdict` 11 · `verdict()` 17)
-#   인데 남는 것은 `gate_denials` 카운터 하나뿐이다. 사고기록은 `[tool ]`/`[think]` 만 찍고
-#   툴 결과를 안 찍으므로 게이트 자기 문구("STALE-BUILD ANCHOR" 등)를 전수 grep 해도 0건이다
-#   — 잡은 적이 없어서가 아니라 **기록이 없어서**다.
+# ── gate denial records (D-type grounding: behaviour the harness observed) ────────
+# ★ Why (2026-09-05, operator question "are the gates actually helping?"):
+#   Measured: **692 of 3,506 verdict tool calls (20%) were denied by a gate, and what they blocked was
+#   recorded nowhere.** There are 49 denial points (`_reject_gate` 21 · `_gate_verdict` 11 · `verdict()` 17),
+#   yet all that remains is a single `gate_denials` counter. The incident log stamps only `[tool ]`/`[think]` and
+#   not tool results, so grepping the whole log for the gates' own wording ("STALE-BUILD ANCHOR" etc.) finds 0
+#   — not because nothing was caught but **because nothing was recorded.**
 #
-#   그 결과 적대층은 감사 가능한데(승격 6/8 · 심문 93/152 · 반박 8/13) 결정론층은 감사 불가능한
-#   비대칭이 생겼고, 지난 며칠의 진단이 전부 적대자 쪽에서만 나온 이유가 이것이다.
+#   The result was an asymmetry: the adversarial layer is auditable (escalations 6/8 · interrogations 93/152 ·
+#   refutations 8/13) while the deterministic layer is not, which is why every diagnosis of the last few days came from the adversaries' side.
 #
-# ★ 이 함수는 **아무것도 막지 않는다.** 관측만 한다. 한 회차 뒤에 `denial_report()` 로
-#   "어느 규칙이 무엇을 몇 번 잡았나"가 표로 나오고, 그때 안 잡는 게이트를 데이터로 지운다.
-#   memory `grounding-decides-gate` 가 "D형은 거의 안 쓰인다"고 적어둔 구멍이 여기다.
+# ★ This function **blocks nothing.** It only observes. One round later `denial_report()` produces a table
+#   of "which rule caught what, how many times", and gates that catch nothing are then removed on the data.
+#   This is the hole memory `grounding-decides-gate` noted as "D-type is barely used".
 DENIAL_CAP = 400
 
 
 def _rule_key(reason):
-    """반려 문구의 앞머리를 규칙 식별자로 쓴다. 게이트 메시지는 고정 문자열이라 잘 뭉친다."""
+    """Use the head of the denial wording as the rule id. Gate messages are fixed strings, so they cluster well."""
     r = " ".join(str(reason or "").split())
-    return r[:56] or "(사유 없음)"
+    return r[:56] or "(no reason)"
 
 
 def record_denial(target, reason, act="", klass="", rule=""):
@@ -5773,39 +5792,39 @@ def record_denial(target, reason, act="", klass="", rule=""):
 
 
 def denial_report(limit=25):
-    """규칙별 반려 횟수 — "이 게이트가 실제로 무엇을 잡는가" 의 유일한 1차 자료."""
+    """Denials per rule — the only primary source for "what does this gate actually catch"."""
     D = STATE.get("denials") or []
     if not D:
-        return "반려 기록 없음 (아직 한 건도 안 막았거나 배선 전이다)"
+        return "no denial records (nothing has been blocked yet, or this is before the wiring)"
     agg = {}
     for d in D:
-        k = d.get("rule") or "(사유 없음)"
+        k = d.get("rule") or "(no reason)"
         a = agg.setdefault(k, {"n": 0, "acts": set(), "klasses": set(), "targets": set()})
         a["n"] += 1
         a["acts"].add(d.get("act") or "?")
         if d.get("klass"):
             a["klasses"].add(d["klass"])
         a["targets"].add(str(d.get("target"))[:40])
-    out = ["반려 %d건 · 규칙 %d종 (표적 기준)" % (len(D), len(agg))]
+    out = ["%d denials · %d rules (by target)" % (len(D), len(agg))]
     for k, a in sorted(agg.items(), key=lambda x: -x[1]["n"])[:limit]:
-        out.append("  %3d× [%s] 표적 %d개 %s  %s"
+        out.append("  %3d× [%s] %d targets %s  %s"
                    % (a["n"], "/".join(sorted(a["acts"])), len(a["targets"]),
                       ("klass=" + ",".join(sorted(a["klasses"]))) if a["klasses"] else "", k))
     return "\n".join(out)
 
 
 def control_overlap(text, kind="positive"):
-    """청구의 앵커 주소와 대조 기록의 앵커 주소가 겹치는가. **A형 접지** — 양쪽 다 주소 집합이다.
+    """Do the claim's anchor addresses overlap the control records' anchor addresses? **A-type grounding** — both sides are address sets.
 
-    ★ 왜 (2026-09-05, C-029): R5 는 `klass='delta_zero'` 에 양성 대조를 요구하는데
-      `has_control()` 이 **원장 전역**이라, 표적에 아무 대조나 하나 있으면 그 뒤 모든
-      `delta_zero` 기각이 무료 통과했다. `ahcache.sys` 의 positive 15건은 전부 다른 것을
-      잰 대조(게이트 도구 검증 · sink_gates 검출 · 레지스트리 프로브)였고, S46 이 주장한
-      채널을 잰 것은 0건이었다. 08-30 이후 `delta_zero` 6건 중 5건이 그렇게 통과했다.
+    ★ Why (2026-09-05, C-029): R5 requires a positive control for `klass='delta_zero'`, but
+      `has_control()` is **ledger-global**, so once a target had any control at all, every later
+      `delta_zero` rejection passed for free. All 15 positives on `ahcache.sys` were controls measuring something
+      else (gate-tool validation · sink_gates detection · a registry probe), and 0 measured the channel S46 claimed.
+      5 of the 6 `delta_zero` rejections since 08-30 passed that way.
 
-    ★ **막지 않는다.** 오늘의 결론이 "결정론 층에 억제 권한을 주지 마라"(refs/05)이므로
-      여기서 그것을 뒤집지 않는다. 겹침을 **계산해서 붙이고** 승격자에게 넘긴다 —
-      `delta_zero` 는 어차피 승격자가 blocking 으로 받는다.
+    ★ **It does not block.** Today's conclusion is "do not give the deterministic layer suppression authority" (refs/05),
+      so it is not reversed here. It **computes the overlap, attaches it** and hands it to the escalator —
+      the escalator takes `delta_zero` as blocking anyway.
     """
     want = set(x.lower() for x in re.findall(r'0x[0-9a-fA-F]{6,16}', str(text or "")))
     pool = STATE.get("controls", {}).get(kind) or []
@@ -5827,27 +5846,27 @@ def has_control(kind="positive"):
     return bool(STATE["controls"].get(kind))
 
 
-# ── 5) 종료 검문 (task verification) ─────────────────────────
-# ── 조사 트랙 ────────────────────────────────────────────────
-# ★ 왜: 확정 3건(`S7-D4`/`S9-D4`/`S10-VA1`)은 **세 개의 결함이 아니라 한 결함의 세 단계**다.
-#   그런데 원장은 셋을 따로 셌고, 어디에도 "이 조사가 몇 단계인가"가 없었다. 그래서 매 회차가
-#   "표 479행 중 미분석 461" 을 보고 **어디부터 팔지 다시 정했다** — 6회차가 6단계를 간 게 아니라
-#   각자 "1단계 수준의 일"을 여섯 번 했다. 사람은 이미 이걸 손으로 하고 있다
-#   (`poc/*.criteria.md`, `RESUME.md`). 하네스가 그걸 못 읽을 뿐이었다.
-DEFAULT_STAGES = ["정적확정", "트리거", "실측", "임팩트", "경계/제출"]
+# ── 5) task verification ─────────────────────────────────────
+# ── investigation tracks ─────────────────────────────────────
+# ★ Why: the 3 confirmations (`S7-D4`/`S9-D4`/`S10-VA1`) are **not three defects but three stages of one defect.**
+#   Yet the ledger counted them separately, and nowhere said "how many stages is this investigation at". So every round
+#   looked at "461 unanalysed of 479 table rows" and **decided again where to dig** — 6 rounds did not go 6 stages,
+#   each did "stage-1-level work" six times over. Humans already do this by hand
+#   (`poc/*.criteria.md`, `RESUME.md`). The harness just could not read it.
+DEFAULT_STAGES = ["static-confirm", "trigger", "measure", "impact", "boundary/submission"]
 
 
 def track(name, stage=None, of=None, note="", evidence=None, target=None):
-    """조사 트랙의 단계를 읽거나 올린다. 단계는 **되돌릴 수도 있다** — 반박당하면 내리는 게 정직하다."""
+    """Read or advance an investigation track's stage. A stage **can also go back** — lowering it when refuted is the honest thing."""
     T = STATE.setdefault("tracks", {})
     t = T.get(name)
     if t is None:
         t = {"stages": list(of or DEFAULT_STAGES), "stage": 0, "evidence": {},
              "note": "", "t": time.strftime("%m-%d %H:%M")}
         T[name] = t
-    # ★ 2026-09-05: 트랙 레코드에 `target` 이 **아예 없었다**(필드 전수: stages/stage/
-    #   evidence/note/t). 그래서 "이 트랙의 표적에 앵커 검증된 확정이 있나" 를 계산할 수
-    #   없었고, `GOAL(track:X)` 의 X 는 지시대상 없는 자유 문자열이었다.
+    # ★ 2026-09-05: a track record had **no `target` at all** (fields in full: stages/stage/
+    #   evidence/note/t). So "does this track's target have an anchor-verified confirmation" could not be
+    #   computed, and the X in `GOAL(track:X)` was a free string with no referent.
     if target:
         t["target"] = str(target)[:160]
     if of:
@@ -5870,7 +5889,7 @@ def track_render(compact=False):
     L = []
     for n, t in T.items():
         st, names = t.get("stage", 0), t.get("stages") or DEFAULT_STAGES
-        bar = " ".join(("[x]" if i < st else ("**[ ]←지금**" if i == st else "[ ]")) + nm
+        bar = " ".join(("[x]" if i < st else ("**[ ]←now**" if i == st else "[ ]")) + nm
                        for i, nm in enumerate(names))
         L.append("- `%s`  %s" % (n, bar))
         if t.get("note") and not compact:
@@ -5879,35 +5898,35 @@ def track_render(compact=False):
 
 
 
-# ── 원장이 못 담던 세 모양 (2026-09-14) ─────────────────────────────────────
-# ★ 왜 추가하나. 09-14 야간런이 `reports/unrecordable/` 에 **다섯 건**을 쌓았고, 지휘자가
-#   세 번 "필요한 칸"을 구체적으로 요청했다. 그중 하나는 그 밤의 **가장 강한 발견**이었다:
-#     "FltCreateFileEx* 13호출부/11함수 중 인가 가드를 자기 본문에 가진 것은 1개뿐"
-#   원장에는 행 모양이 둘뿐이다 — 「한 표적의 한 결함 주장」과 「채점된 관측 하나」.
-#   그래서 ① 결함 주장이 아닌 **측정된 속성** ② 표적 이미지에 안 묶이는 **OS 경로 사실**
-#   ③ 멤버와 쿼리를 함께 지닌 **인구** 가 전부 갈 곳이 없었다.
-#   그런데 이 저장소의 규율은 *"실제 결함은 부재가 아니라 **덜 적용됨**이고 그건 인구로만
-#   보인다"* 고 말한다. 도구가 방법론의 핵심 산출물을 표현하지 못하고 있었다.
+# ── three shapes the ledger could not hold (2026-09-14) ─────────────────────────────────────
+# ★ Why they were added. The 09-14 overnight run piled up **five items** in `reports/unrecordable/`, and the conductor
+#   asked three times, concretely, for "the fields it needs". One of them was that night's **strongest finding**:
+#     "of 13 FltCreateFileEx* call sites / 11 functions, only 1 has an authorization guard in its own body"
+#   The ledger has only two row shapes — "one defect claim about one target" and "one graded observation".
+#   So ① a **measured property** that is not a defect claim ② an **OS path fact** not bound to the target image
+#   ③ a **population** carrying members and queries together — had nowhere to go.
+#   Yet this repository's discipline says *"real defects are not absences but **under-applications**, and those
+#   show up only as populations"*. The tool could not express the methodology's core output.
 #
-# ★ 세 칸 모두 **판정이 아니다.** 확정/기각을 담지 못한다 — 승격은 여전히 `verdict()` 를
-#   거치고 거기 붙은 게이트(basis·대조군·부채상한)를 그대로 받는다. 이 칸들은 **판정의
-#   재료를 잃지 않게** 하는 것이지 게이트를 우회하는 뒷문이 아니다.
+# ★ None of the three fields **is a verdict.** They cannot hold a confirmation/rejection — promotion still goes through
+#   `verdict()` and takes the gates attached there (basis · controls · debt cap) as they are. These fields keep **the
+#   material of verdicts from being lost**; they are not a back door around the gates.
 
-POP_MEMBER_STATES = ("미분석", "안전", "의심", "승격됨", "무효")
+POP_MEMBER_STATES = ("unanalysed", "safe", "suspect", "promoted", "void")
 
 
 def population(name, query_a=None, set_a=None, query_b=None, set_b=None,
                differentiator=None, note="", member_state=None, target=None,
                invariant=None):
-    """**인구 기록.** 집합 A, 집합 B, 그 **교집합은 하니스가 계산한다.**
+    """**Population record.** Set A, set B, and **the harness computes their intersection.**
 
-    ★ 교집합을 호출자가 선언하게 두면 그건 자기신고다. 여기서는 A·B 를 받고 셈은 코드가 한다.
-    ★ 멤버 기본 상태는 `미분석` 이고, 렌더링이 **미분석 수를 항상 같이 낸다** —
-      부분 전수가 완전 전수로 읽히는 것이 이 방법론에서 가장 비싼 거짓말이기 때문이다.
-    ★ 이 기록은 **판정이 아니다.** 멤버를 `승격됨` 으로 바꾸는 것은 `verdict()` 가 실제로
-      등재된 뒤에만 의미가 있고, 그 게이트는 그대로 남는다.
+    ★ Letting the caller declare the intersection would make it a self-report. Here A and B come in and the code does the counting.
+    ★ The default member state is `unanalysed`, and the rendering **always reports the unanalysed count** —
+      a partial census read as a complete one is the most expensive lie in this methodology.
+    ★ This record is **not a verdict.** Changing a member to `promoted` means something only after a
+      `verdict()` has actually been filed, and that gate stays in place.
 
-    member_state: {"0x140057D00": "안전", ...} — 부분 갱신. 어휘 밖이면 거부한다.
+    member_state: {"0x140057D00": "safe", ...} — a partial update. Values outside the vocabulary are rejected.
     """
     P = STATE.setdefault("populations", {})
     r = P.get(name)
@@ -5919,9 +5938,9 @@ def population(name, query_a=None, set_a=None, query_b=None, set_b=None,
     if target:
         r["target"] = str(target)[:160]
     if invariant:
-        # ★ 2026-09-24 — patch-anchored census 마커. 이 필드가 있으면 이 인구는
-        #   "벤더가 복원한 불변식 I 를 강제해야 할 모집단" 이고, 완결 주장(verdict completes=)
-        #   은 `population_closure_status()` 게이트를 통과해야 한다(Move 2).
+        # ★ 2026-09-24 — the patch-anchored census marker. When this field is present the population is
+        #   "the population that must enforce the invariant I the vendor restored", and a completion
+        #   claim (verdict completes=) must pass the `population_closure_status()` gate (Move 2).
         r["invariant"] = str(invariant)[:400]
     if query_a:
         r["query_a"] = str(query_a)[:300]
@@ -5935,12 +5954,12 @@ def population(name, query_a=None, set_a=None, query_b=None, set_b=None,
         r["set_a"] = sorted({str(x).strip() for x in set_a if str(x).strip()})
     if set_b is not None:
         r["set_b"] = sorted({str(x).strip() for x in set_b if str(x).strip()})
-    # ★ 교집합·차집합은 **코드가 센다.**
+    # ★ The intersection and the difference are **counted by the code.**
     A, B = set(r["set_a"]), set(r["set_b"])
     r["inter"] = sorted(A & B)
     r["only_a"] = sorted(A - B)
     for m in r["only_a"]:
-        r["members"].setdefault(m, "미분석")
+        r["members"].setdefault(m, "unanalysed")
     bad = []
     for k, v in (member_state or {}).items():
         v = str(v)
@@ -5962,62 +5981,62 @@ def population_render(name=None, compact=False):
     for n, r in P.items():
         if name and n != name:
             continue
-        todo = sum(1 for v in r["members"].values() if v == "미분석")
-        L.append("- 인구 `%s`  A=%d B=%d  **A∩B=%d**  A만=%d  (**미분석 %d**)"
+        todo = sum(1 for v in r["members"].values() if v == "unanalysed")
+        L.append("- population `%s`  A=%d B=%d  **A∩B=%d**  A only=%d  (**unanalysed %d**)"
                  % (n, len(r["set_a"]), len(r["set_b"]), len(r["inter"]),
                     len(r["only_a"]), todo))
         if r.get("differentiator") and not compact:
-            L.append("    판별식: %s" % r["differentiator"][:200])
+            L.append("    discriminator: %s" % r["differentiator"][:200])
         if todo and not compact:
-            L.append("    미분석 멤버: %s"
-                     % ", ".join([m for m, v in r["members"].items() if v == "미분석"][:10]))
+            L.append("    unanalysed members: %s"
+                     % ", ".join([m for m, v in r["members"].items() if v == "unanalysed"][:10]))
         if todo:
-            L.append("    ★ **미분석이 %d 이므로 이 전수는 아직 닫히지 않았다.**" % todo)
+            L.append("    ★ **%d are unanalysed, so this census is not closed yet.**" % todo)
         if r.get("invariant"):
-            L.append("    ⚑ patch-anchored (RI: %s) — 완결 주장은 게이트 통과 필요"
+            L.append("    ⚑ patch-anchored (RI: %s) — a completion claim must pass the gate"
                      % r["invariant"][:120])
     return "\n".join(L)
 
 
 def population_closure_status(name):
-    """**patch-anchored census 를 '완전 수정'으로 닫아도 되는가** (Move 2 게이트).
+    """**May a patch-anchored census be closed as 'fully fixed'?** (the Move 2 gate).
 
-    반환 (ok, reason).
-    · patch-anchored 가 아니면 → (True, "") — 이 게이트의 소관이 아니다.
-    · 미분석 멤버가 남았으면 → (False, ...): 알려진 멤버조차 다 안 봤다.
-    · closure_interrog 가 이 census 이름으로 **SUSTAINED** 되지 않았으면 → (False, ...):
-      어젯밤 mrxsmb 실패의 진짜 원인은 미분석이 아니라 **set_b 열거 자체가 멤버를 놓친 것**
-      이었고, 그걸 잡는 유일한 도구가 재-스윕 심문자다. 그래서 완결은 심문자 SUSTAINED 를
-      요구한다 — 심문자가 BROKE 했거나(=열거 불완전) 아예 안 돌았으면 닫지 못한다.
-    · 그 외 → (True, "").
+    Returns (ok, reason).
+    · not patch-anchored → (True, "") — not this gate's business.
+    · unanalysed members remain → (False, ...): not even the known members have all been looked at.
+    · closure_interrog has not **SUSTAINED** this census name → (False, ...):
+      the real cause of last night's mrxsmb failure was not unanalysed members but **the set_b enumeration
+      itself missing members**, and the only tool that catches that is the re-sweep interrogator. So completion
+      requires an interrogator SUSTAINED — if the interrogator BROKE it (= incomplete enumeration) or never ran, it cannot close.
+    · otherwise → (True, "").
     """
     P = STATE.get("populations") or {}
     r = P.get(name)
     if not r:
-        return (False, "그런 인구가 없다: %s" % name)
+        return (False, "no such population: %s" % name)
     if not r.get("invariant"):
-        return (True, "")  # patch-anchored 아님 — 소관 밖
-    todo = [m for m, v in r.get("members", {}).items() if v == "미분석"]
+        return (True, "")  # not patch-anchored — outside this gate's remit
+    todo = [m for m, v in r.get("members", {}).items() if v == "unanalysed"]
     if todo:
-        return (False, "미분석 %d 멤버 남음: %s" % (len(todo), ", ".join(todo[:12])))
+        return (False, "%d unanalysed members remain: %s" % (len(todo), ", ".join(todo[:12])))
     ci = (STATE.get("closure_interrogs") or {}).get("by_name") or {}
     res = ci.get(name)
     if res != "SUSTAINED":
-        return (False, "closure_interrog 상태=%s — patch-anchored census 는 심문자가 "
-                       "SUSTAINED 해야만 완결로 닫힌다(set 열거 불완전이 미분석으로는 안 잡힌다). "
-                       "닫는 서술로 심문자를 돌리고(name='%s'), 깨지면 놓친 멤버를 set_b 에 넣어라."
-                       % (res or "미실행", name))
+        return (False, "closure_interrog state=%s — a patch-anchored census closes as complete only when "
+                       "the interrogator has SUSTAINED it (an incomplete set enumeration is not caught by the unanalysed count). "
+                       "Run the interrogator with the closing statement (name='%s'), and if it breaks, put the missed members into set_b."
+                       % (res or "not run", name))
     return (True, "")
 
 
 def posture(subject, prop, value, derivation, body_read=False, anchors=None,
             note="", target=None):
-    """**측정된 속성.** 결함 주장이 아니다 — 그래서 `verdict()` 의 어휘로는 담을 수 없었다.
+    """**A measured property.** Not a defect claim — which is why the `verdict()` vocabulary could not hold it.
 
-    ★ 09-14 사고: IOCTL 두 팔의 access mask 를 **완전히 측정**하고도 칸이 없어
-      `blocked`("못 정했다")로 밀려났다. 참인 측정이 실패로 기록되는 건 분모를 거짓으로 만든다.
-    ★ `body_read=False` 를 **보존한다** — "자세는 쟀지만 본문은 안 읽었다"가 이 기록의 내용이고,
-      그걸 지우면 나중에 이 행이 도달성 주장으로 승격될 때 근거가 부풀려진다.
+    ★ The 09-14 incident: the access masks of two IOCTL arms were **fully measured**, but with no slot for
+      them they were pushed into `blocked` ("could not decide"). A true measurement recorded as a failure falsifies the denominator.
+    ★ `body_read=False` is **preserved** — "the posture was measured but the body was not read" is the content
+      of this record, and erasing it would inflate the grounds later when this row is promoted to a reachability claim.
     """
     R = STATE.setdefault("postures", [])
     rec = {"target": str(target or STATE.get("target") or "?")[:160],
@@ -6044,13 +6063,13 @@ def _osfact_file():
 
 def os_fact(routine=None, arm=None, validated=None, omitted=None, anchors=None,
             applies_to=None, image="", build="", note=""):
-    """**표적 이미지에 안 묶이는 OS 경로 사실.** 읽기만 하려면 인자 없이 부른다.
+    """**An OS path fact not bound to the target image.** Call with no arguments to just read.
 
-    ★ 09-14 사고: `nt!NtSetEaFile` 의 BUFFERED/DIRECT 팔 비대칭을 측정했는데, 원장의 모든
-      행이 `target` 한 이미지에 묶여 있어 갈 곳이 없었다. cldflt 밑에 넣으면 표적 이탈이고
-      ntoskrnl 밑에 넣으면 cldflt 작업 중엔 아무도 안 본다 ⇒ **표적마다 재도출된다.**
-      (실측으로 그랬다: 같은 밤에 fltmgr 사실을 bfs·cldflt 회차에 걸쳐 두 번 재도출했다.)
-    ⇒ 그래서 **공유 파일**에 둔다. 어느 표적에서 attach 하든 같은 것을 본다.
+    ★ The 09-14 incident: the BUFFERED/DIRECT arm asymmetry of `nt!NtSetEaFile` was measured, but every row
+      in the ledger is bound to the single `target` image, so it had nowhere to go. Filed under cldflt it is off-target;
+      filed under ntoskrnl nobody sees it while working on cldflt => **it gets re-derived on every target.**
+      (That was measured: the same night, a fltmgr fact was re-derived twice across the bfs and cldflt rounds.)
+    => so it lives in a **shared file.** Whichever target you attach, you see the same thing.
     """
     f = _osfact_file()
     try:
@@ -6059,9 +6078,9 @@ def os_fact(routine=None, arm=None, validated=None, omitted=None, anchors=None,
     except (OSError, ValueError):
         D = {"facts": []}
     if routine:
-        # ★ 같은 routine 은 **갈아끼운다.** 09-14 실측: 야간런이 "팔 둘"로 적은 것을
-        #   감시자가 "셋"으로 재도출했는데, append 만 하면 **낡은 버전이 같이 읽힌다** —
-        #   공유 사실이 두 값을 동시에 주장하면 재도출 금지의 의미가 없어진다.
+        # ★ The same routine is **replaced.** Measured 09-14: the overnight run wrote "two arms" and
+        #   the watcher re-derived "three"; with append alone **the stale version is read alongside it** —
+        #   a shared fact asserting two values at once defeats the point of forbidding re-derivation.
         D["facts"] = [x for x in D["facts"] if x.get("routine") != str(routine)[:200]]
         D["facts"].append({
             "routine": str(routine)[:200], "arm": str(arm or "")[:200],
@@ -6088,27 +6107,27 @@ def osfact_render(n=6, compact=False):
         return ""
     if not facts:
         return ""
-    L = ["**OS 경로 사실 (표적 무관 · 공유)** — 재도출 금지:"]
+    L = ["**OS path facts (target-independent · shared)** — do not re-derive:"]
     for r in facts[-int(n):]:
         _ib = (" [%s %s]" % (r.get("image"), r.get("build"))).replace(" ]", "]") \
             if r.get("image") else ""
         L.append("- `%s` %s%s" % (r.get("routine"), r.get("arm") or "", _ib))
         if not compact:
             if r.get("validated"):
-                L.append("    검증함: %s" % str(r["validated"])[:180])
+                L.append("    validated: %s" % str(r["validated"])[:180])
             if r.get("omitted"):
-                L.append("    **생략함: %s**" % str(r["omitted"])[:180])
+                L.append("    **omitted: %s**" % str(r["omitted"])[:180])
             if r.get("applies_to"):
-                L.append("    적용 대상: %s" % str(r["applies_to"])[:180])
+                L.append("    applies to: %s" % str(r["applies_to"])[:180])
     return "\n".join(L)
 
 def seed_goal(text, kind="judge", by="operator"):
-    """**운영자가 박는 목표.** 에이전트는 이걸 덮어쓸 수 없다.
+    """**A goal the operator sets.** The agent cannot overwrite it.
 
-    ★ 2026-09-02 사고: 목표를 에이전트가 선언하게 했더니 `kind='measure'` 목표를 등록한 뒤
-      같은 회차에서 `kind='judge'` 로 **덮어쓰고** 판정 1건으로 종료 조건을 만족시켰다.
-      실측은 0건이었다 — 시킨 일이 그거였는데. 자기 시험 문제를 자기가 내는 구조였다.
-    ⇒ 목표는 운영자가 박는다. **다만 달성 후 자율 헌팅은 막지 않는다** — 게이트는 미달일 때만 운다.
+    ★ The 2026-09-02 incident: when the agent was allowed to declare the goal, it registered a `kind='measure'` goal and then,
+      in the same round, **overwrote** it with `kind='judge'` and satisfied the finish condition with a single verdict.
+      Measurements: zero — when that was exactly the job. It was setting its own exam questions.
+    => the operator sets the goal. **Autonomous hunting after the goal is met is not blocked** — the gate only fires while it is unmet.
     """
     STATE["goal"] = {"text": (text or "")[:400], "kind": kind, "by": by,
                      "at": {"verdicts": len(STATE.get("verdicts") or []),
@@ -6116,60 +6135,60 @@ def seed_goal(text, kind="judge", by="operator"):
                             "tracks": {n: t.get("stage", 0)
                                        for n, t in (STATE.get("tracks") or {}).items()}},
                      "t": time.strftime("%m-%d %H:%M")}
-    # ★ 2026-09-05 — **집행 불가능한 목표를 조용히 넘기지 않는다.**
-    #   `judge`/`both` 목표의 축 검사는 목표문에서 VA 를 뽑아낼 때만 작동한다(_goal_unmet).
-    #   실측: 내가 쓴 목표문이 `+0x56`/`+0x57`(필드 오프셋)만 담고 **완전한 VA 가 없어서**
-    #   검사가 no-op 이 됐고, 회차는 그 축을 한 건도 안 건드린 채 13건으로 통과했다.
-    #   게이트가 안 도는 것보다 나쁜 건 **안 도는 줄 모르는 것**이다. 설치 시점에 말한다.
+    # ★ 2026-09-05 — **an unenforceable goal is not let through silently.**
+    #   The axis check of a `judge`/`both` goal works only when a VA can be pulled out of the goal text (_goal_unmet).
+    #   Measured: a goal text I wrote held only `+0x56`/`+0x57` (field offsets) and **no complete VA**,
+    #   so the check became a no-op and the round passed with 13 verdicts without touching that axis once.
+    #   Worse than a gate not running is **not knowing it is not running.** It speaks up at install time.
     STATE["goal"]["enforceable"] = bool(
         kind.startswith("track:") or re.search(r'0x1[0-9a-fA-F]{6,15}', text or ""))
-    # ★ 2026-09-05 — **목표가 결론을 처방하지 않는가.** (C-030 원인2)
-    #   실측: 내가 쓴 목표가 "막고 있는 것은 **하나뿐이다** … 아니면 `delta_zero` 로 닫아라"
-    #   였고, 분석가는 그대로 실행했다 ("I could not name it. Closed delta_zero.").
-    #   그건 승격자 맨데이트("델타 0을 종착지로 받지 않는다")와 **정면 모순**인데, 그날
-    #   승격자가 꺼져 있어 중재할 것이 없었다. 같은 자리에서 사람이 던진 **열린 질문**
-    #   ("진짜 0이 맞아?")은 재도출을 강제해 신규 후보를 냈다.
+    # ★ 2026-09-05 — **does the goal prescribe a conclusion?** (C-030 cause 2)
+    #   Measured: a goal I wrote said "there is **only one thing** blocking it … otherwise close it as `delta_zero`",
+    #   and the analyst carried it out to the letter ("I could not name it. Closed delta_zero.").
+    #   That **directly contradicts** the promoter's mandate ("a zero delta is not accepted as a destination"),
+    #   but the promoter was off that day, so nothing was there to arbitrate. At the same spot, an **open question**
+    #   a human asked ("is it really zero?") forced re-derivation and produced new candidates.
     #
-    #   ★ 거부하지 않는다 — 목표는 운영자의 것이고 알고도 쓸 수 있어야 한다. 다만
-    #     **목표는 이 판에서 유일하게 어떤 적대자도 검사하지 않는 입력**이라(게이트는 거절이
-    #     로그에 남지만 목표는 탐색 공간을 소리 없이 자른다) 설치 시점에 소리를 낸다.
+    #   ★ It does not refuse — the goal belongs to the operator, who must be able to write one knowingly. But
+    #     **the goal is the one input on this board that no adversary checks** (a gate's refusal is
+    #     logged, while a goal silently cuts the search space), so it makes a noise at install time.
     _t = text or ""
     _bad = []
     for _k in _REJECT_KLASS:
         if _k in _t:
-            _bad.append("종착 klass `%s` 를 목표가 지정한다 — 분석가에게 출구를 주는 것이다" % _k)
+            _bad.append("the goal names the terminal klass `%s` — that hands the analyst an exit" % _k)
             break
-    if re.search(r'하나뿐|뿐이다|only one blocker|the only thing blocking', _t, re.I):
-        _bad.append("단일 블로커 단정('하나뿐') — 다른 채널을 안 보게 만든다. "
-                    "S46 이 정확히 이렇게 죽었다")
-    if re.search(r'아니면\s*[`\'"]?\w+[`\'"]?\s*(으로|로)\s*닫|or close|otherwise close', _t, re.I):
-        _bad.append("'못 하면 …로 닫아라' 형태 — 종료를 허가한다. 질문만 써라")
+    if re.search(r'only one blocker|the only thing blocking', _t, re.I):
+        _bad.append("asserts a single blocker ('only one') — it stops the other channels being looked at. "
+                    "S46 died exactly this way")
+    if re.search(r'or close|otherwise close', _t, re.I):
+        _bad.append("the 'if you can't, close it as …' shape — it licenses finishing. Write only questions")
     STATE["goal"]["prescriptive"] = _bad
     save()
     if _bad:
         return dict(STATE["goal"], _warn=(
-            "⚠ 이 목표는 **결론을 처방한다**. 분석가는 그 출구로 나간다(2026-09-05 실측: S46).\n"
+            "⚠ This goal **prescribes a conclusion.** The analyst leaves through that exit (measured 2026-09-05: S46).\n"
             + "\n".join("  · " + b for b in _bad)
-            + "\n  고치려면: 목표에는 **질문만** 쓴다. 열린 질문은 재도출을 강제하고, "
-              "닫힌 처방은 종료를 허가한다."))
+            + "\n  To fix it: write **only questions** in a goal. An open question forces re-derivation, "
+              "a closed prescription licenses finishing."))
     if not STATE["goal"]["enforceable"]:
         return dict(STATE["goal"], _warn=(
-            "⚠ 이 목표는 **집행되지 않는다**. kind='%s' 의 축 검사는 목표문에 **완전한 VA**"
-            "(0x1........)가 있을 때만 작동하는데 하나도 없다. 지금 상태로는 '판정이 하나라도 "
-            "늘었나'만 본다 — 전혀 다른 축의 판정으로도 닫힌다(2026-09-05 실측).\n"
-            "  고치려면: 목표문에 그 축의 앵커를 하나 넣거나, kind='track:<이름>' 을 써라." % kind))
+            "⚠ This goal **is not enforced.** The axis check for kind='%s' works only when the goal text holds a **complete VA**"
+            " (0x1........), and it holds none. As it stands it only checks 'did the verdict count go up at all' — "
+            "a verdict on an entirely different axis closes it too (measured 2026-09-05).\n"
+            "  To fix it: put one anchor of that axis in the goal text, or use kind='track:<name>'." % kind))
     return STATE["goal"]
 
 
 def set_goal(text, kind="judge"):
-    """이 회차의 **목표 한 줄**. 종료 게이트가 이걸 본다.
+    """This round's **one-line goal.** The finish gate looks at it.
 
-    ★ 2026-09-02 사고: cap 120분 회차가 **19분에 정상 종료**했다. 한도도 오류도 아니었고,
-      처리율이 이미 100%(표 467행이 거의 전부 '사유 붙은 blocked')라 종료 게이트가 통과시켰다.
-      시드가 시킨 과제(RW 뷰 실측)는 **어떤 게이트도 검사하지 않으니** 에이전트에게는 선택
-      사항이었고, 표 정리가 종료로 가는 최단 경로였다. 판정률은 1% 였다.
-      ⇒ 회차 목표를 게이트가 알아야 한다.
-    kind: judge(판정 1건 이상) · measure(실측 1건 이상) · both
+    ★ The 2026-09-02 incident: a round capped at 120 minutes **finished normally at 19 minutes.** It was neither a limit nor an error —
+      the processed rate was already 100% (nearly all 467 table rows were 'blocked with a reason'), so the finish gate let it through.
+      The task the seed gave (measuring the RW view) **was checked by no gate**, so it was optional for the
+      agent, and tidying the table was the shortest path to finishing. The verdict rate was 1%.
+      => the gate has to know the round's goal.
+    kind: judge (at least 1 verdict) · measure (at least 1 measurement) · both
     """
     cur = STATE.get("goal") or {}
     if cur.get("by") == "operator":
@@ -6183,12 +6202,12 @@ def set_goal(text, kind="judge"):
                    else "  now: MET — you are free from here"))
     if not (text or "").strip():
         return "`goal` requires text=. An empty goal makes the finish gate meaningless."
-    # ★ 2026-09-04 밤: 에이전트가 지휘자 목표를 **"한 일의 요약"으로 덮어썼다.**
+    # ★ The night of 2026-09-04: the agent **overwrote the conductor's goal with "a summary of what it did."**
     #   (`SESSION GOAL, restated to what was actually achieved…`)
-    #   종료 게이트는 안 뚫렸다 — `at` 이 현재 카운트로 재설정돼 델타 요구가 살아 있었다.
-    #   하지만 **지휘자가 내린 지시가 기록에서 사라진다.** 다음 회차 digest 는 지시가 있어야 할
-    #   자리에서 완료 보고를 읽게 된다. 정책은 안 바꾼다(지휘자 목표는 설계상 교체 가능) —
-    #   대신 **덮인 목표를 보존**해서 무엇이 무엇으로 바뀌었는지 감사 가능하게 한다.
+    #   The finish gate held — `at` was reset to the current counts, so the delta requirement stayed alive.
+    #   But **the conductor's instruction vanishes from the record.** The next round's digest reads a completion
+    #   report where the instruction should be. The policy is not changed (a conductor goal is replaceable by design) —
+    #   instead **the overwritten goal is preserved**, so what changed into what can be audited.
     _old = STATE.get("goal")
     if _old and (_old.get("text") or "") != (text or ""):
         STATE.setdefault("goal_history", []).append(
@@ -6215,7 +6234,7 @@ def _goal_unmet():
     kind = g.get("kind") or "judge"
     need = []
     if kind.startswith("track:"):
-        # ★ 목표가 "트랙 X 를 한 단계 올려라" 일 때. 판정 수가 아니라 **진도**를 본다.
+        # ★ When the goal is "move track X up one stage". It looks at **progress**, not the verdict count.
         nm = kind.split(":", 1)[1].strip()
         tr = (STATE.get("tracks") or {}).get(nm) or {}
         cur = tr.get("stage", 0)
@@ -6226,15 +6245,15 @@ def _goal_unmet():
                         % (nm, was, len(names), names[was] if was < len(names) else "done"))
     if kind in ("judge", "both") and dv <= 0:
         need.append("zero verdicts")
-    # ★ 2026-09-05 — **`judge` 목표는 축을 안 본다.** `track:` 목표는 그 트랙의 단계 이동을
-    #   요구하는데, `judge` 는 `dv > 0`(판정이 하나라도 늘었나)만 본다. 그래서 특정 축을
-    #   지목한 judge 목표를 **전혀 다른 축의 판정 10건으로** 만족시킬 수 있다.
-    #   실측 2026-09-05: ahcache(kind=track:) 회차는 게이트가 4번 막아 목표를 답하게 했고
-    #   (`gate_denials: 4`), 같은 밤 msquic(kind=judge) 회차는 CidLen 캡 축을 **한 건도**
-    #   건드리지 않고 다른 축 10건으로 통과했다(`gate_denials: 0`).
-    #   ⇒ 목표문이 **주소를 지목하면** 그 주소가 이번 회차 판정에 인용됐는지 본다.
-    #     접지는 A형이다(앵커는 재표현을 견디는 유일한 키 — 이 저장소의 기존 원칙).
-    #     주소가 없는 목표문이면 아무것도 요구하지 않는다(억지 게이트를 만들지 않는다).
+    # ★ 2026-09-05 — **a `judge` goal does not look at the axis.** A `track:` goal requires that track's
+    #   stage to move, but `judge` only looks at `dv > 0` (did the verdict count go up at all). So a judge goal
+    #   naming a specific axis can be satisfied by **10 verdicts on an entirely different axis.**
+    #   Measured 2026-09-05: the ahcache (kind=track:) round had the gate block it 4 times until it answered the goal
+    #   (`gate_denials: 4`), while the msquic (kind=judge) round the same night passed with 10 verdicts on other
+    #   axes without touching the CidLen cap axis **even once** (`gate_denials: 0`).
+    #   => when the goal text **names an address**, check whether that address is cited in this round's verdicts.
+    #     The grounding is type A (an anchor is the only key that survives rephrasing — this repository's existing principle).
+    #     A goal text with no address requires nothing (no forced gate is invented).
     if kind in ("judge", "both", "measure") and dv > 0:
         _gvas = set(re.findall(r'0x1[0-9a-fA-F]{6,15}', str(g.get("text") or "")))
         if _gvas:
@@ -6261,24 +6280,24 @@ def _goal_unmet():
 
 
 def session_products():
-    """★ **이번 회차가 만든 산출물.** 종료 조건의 정의다.
+    """★ **What this round produced.** This is the definition of the finish condition.
 
-    산출물 = **적대자가 승복한 판정**. 두 형태뿐이고 둘 다 대등하다:
-      · 확정인데 반박자가 **못 죽였다**            → 결함 후보
-      · 기각인데 심문자가 **못 깼다**              → 검증된 음성
+    A product = **a verdict an adversary conceded.** There are only two shapes, and they are equal:
+      · a confirmation the refuter **could not kill**            → a defect candidate
+      · a rejection the interrogator **could not break**         → a verified negative
 
-    왜 이게 종료 조건인가 (2026-09-05 재설계):
-      옛 `can_finish` 의 요구 8개는 전부 정리(커버리지·처리율·reach·race·열린질문)였다.
-      즉 "표를 정돈했나"를 물었지 "무엇을 만들었나"를 묻지 않았다. 그래서 확정은
-      비싼 선택이고 기각은 싼 의무가 됐다 — 실측 9시간에 reject 170 : distinct confirm 1.
-      종료를 **산출물**에 걸면 확정이 정상 종료 경로가 되고, 기각은 목적지가 아니라
-      중간 상태가 된다. 깨끗한 표적이면 **심문자가 승복한 기각**이 정상 종료다.
+    Why this is the finish condition (redesigned 2026-09-05):
+      All eight requirements of the old `can_finish` were tidying (coverage, processed rate, reach, race, open questions).
+      That is, it asked "did you tidy the table", not "what did you produce". So confirming became
+      the expensive option and rejecting the cheap duty — measured over 9 hours: reject 170 : distinct confirm 1.
+      Tying finishing to **products** makes confirmation the normal finishing path, and rejection becomes an
+      intermediate state rather than a destination. On a clean target, **a rejection the interrogator conceded** is the normal finish.
 
-    ★ 소진(exhaust)은 여기 안 들어간다. 못 정한 것은 끝난 것이 아니다 —
-      그 경우 회차는 예산 한도로 잘리고 미완으로 기록되면 된다. 게이트가
-      **우아한 값싼 출구**를 줄 이유가 없다(그게 옛 '표 정리 후 조기 종료'였다).
+    ★ Exhaustion (exhaust) does not count here. What could not be decided is not finished —
+      in that case the round gets cut off by its budget limit and is recorded as unfinished. There is no reason
+      for the gate to offer **an elegant cheap exit** (that was the old 'finish early after tidying the table').
 
-    반환: (산출물 리스트, 이번 회차 판정 수)
+    Returns: (list of products, number of verdicts this round)
     """
     V = STATE.get("verdicts") or []
     base = int(_RUN.get("verdicts0") or 0)
@@ -6286,32 +6305,32 @@ def session_products():
     out = []
     for v in mine:
         st = v.get("status")
-        if st == "확정" and not (v.get("refute") or {}).get("refuted", False):
-            out.append(("확정", v.get("id"), "반박자를 통과했다"))
-        elif st == "기각" and v.get("interrogated") is True:
+        if st == "confirmed" and not (v.get("refute") or {}).get("refuted", False):
+            out.append(("confirmed", v.get("id"), "passed the refuter"))
+        elif st == "rejected" and v.get("interrogated") is True:
             _ig = v.get("interrogation") or {}
             if not _ig.get("broke"):
-                out.append(("검증된 음성", v.get("id"), "심문자가 못 깼다"))
+                out.append(("verified-negative", v.get("id"), "the interrogator could not break it"))
     return out, len(mine)
 
 
 def unsettled_axes():
-    """이번 회차가 **열어놓고 안 닫은 축** 중 열린 질문이 하나도 없는 것.
+    """The axes this round **opened and did not close** that have no open question at all.
 
-    ★ 왜 (2026-09-05, ablation 실측):
-      같은 조건의 두 팔이 갈렸다. `armC` 는 목표 축을 못 닫았지만 **열린 질문 3개**를 남겼고
-      (`SdbpResolveMatchingFile → AslPathToNetworkPathNt → …` 등 사슬 전체가 주소째로),
-      `armA` 는 같은 축을 `impact_unproven` 으로 남기고 **노트 0 · 질문 0** 으로 끝냈다.
-      즉 armA 는 "다음 세션에 넘겼다"가 아니라 **넘길 손잡이를 안 만들었다.**
+    ★ Why (2026-09-05, measured by ablation):
+      Two arms under the same conditions diverged. `armC` could not close the goal axis but left **3 open questions**
+      (the whole chain, `SdbpResolveMatchingFile → AslPathToNetworkPathNt → …` and so on, addresses included),
+      while `armA` left the same axis as `impact_unproven` and finished with **0 notes · 0 questions.**
+      So armA did not "hand it to the next session" — **it never made a handle to hand over.**
 
-    ★ 이건 "목표 축을 파라"는 처방이 **아니다.** 어느 축을 파든 상관없다 —
-      **연 것을 열린 채로 적어라**만 요구한다. 목표 축 강제는 `reports/corrections.md`
-      C-030/C-032 가 결함으로 기록한 바로 그 처방이므로 쓰지 않는다.
+    ★ This is **not** a prescription to "dig the goal axis." Which axis you dig does not matter —
+      it only requires **writing down what you opened, as still open.** Forcing the goal axis is exactly the
+      prescription `reports/corrections.md` C-030/C-032 recorded as a defect, so it is not used.
 
-    ★ 접지: 판정의 앵커 주소 ∩ 열린 질문의 앵커 주소 (A형). 다만 **요구 자체는 절차 강제**다
-      — 질문을 쓴다고 그 축이 실제로 열려 있음이 증명되지는 않는다(memory `grounding-decides-gate`).
+    ★ Grounding: the verdict's anchor addresses ∩ the open questions' anchor addresses (type A). But **the requirement itself is procedural**
+      — writing a question does not prove the axis is actually open (memory `grounding-decides-gate`).
 
-    반환: [(판정 id, 그 축의 앵커 표본)] — 비어 있으면 통과.
+    Returns: [(verdict id, a sample of that axis's anchors)] — empty means pass.
     """
     V = STATE.get("verdicts") or []
     base = int(_RUN.get("verdicts0") or 0)
@@ -6319,12 +6338,12 @@ def unsettled_axes():
         prod = {p[1] for p in (session_products()[0] or [])}
     except Exception:
         prod = set()
-    # ★ 손잡이로 인정하는 것 둘 (실측 근거):
-    #   (a) 열린 질문 — armC 의 RQ120~122 가 그것이고, **하네스가 자동 생성했다**
-    #       ("반박자가 죽인 확정 …" + `method`). 즉 확정을 시도했다가 죽으면 공짜로 생긴다.
-    #   (b) 사유가 붙은 BLOCKED 표면 행 — C-034 가 보인 대로 그 사유란에 다음 한 걸음이 있다.
-    #   분석가가 직접 만들 수 있는 것은 (b) 이고(`verdict(action='blocked', reason=…)`),
-    #   (a) 는 확정을 밀다가 지면 따라온다. 둘 다 "다음 회차가 집을 것"이라 대등하게 센다.
+    # ★ Two things count as a handle (grounds from measurement):
+    #   (a) an open question — armC's RQ120~122 were exactly that, and **the harness generated them automatically**
+    #       ("confirmation killed by the refuter …" + `method`). So they come free when a confirmation is tried and dies.
+    #   (b) a BLOCKED surface row with a reason — as C-034 showed, the next step sits in that reason field.
+    #   What the analyst can make directly is (b) (`verdict(action='blocked', reason=…)`), and
+    #   (a) follows from pushing a confirmation and losing. Both are "what the next round picks up", so they count equally.
     _a0 = _RUN.get("asks0") or set()
     _s0 = _RUN.get("surface0") or set()
     ask_va = set()
@@ -6341,27 +6360,27 @@ def unsettled_axes():
     out = []
     for v in V[base:]:
         if v.get("id") in prod:
-            continue                      # 산물 = 적대자가 승복함 = 닫힌 것
+            continue                      # a product = an adversary conceded = closed
         blob = " ".join(str(v.get(k) or "") for k in ("evidence", "target", "claim"))
         va = set(x.lower() for x in re.findall(r'0x[0-9a-fA-F]{6,16}', blob))
         if not va:
-            continue                      # 앵커가 없으면 축을 특정할 수 없다 — 다른 게이트의 일
+            continue                      # with no anchor the axis cannot be pinned down — another gate's job
         if not (va & ask_va):
             out.append((v.get("id"), sorted(va)[:6]))
     return out
 
 
 def can_finish():
-    """끝내도 되는가. 안 되면 사유 목록. '조용한 성공'을 막는 게이트."""
+    """May it finish? If not, a list of reasons. The gate that prevents 'quiet success'."""
     bad = []
-    # ★ 2026-09-05 — 종료 조건이 **정리에서 산출물로** 바뀌었다. 자세한 근거는 session_products().
+    # ★ 2026-09-05 — the finish condition moved **from tidying to products.** The full grounds are in session_products().
     if getattr(config, "FINISH_ON_PRODUCT", True):
         _prod, _n = session_products()
         if not _prod:
             _conf = sum(1 for v in (STATE.get("verdicts") or [])[int(_RUN.get("verdicts0") or 0):]
-                        if v.get("status") == "확정")
+                        if v.get("status") == "confirmed")
             _rej = sum(1 for v in (STATE.get("verdicts") or [])[int(_RUN.get("verdicts0") or 0):]
-                       if v.get("status") == "기각")
+                       if v.get("status") == "rejected")
             bad.append(
                 "NOTHING SURVIVED AN ADVERSARY THIS SESSION. The session ends on a PRODUCT, "
                 "not on a tidy table.\n"
@@ -6375,10 +6394,10 @@ def can_finish():
                 "interrogator try to break it. Bring the evidence that beats them.\n"
                 "  METHOD EXHAUSTED IS NOT AN ENDING — an unsettled row is not a product." 
                 % (_n, _conf, _rej))
-    # ★ 2026-09-05 — **연 것을 열린 채로 적어라.** 산물로 닫지 못한 축에 열린 질문이
-    #   하나도 없으면 그 축은 조용히 버려진다(실측: armA — 목표 축을 impact_unproven 으로
-    #   남기고 노트 0·질문 0 으로 종료). 어느 축을 파라고 지시하지 않는다 — 다만 다음
-    #   회차가 집을 손잡이를 만들게 한다. → unsettled_axes() 독스트링
+    # ★ 2026-09-05 — **write down what you opened, as still open.** If an axis not closed by a product has
+    #   no open question at all, that axis is silently abandoned (measured: armA — left the goal axis as impact_unproven
+    #   and finished with 0 notes · 0 questions). It does not direct which axis to dig — it only makes the next
+    #   round get a handle to pick up. → the unsettled_axes() docstring
     if getattr(config, "FINISH_ON_PRODUCT", True):
         _un = unsettled_axes()
         if _un:
@@ -6401,10 +6420,10 @@ def can_finish():
     _gu = _goal_unmet()
     if _gu:
         bad.append(_gu)
-    # ★ 2026-09-05 — 아래 정리(housekeeping) 항목들은 **차단이 아니라 자문**으로 내린다.
-    #   근거: 옛 요구 8개가 전부 정리라 "표를 정돈했나"만 물었고, 그래서 확정이 선택이 됐다.
-    #   값은 여전히 계산·보고한다 — 소비자는 분석가가 아니라 **지휘자**다(다음 목표를 정한다).
-    #   FINISH_ON_PRODUCT 가 꺼져 있으면 옛 동작(전부 차단) 그대로다.
+    # ★ 2026-09-05 — the housekeeping items below are issued **as advice, not as blocks.**
+    #   Grounds: all eight old requirements were tidying, asking only "did you tidy the table", and so confirming became optional.
+    #   The values are still computed and reported — their consumer is not the analyst but **the conductor** (it sets the next goal).
+    #   With FINISH_ON_PRODUCT off, the old behaviour (block on all of them) stays as it was.
     _adv = [] if getattr(config, "FINISH_ON_PRODUCT", True) else bad
     pct, done, tot = coverage()
     spct, sdone, _ = settled()
@@ -6456,53 +6475,53 @@ def can_finish():
         bad.append("Zero verdicts. Even with no confirmations, YOU MUST LEAVE REJECTIONS AND "
                    "BLOCKED ROWS for coverage to mean anything.")
     weak = [v["id"] for v in STATE["verdicts"]
-            if v["status"] in ("확정", "경계보류") and not v.get("anchors")]
+            if v["status"] in ("confirmed", "boundary-held") and not v.get("anchors")]
     if weak:
         bad.append(f"Confirmations whose anchors were never machine-verified: "
                    f"{', '.join(weak)}. A confirmation without citations is INFERRED.")
-    # ★ 2026-09-05 — 자문 항목은 **분석가를 막지 않고 지휘자에게 간다.**
-    #   분석가를 정리 노동으로 모는 것이 옛 구조의 병목이었다. 값은 계속 계산하되
-    #   소비자를 바꾼다: 커버리지·reach·race·열린질문은 **다음 목표를 정하는 재료**다.
+    # ★ 2026-09-05 — the advice items **do not block the analyst; they go to the conductor.**
+    #   Driving the analyst into tidying labour was the bottleneck of the old structure. The values are still computed,
+    #   but the consumer changes: coverage, reach, race and open questions are **material for setting the next goal.**
     if getattr(config, "FINISH_ON_PRODUCT", True):
         STATE["housekeeping"] = _adv
         save()
     return bad
 
 
-# ── 6) 상태 블록 ──────────────────────────────────────────────
-# ── status_block 델타 ────────────────────────────────────────
-# ★ 왜: 이 블록은 툴 4회마다 + 모든 verdict 뒤에 `additionalContext` 로 주입된다.
-#   API 는 무상태라 한 번 들어간 것은 **그 뒤 모든 턴의 요청에 다시 실린다.**
-#   실측(09-04 wcifs, 165턴): 블록 1332자 × 약 45회 주입 × 평균 잔여 82턴
-#   ≈ 220만 토큰 재읽기. 그 회차의 cache_read 28.4M 중 약 8%.
-#   그런데 그 1332자의 대부분(미분석 목록·묘지)은 **회차 내내 거의 안 변한다.**
+# ── 6) the status block ──────────────────────────────────────────────
+# ── status_block delta ────────────────────────────────────────
+# ★ Why: this block is injected as `additionalContext` every 4 tool calls + after every verdict.
+#   The API is stateless, so whatever goes in once **is carried again in the request of every later turn.**
+#   Measured (09-04 wcifs, 165 turns): a 1332-char block × about 45 injections × 82 remaining turns on average
+#   ≈ 2.2M tokens of re-reading. About 8% of that round's 28.4M cache_read.
+#   Yet most of those 1332 chars (the unanalysed list, the graveyard) **barely change over the whole round.**
 #
-# ★★ 단, 접으면 안 되는 것이 있다. **"무엇을 이미 해봤는가"** 다.
-#   그게 사라지면 다음 턴의 분석가가 같은 방법을 다시 쓴다 — 원장이 `attempts` 를
-#   세는 이유가 통째로 무의미해진다. 실측으로 같은 질문에 4~5회 부딪힌 것이
-#   ahcache 6건 · wcifs 8건이고, 판결자를 만든 이유가 그 루프다.
-#   ⇒ 변동 없는 큰 덩어리는 접고, **시도 이력은 항상 싣는다.** 순증이 아니라 교환이다.
+# ★★ But one thing must never be folded: **"what has already been tried."**
+#   Without it the next turn's analyst uses the same method again — the whole reason the ledger
+#   counts `attempts` becomes meaningless. Measured: hitting the same question 4–5 times happened
+#   6 times in ahcache · 8 times in wcifs, and that loop is why the adjudicator was built.
+#   => unchanged big chunks are folded, and **the attempt history is always carried.** Not a net increase but a trade.
 _SB = {"digest": None}
 
 
 def status_reset(why=""):
-    """델타 캐시를 비운다 — 다음 블록은 **전문**이 나간다.
+    """Empty the delta cache — the next block goes out **in full.**
 
-    ★ 압축(PreCompact) 직후에는 반드시 불러야 한다. 모델이 앞 블록을 잃었는데
-      '변동 없음' 한 줄만 주면 그 회차는 상태를 영영 못 본다.
+    ★ It must be called right after compaction (PreCompact). If the model has lost the previous block
+      and gets only a one-line 'unchanged', that round never sees the state again.
     """
     _SB["digest"] = None
     return why
 
 
 def _tried_line():
-    """★ 절대 접지 않는 부분 — 무엇을 이미 시도했고 무엇이 닫혔는가."""
+    """★ The part that is never folded — what has already been tried and what has been closed."""
     out = []
     qs = [q for q in (STATE.get("asks") or []) if (q.get("attempts") or [])
           or (q.get("status") or "open").lower() in ("exhausted", "answered")]
     qs.sort(key=lambda q: -len(q.get("attempts") or []))
     if qs:
-        mark = {"exhausted": "소진", "answered": "★답함"}
+        mark = {"exhausted": "exhausted", "answered": "★answered"}
         bits = ["[%s]%s×%d%s" % (str(q.get("id"))[:16],
                                  (":" + str(q.get("cfg") or q.get("klass"))[:18])
                                  if (q.get("cfg") or q.get("klass")) else "",
@@ -6510,11 +6529,11 @@ def _tried_line():
                                  "·" + mark[(q.get("status") or "").lower()]
                                  if (q.get("status") or "").lower() in mark else "")
                 for q in qs[:6]]
-        out.append("  ★ 이미 시도함(같은 방법을 또 쓰지 마라): " + " · ".join(bits)
-                   + (" …외 %d" % (len(qs) - 6) if len(qs) > 6 else ""))
+        out.append("  ★ already tried (do not use the same method again): " + " · ".join(bits)
+                   + (" …and %d more" % (len(qs) - 6) if len(qs) > 6 else ""))
     adj = STATE.get("adjudications") or []
     if adj:
-        out.append("  ⚖ 판결자가 닫은 행 %d건 — 다시 논쟁하지 마라 (%s)"
+        out.append("  ⚖ %d rows closed by the adjudicator — do not argue them again (%s)"
                    % (len(adj), ", ".join(str(a.get("target"))[:22] for a in adj[-3:])))
     return out
 
@@ -6522,24 +6541,24 @@ def _tried_line():
 def status_block(i, total):
     parts = []
     if i and total:
-        parts.append(f"[state] tool {i}/{total} · 남은 예산 {total - i}")
+        parts.append(f"[state] tool {i}/{total} · budget left {total - i}")
     pct, done, tot = coverage()
     if tot:
-        parts.append(f"  커버리지 {done}/{tot} ({pct*100:.0f}%)")
+        parts.append(f"  coverage {done}/{tot} ({pct*100:.0f}%)")
         un = unaudited()
         if un:
             _shape = unaudited_shape()
             _n = sum(_shape.values())
-            parts.append("  미분석 %d행 — 도달성 구성: %s"
+            parts.append("  %d rows unanalysed — reachability mix: %s"
                          % (_n, " · ".join("%s %d" % (k, v)
                                            for k, v in _shape.most_common(4))))
-            parts.append("  이번 표본(회전 중, %d행 전체를 순회한다): " % _n + " / ".join(un))
+            parts.append("  this sample (rotating; it walks all %d rows): " % _n + " / ".join(un))
     else:
         parts.append("WARNING: the enumeration table is empty. Register the ingress first with "
                      "surface(action='add').")
 
-    # 예산을 40% 넘게 쓰고도 판정이 0건이면 그 자체가 이탈이다.
-    # (실사례: clfs 61턴 · $9.87 · 원장 판정 0건 — 발견은 note 에만 남고 커버리지 0%)
+    # Spending more than 40% of the budget with zero verdicts is a deviation in itself.
+    # (A real case: clfs, 61 turns · $9.87 · zero verdicts in the ledger — findings left only in note, coverage 0%)
     if i and total and not STATE["verdicts"] and i >= total * 0.4:
         parts.append(
             "  BUDGET: %d/%d of budget spent with ZERO verdicts. note() is not a verdict.\n"
@@ -6548,16 +6567,16 @@ def status_block(i, total):
             "     A rejection IS a verdict - record 'the guard is real, the candidate died' "
             "with basis='decompile'." % (i, total))
 
-    conf = [v for v in STATE["verdicts"] if v["status"] == "확정"]
+    conf = [v for v in STATE["verdicts"] if v["status"] == "confirmed"]
     if conf:
         weak = [v["id"] for v in conf if BASIS_RANK.get(v["basis"], 0) < 3]
-        parts.append(f"  확정 {len(conf)}건" + (f" (근거 약함: {', '.join(weak)})" if weak else ""))
-    # ★ 2026-09-05 — **계기판이 "안 한 것"만 보여줬다.**
-    #   실측(밤샘 9시간): 매 4툴호출마다 주입되는 이 블록이 커버리지 2% · 미분석 544행 ·
-    #   회전 표본 8행 · 묘지 6건 · 실패이력 101건을 보여주는데, **"거의 다 된 것"은 한 줄도 없었다.**
-    #   결과: 판정 134건 중 `reject` 170 : `confirm` 4(그마저 같은 후보 재시도라 **distinct 1건**).
-    #   그동안 wcifs 에는 4/5 트랙이 셋, ahcache 에 하나가 **손도 안 닿은 채** 있었다.
-    #   ⇒ 남은 사다리가 1~2칸인 트랙을 **매 턴 보여준다.** 할당량이 아니라 **가시성**이다.
+        parts.append(f"  {len(conf)} confirmed" + (f" (weak grounds: {', '.join(weak)})" if weak else ""))
+    # ★ 2026-09-05 — **the dashboard showed only "what has not been done."**
+    #   Measured (a 9-hour overnight run): this block, injected every 4 tool calls, showed 2% coverage · 544 unanalysed rows ·
+    #   8 rotating sample rows · 6 graveyard entries · 101 failure-history entries, and **not one line of "nearly done."**
+    #   Result: of 134 verdicts, `reject` 170 : `confirm` 4 (and even those were retries of the same candidate, so **1 distinct**).
+    #   Meanwhile wcifs had three tracks at 4/5, and ahcache had one, **left untouched.**
+    #   => tracks with 1–2 rungs left on the ladder are **shown every turn.** Not a quota but **visibility.**
     _near = []
     for _n, _t in (STATE.get("tracks") or {}).items():
         _st = _t.get("stage", 0); _names = _t.get("stages") or DEFAULT_STAGES
@@ -6566,60 +6585,60 @@ def status_block(i, total):
             _near.append((_left, _n, _names[_st] if _st < len(_names) else "?"))
     if _near:
         _near.sort()
-        parts.append("  ★ 사다리 끝이 가까운 트랙 %d개 — **다음 칸을 올려라**: %s"
-                     % (len(_near), " / ".join("`%s` %d칸 남음(다음: %s)" % (n, l, nx)
+        parts.append("  ★ %d tracks near the top of the ladder — **climb the next rung**: %s"
+                     % (len(_near), " / ".join("`%s` %d rungs left (next: %s)" % (n, l, nx)
                                                for l, n, nx in _near[:4])))
-    # ★ 재개로 **종결 주장이 상한** 트랙을 매 턴 보여준다. 노트는 "끝났고 음성"이라고
-    #   말하는데 그 축이 다시 열렸으면, 그 노트를 믿고 시작하는 다음 회차가 통째로 헛돈다.
+    # ★ Show every turn the tracks whose **closure claim went stale** through a reopen. If the note says
+    #   "done, negative" but that axis has been reopened, the next round that starts by trusting that note spins in vain entirely.
     _stale = [(n, t) for n, t in (STATE.get("tracks") or {}).items() if t.get("stale_closure")]
     if _stale:
-        parts.append("  ⚠ 종결 주장이 **상한** 트랙 %d개 — 노트는 '끝났다'는데 그 축이 재개됐다: %s"
+        parts.append("  ⚠ %d tracks whose closure claim **went stale** — the note says 'done' but the axis was reopened: %s"
                      % (len(_stale),
-                        " / ".join("`%s`(재개 %d회: %s)"
+                        " / ".join("`%s`(reopened %d times: %s)"
                                    % (n, len(t["stale_closure"]),
                                       ", ".join(str(x.get("by"))[:28] for x in t["stale_closure"][:2]))
                                    for n, t in _stale[:3])))
-    # ★ 2026-09-05 (C-037) — **저수지를 매 턴 보이게 한다.** C-034 가 잰 격차의 자리다:
-    #   하네스가 결함까지 한 질문 남기고 규율상 옳게 멈춘 행 넷이 `BLOCKED` 로 있었는데,
-    #   BLOCKED 는 커버리지에서 정당하게 빠지고 worklist 에서도 내려가므로 **아무도 안 돌아갔다.**
-    #   순위를 매기지 않는다(산문에서 '다음 수가 있는가'는 판별 불가 — 측정됨). **크기만 말한다.**
+    # ★ 2026-09-05 (C-037) — **make the reservoir visible every turn.** This is where the gap C-034 measured sits:
+    #   four rows the harness had stopped at, correctly by the discipline, one question short of a defect sat as `BLOCKED`,
+    #   and since BLOCKED rightly drops out of coverage and also sinks in the worklist, **nobody went back to them.**
+    #   No ranking (whether prose 'has a next step' cannot be decided — that was measured). **It states only the size.**
     _bl = [r for r in (STATE.get("surface") or {}).values()
            if r.get("blocked") and not r.get("exhausted")
            and not _is_alias_row(r.get("why"))]
     if _bl:
         _wn = sum(1 for r in _bl if isinstance(r.get("next"), dict))
-        parts.append("  ★ blocked 저수지 %d행 — 다음 걸음이 **칸에 선언된 것은 %d행**. "
-                     "`verdict(action='unfinished')` 로 열거하라. 분석이 이미 일어났고 "
-                     "한 걸음 앞에서 멈춘 행들이다." % (len(_bl), _wn))
+        parts.append("  ★ blocked reservoir: %d rows — **%d of them declare** the next step in the field. "
+                     "List them with `verdict(action='unfinished')`. These are rows where the analysis already "
+                     "happened and stopped one step short." % (len(_bl), _wn))
     _prop = [c for c in (STATE.get("candidates") or []) if c.get("state") == "proposed"]
     if _prop:
-        parts.append("  ★ 반박자를 아직 안 거친 후보 %d건: %s"
+        parts.append("  ★ %d candidates not yet through the refuter: %s"
                      % (len(_prop), ", ".join(str(c.get("id")) for c in _prop[:6])))
     r = STATE["refutes"]
     if r["run"]:
-        parts.append(f"  반박 {r['run']}회 — 킬 {r['killed']} / 생존 {r['survived']}"
-                     + (f" / 실행실패 {r['failed']}" if r["failed"] else ""))
+        parts.append(f"  refutations {r['run']} — killed {r['killed']} / survived {r['survived']}"
+                     + (f" / run failures {r['failed']}" if r["failed"] else ""))
     if STATE["graveyard"]:
-        parts.append("  묘지(재개 금지): " + " / ".join(
+        parts.append("  graveyard (do not reopen): " + " / ".join(
             f"{g['id']}:{g['target']}[{g.get('klass') or '-'}]" for g in STATE["graveyard"][-6:]))
     miss = [k for k in ("positive", "negative", "swap") if not STATE["controls"].get(k)]
     if STATE["controls"] or miss != ["positive", "negative", "swap"]:
-        parts.append("  대조군 미확보: " + (", ".join(miss) if miss else "없음 (3종 완비)"))
+        parts.append("  controls missing: " + (", ".join(miss) if miss else "none (all 3 in place)"))
 
-    # ── 델타 ──────────────────────────────────────────────────
-    # 첫 줄(예산)은 매 호출 달라지므로 지문에서 뺀다 — 안 그러면 델타가 절대 안 걸린다.
-    # ★ 회전 표본도 같은 이유로 뺀다. 안 빼면 매 호출 본문이 달라져 **델타가 영영 안 걸린다**
-    #   (unaudited 회전을 넣자마자 실제로 그렇게 됐다). 표본은 접힌 블록에도 계속 싣는다 —
-    #   회차 안에서 표 전체를 훑는 것이 그 줄의 목적이라 접으면 목적이 사라진다.
+    # ── delta ──────────────────────────────────────────────────
+    # The first line (the budget) changes on every call, so it is left out of the fingerprint — otherwise the delta never triggers.
+    # ★ The rotating sample is left out for the same reason. Otherwise the body differs on every call and **the delta never triggers**
+    #   (that really happened as soon as the unaudited rotation went in). The sample is still carried in the folded block —
+    #   the point of that line is to sweep the whole table within a round, so folding it would defeat the point.
     body = [x for x in (parts[1:] if (i and total) else parts)
-            if not x.startswith("  이번 표본")]
-    sample = [x for x in parts if x.startswith("  이번 표본")]
+            if not x.startswith("  this sample")]
+    sample = [x for x in parts if x.startswith("  this sample")]
     dig = hashlib.sha1("\n".join(body).encode("utf-8")).hexdigest()
     tried = _tried_line()
     if body and _SB["digest"] == dig:
-        # 변동 없음 → 큰 덩어리는 접는다. 시도 이력은 **접지 않는다.**
+        # unchanged → fold the big chunks. The attempt history is **not folded.**
         head = parts[0] if (i and total) else ""
         return "\n".join(([head] if head else [])
-                         + ["  (표·확정·묘지·대조군 변동 없음)"] + sample + tried)
+                         + ["  (table · confirmations · graveyard · controls unchanged)"] + sample + tried)
     _SB["digest"] = dig
     return "\n".join(parts + tried)

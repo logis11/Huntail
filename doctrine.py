@@ -9,33 +9,39 @@
 #   (3) confirming from decompiler output alone -> recall the two-way decompiler errors
 #   (4) a negative conclusion -> interrogate whether a positive control exists
 #
-# The patterns match both English and Korean: an analyst's own notes are written
-# in whichever language, while the prompts and the ledger are English. Matching
-# only one half means the pressure silently stops applying to half the writing.
+# The patterns are English-only. They used to carry Korean alternations as well,
+# from when the analyst's notes were written in Korean; the harness is English
+# end to end now, so those branches could never fire. Where a Korean branch was
+# the only one covering a concept — a bare "there is no check", "probably" in the
+# guessing sense, "could not be reached" — the English side was widened to cover
+# it rather than losing the detection.
 import re
 
 STATE = {"flags": []}
 
 # (1) absence claims
 _ABSENCE = re.compile(
-    r"검사가?\s*(없|안)|검증이?\s*(없|안)|가드가?\s*없|무검사|"
     r"\bno\s+(bounds|length|access|auth|permission)\s+check|\bmissing\s+check|"
+    r"\bno\s+(check|guard|validation)\b|\bthere\s+is\s+no\s+check|"
+    r"\bunvalidated\b|\bno\s+bounds\b|"
     r"\bunchecked\b|\bwithout\s+(any\s+)?(check|validation)", re.I)
 
 # (2) hedges
 _HEDGE = re.compile(
-    r"~?일\s*것|~?로\s*보인|아마|추측|것\s*같다|듯\s*하다|가능성이\s*(높|있)|"
     r"\bprobably\b|\blikely\b|\bseems?\b|\bappears?\b|\bshould\s+be\b|"
+    r"\bpossibly\b|\bpresumably\b|\bapparently\b|\bI\s+(think|believe|suspect)\b|"
+    r"\bmy\s+guess\b|\bpresumed\b|\bsuggests?\s+that\b|"
     r"\bin\s+theory\b|\bmight\s+(be|work)\b", re.I)
 
 # (3) leaning on the decompiler
 _DECOMP_ONLY = re.compile(
-    r"디컴파일|decompil|Hex-?Rays|의사\s*코드|pseudo-?code", re.I)
+    r"decompil|Hex-?Rays|pseudo-?code|\bIDA\s+output\b", re.I)
 
 # (4) negative conclusions
 _NEGATIVE = re.compile(
-    r"재현되지\s*않|안\s*됨|실패했|막혀|차단됨|도달\s*(불가|안)|"
-    r"\bdid\s+not\b|\bblocked\b|\bfailed\b|\bnot\s+reproduc", re.I)
+    r"\bdid\s+not\b|\bblocked\b|\bfailed\b|\bnot\s+reproduc|"
+    r"\bunreachable\b|\b(not|never)\s+reach|\bcould\s+not\s+be\s+reached\b|"
+    r"\bdoes\s+not\s+work\b|\bno\s+effect\b", re.I)
 
 # AV/EDR blocked the probe and it never reached the ledger.
 #   In one measurement run, an AV product quarantined the dropped probe
@@ -45,8 +51,8 @@ _NEGATIVE = re.compile(
 #   "blocked, then bypassed" from "just worked".
 #   A block is itself a negative control result — it has to be recorded.
 _AVBLOCK = re.compile(
-    r"contains a virus|virus or potentially unwanted|바이러스|Real Protect|"
-    r"이 앱은 보호를 위해|McAfee|quarantin|격리|"
+    r"contains a virus|virus or potentially unwanted|Real Protect|McAfee|"
+    r"quarantin|\bthreat\s+(detected|found)\b|"
     r"blocked by (?:your )?(?:antivirus|AV|EDR|Defender)", re.I)
 _PIVOT = re.compile(r"Add-Type\s+-TypeDefinition|reflect(?:ively)?\s+(?:load|compile)|"
                     r"in-?memory\s+(?:compile|load)", re.I)

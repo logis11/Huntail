@@ -46,7 +46,7 @@ import time
 import deadrun
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIRMED = "확정"            # the ledger's confirmed status (see ledger.STATUS)
+CONFIRMED = "confirmed"            # the ledger's confirmed status (see ledger.STATUS)
 
 
 # ── validity ─────────────────────────────────────────────────────────────────

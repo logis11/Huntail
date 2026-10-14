@@ -79,14 +79,14 @@ ck("K<2 -> majority is None", one["majority"] is None)
 ck("K<2 -> the lone finding is a lead, never confirmed",
    one["findings"][0]["tier"] == "lead", one["findings"])
 
-# ── confirmed_from_ledger: only 확정, robust to junk ──────────────────────────
+# ── confirmed_from_ledger: only confirmed rows, robust to junk ──────────────────────────
 with tempfile.TemporaryDirectory() as d:
     p = os.path.join(d, "t.json")
     with open(p, "w", encoding="utf-8") as f:
         json.dump({"verdicts": [
-            {"status": "확정", "target": "A"},
-            {"status": "기각", "target": "B"},
-            {"status": "미분석", "target": "C"},
+            {"status": "confirmed", "target": "A"},
+            {"status": "rejected", "target": "B"},
+            {"status": "unanalysed", "target": "C"},
             "not-a-dict",
         ]}, f, ensure_ascii=False)
     got = O.confirmed_from_ledger(p)

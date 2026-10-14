@@ -1,17 +1,26 @@
-# agent_sdk.py — 취약점 분석 하네스 (Claude Agent SDK, 구독 인증 경로).
+# agent_sdk.py — the vulnerability-analysis harness (Claude Agent SDK, on the
+# subscription auth path).
 #
-# 압력의 방향: **위양성 억제**. 이건 취향이 아니라 측정된 문제다 —
-# 함수 단위 취약점 판정 벤치마크에서 프런티어 모델의 위양성률은 33~45% 대이고,
-# 어떤 모델은 전체 샘플의 69% 를 "취약함"으로 분류한다. 재현율이 아니라 **정밀도**가 병목이다.
-# 그래서 이 하네스의 게이트는 전부 "확정을 어렵게" 만드는 쪽으로만 건다.
+# The direction of pressure is **suppressing false positives.** That is not a
+# preference, it is a measured problem: on function-level vulnerability
+# adjudication benchmarks frontier models run a 33-45% false-positive rate, and
+# some classify 69% of all samples as vulnerable. Recall is not the bottleneck,
+# **precision** is. So every gate here is built in one direction only: making a
+# confirmation harder to reach.
 #
-# 게이트 4단 (전부 실제 차단):
-#   G0 근거 비어 있음                    → deny
-#   G1 **앵커 기계 검증** — 인용한 주소에 정말 그 명령이 있는가 → deny
-#   G2 부재 주장인데 디스어셈블 없음      → deny
-#   G3 이미 죽은 시나리오                → deny (묘지에서 부활 금지)
-#   G4 **독립 반박자** (컨텍스트 비대칭)  → 반박되면 deny + 묘지 등재
-# 종료 게이트: 전수 표·앵커 미검증 확정이 남아 있으면 끝내지 못한다.
+# Four gates, all of which really block:
+#   G0 the evidence is empty                      -> deny
+#   G1 **machine anchor verification** — is that
+#      instruction really at the cited address?   -> deny
+#   G2 an absence claim with no disassembly       -> deny
+#   G3 a scenario that is already dead            -> deny (nothing is
+#                                                    resurrected from the
+#                                                    graveyard)
+#   G4 **an independent refuter** (context
+#      asymmetry)                                 -> refuted means deny plus a
+#                                                    graveyard row
+# The stop gate: a run cannot end while the exhaustive table is open or an
+# anchor-unverified confirmation is still standing.
 import asyncio, os, re, sys, time
 
 _LEAKED = os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -36,7 +45,7 @@ def _text(s):
 
 
 def _mk(name, desc, schema):
-    """execute_tool 로 넘기는 얇은 래퍼. None/빈값 인자는 떨어뜨린다."""
+    """A thin wrapper onto execute_tool. None and empty arguments are dropped."""
     @tool(name, desc, schema)
     async def _f(a, _n=name):
         return _text(T.execute_tool(_n, {k: v for k, v in a.items() if v not in (None, "")}))
@@ -69,10 +78,12 @@ TOOLDEFS = [
         "action='race' registers a TWO-TERM item: a=, b=, shared=. A race is a property of a "
         "PAIR plus shared state, so a single-request table cannot hold it — and what a table "
         "cannot hold never gets counted as unanalysed either.",
-        # ★ 2026-09-03: `found_while` 이 스키마에 없었다. `action='incidental'` 은 이 프로젝트
-        #   최고의 결함이 발견된 채널인데, 핸들러는 `a.get("found_while")` 를 읽고 스키마에는
-        #   없어서 **모델이 그 인자명을 알 길이 없었다**(설명 산문에만 있었다). 17개 인자 사고와
-        #   같은 유형이다 — 이제 test_argschema.py 가 27개 툴 전부를 기계로 검사한다.
+        # `found_while` was missing from the schema. `action='incidental'` is the channel
+        #   through which this project's best defect was found, and the handler reads
+        #   `a.get("found_while")` — but with nothing in the schema **the model had no way
+        #   to learn the argument's name** (it existed only in the prose description).
+        #   Same class as the 17-argument accident below; a schema test now checks every
+        #   tool mechanically.
         {"action": str, "items": list, "kind": str, "name": str, "status": str, "why": str,
          "reach": str, "a": str, "b": str, "shared": str, "found_while": str}),
     _mk("sink_gates",
@@ -202,14 +213,14 @@ TOOLDEFS = [
         "kind='population' - the shape this methodology actually cares about: a guard that is "
         "present in 1 of 11 sibling call sites. Pass query_a + set_a (the whole population), "
         "query_b + set_b (the ones carrying the property), differentiator (the one-line "
-        "predicate that decides a member), and later member_state='0x140057D00=안전 0x...=의심'. "
+        "predicate that decides a member), and later member_state='0x140057D00=safe 0x...=suspect'. "
         "THE HARNESS COMPUTES THE INTERSECTION - you do not declare it, because a declared "
-        "intersection is a self-report. Members default to 미분석 and every render prints how "
-        "many are still 미분석, so a PARTIAL census can never read as a closed one.\n"
+        "intersection is a self-report. Members default to `unanalysed` and every render prints how "
+        "many are still unanalysed, so a PARTIAL census can never read as a closed one.\n"
         "  ★ invariant=<one sentence> marks the census PATCH-ANCHORED: the population that must "
         "enforce an invariant a vendor just restored (a fixed bug's siblings). Once tagged, you "
         "cannot close it as a complete fix with a bare verdict — you must file the closing verdict "
-        "with completes=<this census name>, and it passes ONLY when 미분석=0 AND the closure "
+        "with completes=<this census name>, and it passes ONLY when unanalysed=0 AND the closure "
         "interrogator SUSTAINED it. This exists because a QUIC census was closed 'no siblings, "
         "complete fix' while set_b had missed a member; the interrogator broke it but too late.\n"
         "kind='posture' - a measured property with NO defect claim attached: an access-mask "
@@ -224,7 +235,7 @@ TOOLDEFS = [
         "These go to a SHARED file visible from every target. Pass routine, arm, validated, "
         "omitted, applies_to, anchors. Call it with no arguments to READ what is already known "
         "before you re-derive anything.\n"
-        "NONE of these three can carry 확정/기각. Promotion still goes through verdict() and "
+        "NONE of these three can carry confirmed/rejected. Promotion still goes through verdict() and "
         "still faces its gates (basis, controls, debt cap). This is material preservation, "
         "not a back door around judgement.",
         {"kind": str, "name": str, "query_a": str, "set_a": str, "query_b": str, "set_b": str,
@@ -347,9 +358,9 @@ TOOLDEFS = [
         "\n★ action='reaudit' lists the GRAVEYARD RE-AUDIT QUEUE. A rejection is defended only ONCE, at the moment it is filed - nothing re-examines it afterwards, so a wrong negative is a permanent loss. Measured in this ledger: only 34% of buried rows were ever sustained by an interrogator, and 25 rows sit there that an interrogator BROKE or that their own author WITHDREW - still reading as clean negatives to you. Call it when you arrive, when a new measurement lands, or when the build changes. Clearing one of those is not a resurrection, it is bookkeeping.\n★★ action='resisted' IS THE QUEUE THIS HARNESS DID NOT HAVE: ROWS SOMEBODY ALREADY TRIED TO KILL AND FAILED. Every adversary here pushes DOWN - the refuter kills confirmations, the interrogator breaks rejections - but until now a FAILED kill left no trace you could act on. It counts three axes on the same row: (1) your rejection was DENIED by the reject gate, (2) the CFG REFUTED the guard/sink pair you declared yet the rejection was recorded anyway, (3) an interrogator BROKE it. Measured in this project: 30 rows resisted 2+ kill attempts, one of them 12 times ACROSS THREE DIFFERENT klasses, and 23 of 30 resisted on more than one axis. A single denial is often just paperwork - but a row you attacked under guarded, then impact_unproven, then state_precondition, and which survived all three, is telling you the death hypotheses are the thing that is wrong, not the paperwork. THERE IS NO AUTOMATIC PROMOTION: this is a re-analysis list, not a list of confirmations. Close a row by refiling a rejection that meets the requirement, by confirming it if the reason it will not die is that it is a defect, or by action='exhaust'. Rows carrying a lead id are closed in the LEAD queue instead - two queues must not ask for the same work twice.\n\n★ action='track' (name=, stage=, note=) is how depth accumulates ACROSS sessions. A finding is not one verdict, it is a ladder: static-confirm -> trigger -> measure -> impact -> boundary/submission. Three of this project's confirmed rows (S7-D4, S9-D4, S10-VA1) are the SAME investigation at three rungs, but the ledger counted them as three unrelated verdicts, so six sessions each redid rung-one work instead of climbing six rungs. Register the track, move its stage when you actually advance it, and MOVE IT BACK when a refutation knocks it down. The next session's carry-over block leads with this table.\n"
         "\n★ completes=<census name> — attach to a reject/blocked/track that closes a PATCH-ANCHORED "
         "census (one filed via population(invariant=...)) as a complete fix / no surviving variant. "
-        "The closure is REFUSED unless that census has 미분석=0 AND its closing narrative was SUSTAINED "
+        "The closure is REFUSED unless that census has unanalysed=0 AND its closing narrative was SUSTAINED "
         "by the interrogator. Enumeration incompleteness (a member set_b never listed) does not show up "
-        "as 미분석, so the SUSTAINED interrogation — not the member count — is the real gate. If it is "
+        "as unanalysed, so the SUSTAINED interrogation — not the member count — is the real gate. If it is "
         "refused, the census is not done: add the missed sibling to set_b and re-run the interrogator.\n"
         "\n★ action='anchors' (evidence='0x... 0x...') asks the ledger where those addresses ALREADY "
         "appear — in a filed verdict's evidence, an open question, the graveyard, a taxonomy report. "
@@ -407,15 +418,15 @@ TOOLDEFS = [
         "\n★★ A REJECTION KILLS ONE CLAIM, NOT THE SURFACE. Measured 2026-08-31: 73 of 73 "
         "rejected surfaces had been closed on a SINGLE claim — one case rebutted one sink inside "
         "a shared classifier and closed the whole major handler while its own note still listed "
-        "three unexamined sinks. So a surface row now goes to 기각 ONLY when you first declare its "
+        "three unexamined sinks. So a surface row now goes to rejected ONLY when you first declare its "
         "denominator with action='scope' (target=, items=['0xVA name', ...], method=<how you "
         "enumerated it — behaviour-based, not name xref>) and then adjudicate EVERY item. "
         "Each reject must name which candidate it kills: item='<label>' or sink=<VA>. "
-        "Until the last one falls the surface stays 미분석(blocked) with the remaining candidates "
+        "Until the last one falls the surface stays unanalysed(blocked) with the remaining candidates "
         "listed for you. This is not bureaucracy: 'this one path is guarded' and 'this surface is "
         "clean' are different claims, and only the first one is what your evidence supports.\n"
         "★ A gate that CANNOT DECIDE does not pass you — it ASKS. A reject that the gate cannot "
-        "verify comes back as '[기각 보류 — 질문]' with a concrete next method, is NOT counted as "
+        "verify comes back as '[REJECTION HELD - QUESTION]' with a concrete next method, is NOT counted as "
         "a judgement, and stays in the open-question queue. action='asks' lists open questions; "
         "answer one by re-rejecting the same target after doing what the method says. "
         "If no method is left, action='exhaust' (target=, reason=, tried=) records METHOD "
@@ -424,8 +435,8 @@ TOOLDEFS = [
         "You cannot finish while questions are open.\n"
         "basis ∈ decompile|disassemble|measured|doc. Every confirm is anchor-checked and then "
         "handed to an independent refuter that is trying to kill it. 'blocked' keeps the item "
-        "as 미분석 and REQUIRES reason= : what you would have to look at next to move it to "
-        "확정 or 기각.\n"
+        "as unanalysed and REQUIRES reason= : what you would have to look at next to move it to "
+        "confirmed or rejected.\n"
         "★ REJECTS ARE GATED TOO. A rejection needs klass= (why it dies) because each class "
         "carries a DIFFERENT measurement obligation: guarded | unreachable | not_controlled | "
         "no_sink | by_design | delta_zero | decompiler_artifact | second_site | "
@@ -483,17 +494,19 @@ TOOLDEFS = [
         "sweep recorded through import_xref, or pass enumerated='<what you swept and how>'. "
         "Writing 'what I verified is X, the rest is unaudited' passes freely — that is a "
         "different and honest claim, and it is usually the true one.",
-        # ★ 2026-09-03: 핸들러가 읽는 인자 **17개가 스키마에 없었다** — gate_blocked 의
-        #   gate/kind/why/would_be, track 의 name/stage/note, exhaust 의 tried/method 등.
-        #   SDK 가 미선언 키를 통과시켜서 '동작은 했지만', 스키마에 없으니
-        #   에이전트가 **인자 이름을 알 길이 없었다**(산문에 적힌 것만 발견 가능).
-        #   실제로 두 회차 연속 "이 채널은 도달 불가"로 신고됐다. 핸들러와 맞춘다.
+        # **17 arguments the handlers read were missing from the schema** — gate_blocked's
+        #   gate/kind/why/would_be, track's name/stage/note, exhaust's tried/method and
+        #   more. The SDK passes undeclared keys through, so it "worked" — but with
+        #   nothing in the schema the agent **had no way to learn the names** (only what
+        #   the prose happened to mention was discoverable). Two rounds in a row filed
+        #   "this channel is unreachable". The schema is now matched to the handlers.
         {"action": str, "id": str, "target": str, "claim": str, "basis": str,
          "evidence": str, "evidence_ids": str, "reason": str, "klass": str,
          "guard": str, "guards": str, "sink": str, "items": list, "method": str, "item": str,
          "owner": str, "delta": str, "boundary": str, "principal": str,
-         # ★ 2026-09-10 — 경계를 **칸으로**. 산문 `boundary=` 는 벤더 언어 한 문장으로
-         #   남기고, 정책 판정은 이 두 토큰이 한다(`ledger.PRINCIPAL_LATTICE`).
+         # The boundary becomes **a column.** Prose `boundary=` stays as one sentence of
+         #   vendor language; the policy decision is made by these two tokens
+         #   (`ledger.PRINCIPAL_LATTICE`).
          "from_principal": str, "to_principal": str,
          "enumerated": str,
          # gate_blocked
@@ -502,19 +515,20 @@ TOOLDEFS = [
          "name": str, "stage": int, "stages": str, "note": str, "text": str,
          # reopen
          "ground": str, "gid": str,
-         # ★ 2026-09-07 lead — 리드를 닫는 **길**. 선언 안 하면 에이전트는 이 인자의
-         #   존재를 모르고, 그러면 리드 큐는 읽기 전용이 된다(= 또 하나의 묘지).
+         # lead — **the way to close a lead.** Undeclared, the agent does not know the
+         #   argument exists and the lead queue becomes read-only: another graveyard.
          "how": str,
          # exhaust / asks / unfinished
          "tried": str, "n": int, "of": str, "offset": int,
-         # ★ 2026-09-05 (C-037): blocked 의 '다음 한 걸음' 칸. 산문 사유에서는 기계가
-         #   못 뽑는다는 것이 측정됐다(어떤 술어를 써도 blocked 의 56%가 걸리거나,
-         #   접지형은 되찾아야 할 행을 떨어뜨린다). 그래서 쓰는 쪽이 선언한다.
+         # The 'next single step' column for `blocked`. It was measured that a machine
+         #   cannot extract it from the prose reason: any predicate either catches 56% of
+         #   all blocked rows, or, if grounded, drops the rows that need recovering. So the
+         #   writer declares it.
          "next": str,
-         # ★ 2026-09-05: 09-05 에 klass 넷을 늘리면서 **그 의무 인자를 또 안 넣었다** —
-         #   바로 위 주석이 경고하는 그 실패를 같은 파일에서 반복했다.
-         #   second_site/bounded_absence 는 게이트가 이 이름들을 요구하는데
-         #   스키마에 없어서 에이전트가 이름을 알 길이 없었다.
+         # When four klass values were added, **their mandatory arguments were left out
+         #   again** — the exact failure the comment above warns about, repeated in the
+         #   same file. The gate demands these names for second_site / bounded_absence,
+         #   and with nothing in the schema the agent could not learn them.
          "origin_id": str, "scope": str, "callsite": str, "branches": str,
          "depends_on": str}),
     _mk("import_xref",
@@ -555,15 +569,17 @@ TOOLDEFS = [
 SERVER = create_sdk_mcp_server(name="vuln", version="2.0.0", tools=TOOLDEFS)
 ALL_TOOLS = [f"mcp__vuln__{n}" for n in T.TOOLS]
 RO_TOOLS = [f"mcp__vuln__{n}" for n in T.READONLY]
-# ★ 2026-09-05: 반박자만 **실측 도구**를 더 받는다 (`ioctl` + `kd`).
-#   왜: 반박자는 지금까지 문서만 읽고 죽였다 — 실측으로 반증할 수단이 없어
-#   "측정되지 않았다"는 킬을 낼 수는 있어도 **직접 재보고 뒤집을** 수는 없었다.
-#   `run_python`/`Bash` 는 주지 않는다 — 반박자는 재보는 것이지 새 도구를 짜는 게 아니다.
-#   게이트가 꺼져 있으면 툴이 "미측정"이라고 거부한다. 그 거부는 킬 사유가 아니다.
+# The refuter alone gets the **measurement tools** (`ioctl` + `kd`).
+#   Why: until now the refuter killed on reading alone. With no way to disprove by
+#   measurement it could issue a "this was never measured" kill, but it could not
+#   **re-measure and overturn.**
+#   It does not get `run_python` / `Bash` — a refuter re-measures, it does not
+#   write new tooling. With the gates off the tool refuses with "unmeasured", and
+#   that refusal is not grounds for a kill.
 REFUTER_TOOLS = RO_TOOLS + [f"mcp__vuln__{n}" for n in ("ioctl", "kd")]
 
 
-# ── G1: 앵커 기계 검증 ───────────────────────────────────────
+# ── G1: machine anchor verification ──────────────────────────────────────
 def _anchor_gate(inp):
     p = T.TARGET.get("_pe")
     if p is None:
@@ -584,12 +600,16 @@ def _anchor_gate(inp):
 
 
 async def gate_verdict(input_data, tool_use_id, context):
-    """게이트 본체는 _gate_verdict. 여기서 예외를 잡아 **deny 로** 바꾼다.
+    """The gate body is `_gate_verdict`. This catches an exception and turns it
+        into **a deny.**
 
-    PreToolUse 훅이 예외로 죽으면 CLI 는 그 호출을 그냥 통과시킨다 — 즉 **고장이 통과가 된다.**
-    실제로 seen_scenario 의 한 줄 버그(`sorted(set(...)[:12])`)가 모든 정상 확정에서 터졌고,
-    확정은 게이트를 하나도 거치지 않고 원장에 들어갔다. 반박자도 돌지 않았다.
-    이 하네스 전체가 막으려는 실패 유형이 하네스 자신에게 있었다."""
+    If a PreToolUse hook dies with an exception the CLI simply lets the call
+        through — **a malfunction becomes a pass.** A one-line bug in `seen_scenario`
+        (`sorted(set(...)[:12])`) really did raise on every legitimate confirmation,
+        and those confirmations went into the ledger without passing a single gate.
+        The refuter never ran either.
+        The failure class this whole harness exists to stop was present in the
+        harness itself."""
     try:
         return await _gate_verdict(input_data, tool_use_id, context)
     except Exception as e:
@@ -609,7 +629,7 @@ async def gate_verdict(input_data, tool_use_id, context):
 def deny_msg(reason, target="", act="", klass=""):
     runlog.bump("gate_denials")
     try:
-        ledger.record_denial(target or "(적대자 경로)", reason, act=act, klass=klass)
+        ledger.record_denial(target or "(adversary path)", reason, act=act, klass=klass)
     except Exception:
         pass
     return {"systemMessage": f"verdict blocked: {reason[:80]}",
@@ -619,24 +639,27 @@ def deny_msg(reason, target="", act="", klass=""):
 
 
 async def _interrogate(tgt, inp, gate_rec, force=False):
-    """기각에 독립 심문자를 붙인다. 기각이 서지 않으면 deny 를 돌려준다(=ASK 로 되돌림).
+    """Attach an independent interrogator to a rejection. If the rejection does
+        not stand, return a deny — which sends it back as an ASK.
 
-    맨데이트가 반박자와 **반대**다: 애매하면 기각이 서지 않는다. 거짓 확정은 트리아지
-    시간을 쓰지만 거짓 기각은 버그를 영구히 잃는다.
+    The mandate is the **inverse** of the refuter's: when unsure, the rejection
+        does not stand. A false confirmation costs triage time; a false rejection
+        loses the bug permanently.
     """
     st = ledger.STATE.setdefault(
         "interrogs", {"run": 0, "broke": 0, "sustained": 0, "failed": 0, "skipped": 0})
     import random
-    # ★ force: 게이트가 **표현 못 한** 건은 표본율로 건너뛰면 안 된다.
-    #   건너뜀도 `None` 을 돌려주므로, 호출부는 "심문 통과"와 구분할 수 없다 —
-    #   INTERROGATE_RATE 를 낮추는 순간 표현 불가 기각이 **아무 검증 없이 통과**한다.
-    #   (이 저장소가 반복해서 당한 '성공을 반환하는 무동작' 계열이다.)
+    # force: a case the gate **could not express** must not be skipped by the
+    #   sampling rate. A skip also returns `None`, so the caller cannot tell it from
+    #   "the interrogation passed" — the moment INTERROGATE_RATE drops, an
+    #   inexpressible rejection **passes with no verification at all.**
+    #   (The same no-op-that-returns-success class this repo keeps hitting.)
     if not force and random.random() > config.INTERROGATE_RATE:
         st["skipped"] += 1
         ledger.mark_interrogated(tgt, None, vid=(inp or {}).get("id"))
         return None
     st["run"] += 1
-    print(f"\033[96m[interrogate] {tgt} — 독립 심문자 기동 "
+    print(f"\033[96m[interrogate] {tgt} — independent interrogator starting "
           f"(model={config.INTERROGATOR_MODEL or 'inherit'})\033[0m")
     v, raw = await interrogator.run(
         SERVER, tgt, inp.get("claim", ""), inp.get("evidence", ""),
@@ -652,13 +675,13 @@ async def _interrogate(tgt, inp, gate_rec, force=False):
                         "disable with GATE_INTERROGATE=0 and say so in the report).")
     runlog.transcript(f"[interrogate] {tgt} {v}")
     ledger.count_via("interrogs", v)
-    # ★ 같은 이유로 여기서도 먼저 가른다. 이 줄이 없으면 sustained=None 이
-    #   "기각이 서지 않는다" 로 읽혀, 고장이 **기각 붕괴** 로 보고된다.
-    #   09-02 ahcache S26-F10 이 정확히 이 경로로 두 번 죽었다.
+    # Separated first here for the same reason. Without this line, sustained=None
+    #   reads as "the rejection does not stand", so a malfunction gets reported as a
+    #   **rejection collapse.** One axis died that way twice.
     if v.get("fault"):
         st["failed"] += 1
         ledger.save()
-        print(f"\033[93m[interrogate] FAULT [{v.get('fault')}] — 결과 아님\033[0m")
+        print(f"\033[93m[interrogate] FAULT [{v.get('fault')}] — not a result\033[0m")
         return deny_msg(
             f"The interrogator FAILED TO PRODUCE A VERDICT ({v.get('fault')}): "
             f"{v.get('reason')}\n"
@@ -669,13 +692,14 @@ async def _interrogate(tgt, inp, gate_rec, force=False):
             "Recorded in the ledger as interrogs.failed.")
     if not v.get("sustained"):
         st["broke"] += 1
-        # ★ 깨진 기각은 판정으로 기록되지 않으므로 `mark_interrogated` 가 붙일 행이 없다.
-        #   그래서 지금까지 213건의 사유가 흔적 없이 사라졌다(transcript 는 회차마다 truncate).
-        #   원장이 아니라 별도 기록부에 남긴다 — 소비자는 지휘자가 아니라 다음 회차 분석가다.
+        # A broken rejection is not recorded as a verdict, so `mark_interrogated` has no
+        #   row to attach to. 213 sets of grounds vanished without a trace that way (the
+        #   transcript is truncated every round). They go to a separate record rather than
+        #   the ledger — the consumer is the next round's analyst, not the orchestrator.
         try:
             ledger.record_break(tgt, v, inp)
         except Exception as _e:
-            print("\033[93m[breaks] 기록 실패: %s\033[0m" % _e)
+            print("\033[93m[breaks] failed to record: %s\033[0m" % _e)
         ledger.save()
         print(f"\033[91m[interrogate] BROKE [{v.get('klass')}] "
               f"{v.get('reason','')[:120]}\033[0m")
@@ -684,16 +708,19 @@ async def _interrogate(tgt, inp, gate_rec, force=False):
             _prec = ledger.rules_for(v.get("klass"))
         except Exception:
             pass
-        # ★ 2026-09-05 재설계 — **깨진 기각을 제출 시점에 막지 않는다.**
-        #   옛 동작: deny → 분석가가 그 자리에서 다시 짝을 만들려다 루프에 갇혔다.
-        #   새 동작: 기각은 그대로 등재되되 **산출물이 아니다**
-        #   (`session_products()` 가 `broke` 인 것을 안 센다) ⇒ 이것만으로는 회차가 안 끝난다.
-        #   차단을 **판정이 아니라 종료**에 걸면, 값싼 기각은 막으면서 루프는 안 생긴다.
+        # Redesigned: **a broken rejection is no longer blocked at submission time.**
+        #   Old behaviour: deny -> the analyst tried to rebuild the pair on the spot and
+        #   got stuck in a loop.
+        #   New behaviour: the rejection is filed as usual but **is not a product**
+        #   (`session_products()` does not count anything marked `broke`), so it alone
+        #   cannot end a round. Putting the block on **the exit rather than the verdict**
+        #   stops cheap rejections without creating a loop.
         #
-        #   ★★ 단 **사유는 반드시 분석가에게 간다.** 비차단으로 바꾸면서 이걸 놓치면
-        #   "왜 깨졌는지"가 사라진다 — 그건 루프를 없애는 게 아니라 학습을 없애는 것이다.
-        #   (T39 가 이 회귀를 잡았다: 선례 회수가 파기 문구에 안 붙는 상태였다.)
-        #   차단하지 않는 경로에서는 툴 결과에 실어 보낸다 — stash 에 사유를 얹는다.
+        #   But **the grounds must still reach the analyst.** Losing that while making it
+        #   non-blocking deletes "why it broke" — which removes the learning, not the
+        #   loop. (A regression caught exactly this: the precedent recovery was not being
+        #   attached to the teardown text.) On the non-blocking path it rides along in the
+        #   tool result — the grounds are put in the stash.
         _brk_msg = (
             f"[REJECTION RECORDED, BUT AN INTERROGATOR BROKE IT] "
             f"[{v.get('klass')}] {v.get('reason')}\n"
@@ -707,7 +734,7 @@ async def _interrogate(tgt, inp, gate_rec, force=False):
         except TypeError:
             ledger.mark_interrogated(tgt, v)
         if getattr(config, "FINISH_ON_PRODUCT", True):
-            return None            # 통과시킨다. 사유는 stash 로 툴 결과에 실린다.
+            return None            # let it through; grounds ride in the stash
         return deny_msg(
             f"An independent interrogator BROKE this rejection — [{v.get('klass')}] {v.get('reason')}\n"
             f"Next method: {v.get('next_method') or '(the interrogator gave no method)'}{_prec}\n"
@@ -724,18 +751,21 @@ async def _interrogate(tgt, inp, gate_rec, force=False):
 
 
 async def _adjudicate(tgt, inp, n_attempts):
-    """★ 루프를 끊는다. 적대자가 아니라 **종결자**다 — 이 판에서 유일하게 전체 이력을 본다.
+    """Break the loop. Not an adversary but **a terminator** — the only member of
+        the panel that sees the whole history.
 
-    실측(2026-09-04): 심문자 파기율 64~88%, 깨진 기각은 ASK 로 돌아가고 다음 회차가 다시
-    기각하고 다시 깨진다. 같은 질문 4~5회가 ahcache 6건 · wcifs 8건. `attempts` 는 세기만
-    했고 **강제 종료 지점이 없었다.**
-    문헌: Refute-or-Promote 가 judge 를 두고(우리는 ❌였다), MAD-Stability 가
-    **비수렴 시의 정의된 출력**을 요구하며, Nine Judges 는 판정자를 늘리는 방향을 반증한다.
-    ⇒ 적대자를 더 붙이지 않고 종결자 하나.
+    Measured: an interrogator teardown rate of 64-88%. A broken rejection goes
+        back as an ASK, the next round rejects it again, and it breaks again. The same
+        question came round 4-5 times on 6 rows of one target and 8 of another.
+        `attempts` was only being counted — **there was no forced end point.**
+        The literature: Refute-or-Promote keeps a judge (this harness had none),
+        MAD-Stability demands **a defined output on non-convergence**, and the Nine
+        Judges result disproves the add-more-judges direction.
+        => no extra adversary; one terminator.
     """
     hist = ledger.history_for(tgt)
-    print(f"\033[95m[adjudicate] {tgt} — {n_attempts}회 미종결 ⇒ 판결자 기동 "
-          f"(confirm 권한={config.ADJUDICATOR_MAY_CONFIRM})\033[0m")
+    print(f"\033[95m[adjudicate] {tgt} — {n_attempts} unresolved attempts => adjudicator starting "
+          f"(may confirm={config.ADJUDICATOR_MAY_CONFIRM})\033[0m")
     runlog.bump("adjudications_run")
     v, raw = await adjudicator.run(
         SERVER, tgt, inp.get("claim", ""), hist, n_attempts,
@@ -750,12 +780,13 @@ async def _adjudicate(tgt, inp, n_attempts):
     runlog.transcript(f"[adjudicate] {tgt} {v}")
     if v.get("fault"):
         runlog.bump("adjudications_failed")
-        print(f"\033[93m[adjudicate] FAULT [{v.get('fault')}] — 결정 아님\033[0m")
+        print(f"\033[93m[adjudicate] FAULT [{v.get('fault')}] — not a decision\033[0m")
         return deny_msg(f"The adjudicator FAILED TO PRODUCE A DECISION ({v.get('fault')}): "
                         f"{v.get('reason')}\nTHIS IS A MALFUNCTION, NOT A DECISION. The row "
                         "stays open. Report it with gate_blocked(kind='tool').")
     dec = v.get("verdict")
-    # ★ 권한 스위치. 하루짜리 결정이라 코드가 아니라 config 로 잠근다.
+    # The authority switch. It was a one-day decision, so it is pinned in config
+    # rather than in code.
     if dec == "confirm" and not config.ADJUDICATOR_MAY_CONFIRM:
         dec = "exhaust"
         v["downgraded_from"] = "confirm(no_authority)"
@@ -763,7 +794,7 @@ async def _adjudicate(tgt, inp, n_attempts):
     runlog.bump("adjudicated_" + str(dec))
     print(f"\033[92m[adjudicate] {str(dec).upper()} — {str(v.get('reason'))[:120]}\033[0m")
     if dec == "reject":
-        return None            # 기각이 선다 — 원래 경로로 기록된다
+        return None            # the rejection stands - recorded on the normal path
     if dec == "exhaust":
         ledger.verdict({"action": "exhaust", "target": tgt,
                         "reason": "[adjudicator] " + str(v.get("reason"))[:400],
@@ -773,7 +804,8 @@ async def _adjudicate(tgt, inp, n_attempts):
                         "the row is closed as unaudited-with-reason. Do not re-argue it; the "
                         "loop is what it was closed for. Move to another row."
                         % (n_attempts, v.get("reason"), v.get("decisive") or "(not named)"))
-    # confirm — 판결자가 확정을 냈다. **감사 가능하게** 표시하고 통과시킨다.
+    # confirm — the adjudicator issued a confirmation. Mark it **auditably** and
+    # let it through.
     ledger.stash_adjudication(tgt, {
         "verdict": "confirm", "decisive": v.get("decisive"), "reason": v.get("reason"),
         "residual_risk": v.get("residual_risk"), "attempts": n_attempts})
@@ -781,12 +813,15 @@ async def _adjudicate(tgt, inp, n_attempts):
 
 
 async def _run_escalator(inp, tgt, impact_json, blocking):
-    """★ L3 — 유일하게 **위로 미는** 장치. 반박자/심문자의 반대 방향.
+    """The only device that pushes **upward** — the opposite direction from the
+        refuter and the interrogator.
 
-    blocking=True  (기각 klass='delta_zero') — 승격되면 그 기각을 **되돌린다.**
-                   델타 0 기각은 이 프로젝트에서 발견이 죽은 바로 그 자리다.
-    blocking=False (확정인데 임팩트가 약함) — 되돌리지 않는다. 확정 자체는 유효하고
-                   등급만 낮은 것이므로, 승격 결과를 **붙여만** 둔다.
+    blocking=True  (a rejection with klass='delta_zero') — if it escalates, that
+        rejection is **reversed.** A delta-zero rejection is exactly where findings
+        died in this project.
+        blocking=False (a confirmation with weak impact) — nothing is reversed. The
+        confirmation itself is valid and only its grade is low, so the escalation
+        result is **attached** and no more.
     """
     st = ledger.STATE.setdefault(
         "escalations", {"run": 0, "lifted": 0, "held": 0, "failed": 0, "skipped": 0})
@@ -795,7 +830,7 @@ async def _run_escalator(inp, tgt, impact_json, blocking):
         st["skipped"] += 1
         return None
     st["run"] += 1
-    print(f"\033[95m[escalate] {tgt} — 승격자 기동 "
+    print(f"\033[95m[escalate] {tgt} — escalator starting "
           f"(model={config.ESCALATOR_MODEL or 'inherit'}, blocking={blocking})\033[0m")
     v, raw = await escalator.run(
         SERVER, tgt, inp.get("claim", ""), inp.get("evidence", ""), impact_json,
@@ -804,15 +839,16 @@ async def _run_escalator(inp, tgt, impact_json, blocking):
     if v is None:
         st["failed"] += 1
         ledger.save()
-        print(f"\033[91m[escalate] 실행 실패: {raw[:160]}\033[0m")
-        return None                      # 승격자 고장은 판정을 막지 않는다 (거짓 승격이 더 비싸다)
+        print(f"\033[91m[escalate] failed to run: {raw[:160]}\033[0m")
+        return None                      # an escalator fault does not block the verdict (a false escalation costs more)
     runlog.transcript(f"[escalate] {tgt} {v}")
     ledger.stash_escalation(tgt, v)
-    # ★ fault 를 먼저 가른다 (escalated=None 은 falsy — 고장이 'held' 로 세어지던 자리).
+    # Separate the fault first: escalated=None is falsy, which is where a
+    # malfunction used to be counted as 'held'.
     if v.get("fault"):
         st["failed"] += 1
         ledger.save()
-        print(f"\033[93m[escalate] FAULT [{v.get('fault')}] — 결과 아님\033[0m")
+        print(f"\033[93m[escalate] FAULT [{v.get('fault')}] — not a result\033[0m")
         return {"escalated": False, "fault": v.get("fault"),
                 "note": ("The escalator FAILED TO PRODUCE A VERDICT (%s). One retry gave the "
                          "same result. This is a MALFUNCTION, not 'nothing to escalate' — the "
@@ -828,7 +864,7 @@ async def _run_escalator(inp, tgt, impact_json, blocking):
                 f"The escalator OVERTURNED this delta-zero rejection — [{v.get('axis')}]\n"
                 f"Principal / path for which the delta is NONZERO: {v.get('principal')}\n"
                 f"Basis: {v.get('reason')}\n"
-                f"다음 방법: {v.get('next_method') or '(no method given)'}\n"
+                f"next method: {v.get('next_method') or '(no method given)'}\n"
                 "'delta 0' is not a terminal answer. Re-adjudicate with this principal substituted in — "
                 "this exact pivot has revived a finding that had already been written off.")
         return None
@@ -838,33 +874,42 @@ async def _run_escalator(inp, tgt, impact_json, blocking):
     return None
 
 
-# ── 축을 닫는 서술에도 적대자를 붙인다 (2026-09-12) ──────────────────────────
-# ★ 왜: 적대자는 **판정**에만 붙어 있었다 — 확정→반박자, 기각→심문자.
-#   그런데 축을 닫는 것은 판정이 아니라 `track` 의 note 와 `gate_blocked` 의 why 다.
-#   실측(09-12): `bfs-forceaccesscheck-arm` 이
+# ── put an adversary on the prose that closes an axis too ────────────────────
+# Why: the adversaries were attached to **verdicts** only — a confirmation to the
+#   refuter, a rejection to the interrogator. But what closes an axis is not a
+#   verdict: it is a `track` note or a `gate_blocked` why. Measured, one axis was
+#   closed with
 #     "remaining term is the live ForceAccessCheck/feature state,
 #      which no open axis can read - treat as parked"
-#   로 닫혀 있었고 **아무도 그 문장을 보지 않았다.** 두 군데가 틀렸다 —
-#   그 축은 `vmrun start` 한 번으로 열렸고, 술어는 기능 게이트가 아니라 레지스터 비교였다.
-#   판정이었으면 심문자가 봤을 문장이 트랙 노트라서 통과했다.
-# ★ **막지 않는다.** 이 저장소의 기존 결론대로(게이트를 조이면 리콜만 떨어진다)
-#   결과를 기록해 분석가에게 넘기고 판단은 분석가가 한다 — `_inexpr` 경로와 같은 계약이다.
+#   and **nobody read that sentence.** Two parts of it were wrong: the axis opened
+#   with a single `vmrun start`, and the predicate was a register comparison, not
+#   a feature gate. A sentence the interrogator would have seen as a verdict
+#   passed because it was a track note.
+# **It does not block.** Per this repo's standing conclusion — tightening gates
+#   only costs recall — the result is recorded and handed to the analyst, who
+#   judges. Same contract as the `_inexpr` path.
+# Calibrated against the corpus: the first version was built from **one** example
+#   and caught 7 of 29 notes (24%). The dominant idiom turned out to be the
+#   "NO MEASUREMENT AXIS WAS OPEN THIS ROUND" family. Now 79%.
+#   (Build a scanner and check **first** that the original defect hits.)
+#   The Korean alternations this used to carry are gone — the harness is English
+#   end to end, so they could never fire.
 _CLOSURE_MARK = re.compile(
-    # ★ 2026-09-12 코퍼스 보정: 첫 판은 예시 **하나**로 만들어 노트 29건 중 7건(24%)만 잡았다.
-    #   지배 관용구는 "NO MEASUREMENT AXIS WAS OPEN THIS ROUND" 계열이었다. 79%로 올렸다.
-    #   (escalation.md §5 — 스캐너를 만들면 원본 결함이 히트하는지 **먼저** 확인하라.)
     r"CLOSED\s+NEGATIVE|closes?\s+NEGATIVE|\bparked\b|\bTerminal\b|"
-    r"DO\s*NOT\s*RE-?OPEN|재개봉\s*금지|재주문\s*금지|어떤\s*열린\s*축|"
-    r"(no|any)\s+open\s+ax[ie]s|"            # ★ 원래 사례 - 재작성 때 깨뜨렸다가 회귀가 잡았다
+    r"DO\s*NOT\s*RE-?OPEN|\bdo\s+not\s+reopen\b|"
+    r"(no|any)\s+open\s+ax[ie]s|"      # the original case; a rewrite broke it and a regression caught it
     r"(no|any|every|all)\s+(open\s+)?(measurement\s+)?ax[ie]s(\s+(is|was|were|are))?\s+(open|closed)|"
     r"measurement\s+ax[ie]s\s+(are|is|was|were)\s+(all\s+)?closed|"
     r"all\s+measurement\s+axes|needs?\s+a\s+(measurement|runtime)\s+axis|"
     r"policy-closed|cannot\s+be\s+(measured|read)\s+without|"
-    r"blocked-for-measurement|실측\s*(불가|필요)|런타임\s*축", re.I)
+    r"blocked-for-measurement|cannot\s+be\s+measured|needs?\s+measuring|"
+    r"\bruntime\s+axis\b",
+    re.I)
 
 
 def _closure_text(inp):
-    """`track`/`gate_blocked` 입력에서 **축을 닫는 서술**을 뽑는다. 없으면 None."""
+    """Pull the **axis-closing prose** out of a `track` / `gate_blocked` input.
+        None if there is none."""
     for k in ("note", "why", "reason", "claim"):
         t = (inp or {}).get(k)
         if isinstance(t, str) and _CLOSURE_MARK.search(t):
@@ -873,7 +918,8 @@ def _closure_text(inp):
 
 
 async def _interrogate_closure(tgt, inp, act):
-    """축을 닫는 서술에 심문자를 붙인다. **항상 None 을 돌려준다(막지 않는다).**"""
+    """Attach the interrogator to axis-closing prose. **It always returns None —
+        it never blocks.**"""
     txt = _closure_text(inp)
     if not txt:
         return None
@@ -884,7 +930,7 @@ async def _interrogate_closure(tgt, inp, act):
     name = (inp or {}).get("name") or (inp or {}).get("gate") or tgt
     claim = ("This axis is closed: %s (via action=%s on `%s`). "
              "The closure is the claim under test." % (txt[:400], act, name))
-    print("\033[96m[interrogate-closure] %s - 축을 닫는 서술에 심문자 기동 (%s)\033[0m"
+    print("\033[96m[interrogate-closure] %s - interrogating the axis-closing prose (%s)\033[0m"
           % (tgt, act))
     try:
         v, _raw = await interrogator.run(
@@ -894,15 +940,16 @@ async def _interrogate_closure(tgt, inp, act):
     except Exception as e:
         st["failed"] += 1
         runlog.bump("closure_interrog_failed")
-        print("\033[93m[interrogate-closure] 실패(%s) - 닫힘은 그대로 선다\033[0m"
+        print("\033[93m[interrogate-closure] failed (%s) - the closure stands as it is\033[0m"
               % type(e).__name__)
         return None
-    # ★ 반환 규약은 `_interrogate` 와 같다: `v is None` = 실행 실패, `fault` = 판정 못 냄.
-    #   **둘 다 '통과'가 아니다** — 이 저장소가 반복해서 밟은 '실패=통과' 함정이다.
+    # The return contract matches `_interrogate`: `v is None` means it failed to run,
+    #   `fault` means it could not decide. **Neither is a pass** — the failure-equals-
+    #   pass trap this repo keeps stepping on.
     if v is None or (v or {}).get("fault"):
         st["failed"] += 1
         runlog.bump("closure_interrog_failed")
-        print("\033[93m[interrogate-closure] 판정 못 냄(%s) - 미심문이지 '닫힘이 옳다'가 아니다\033[0m"
+        print("\033[93m[interrogate-closure] could not decide (%s) - that is uninterrogated, not 'the closure is right'\033[0m"
               % ((v or {}).get("fault") or "no-result"))
         _res, _detail = "UNJUDGED", str((v or {}).get("reason") or _raw or "")[:1200]
     else:
@@ -912,23 +959,25 @@ async def _interrogate_closure(tgt, inp, act):
         _res = "BROKE" if broke else "SUSTAINED"
         _detail = "klass=%s\n%s" % (v.get("klass"), str(v.get("reason") or "")[:1200])
         if broke:
-            print("\033[91m[interrogate-closure] 심문자가 이 닫힘을 깼다 - 막지는 않지만 "
-                  "원장에 남겼다. 다시 열지는 분석가가 정한다.\033[0m")
-    # ★ 2026-09-24 — CI 결과를 **per-name** 으로도 남긴다(Move 2 게이트가 읽는다).
-    #   전역 카운터(run/broke/sustained)만으로는 "어느 census 가 SUSTAINED 됐나" 를 알 수
-    #   없어 patch-anchored 완결 게이트(`population_closure_status`)가 못 건다.
+            print("\033[91m[interrogate-closure] the interrogator broke this closure - "
+                  "it does not block, but it is on the ledger. Reopening is the "
+                  "analyst's call.\033[0m")
+    # Record the cross-check result **per name** as well (the Move 2 gate reads it).
+    #   The global counters (run/broke/sustained) cannot say *which* census was
+    #   SUSTAINED, so the patch-anchored closure gate
+    #   (`population_closure_status`) has nothing to hang on.
     st.setdefault("by_name", {})[str(name)] = _res
-    # ★ 조용한 무동작 금지 - 결과를 노트로 남긴다. `tools._t_note` 가 정본 채널이다
-    #   (`ledger.note_write` 는 **존재하지 않는다** - 첫 판에서 그걸 부르고 try/except 로
-    #    삼킬 뻔했다).
+    # No silent no-ops: the result is written as a note. `tools._t_note` is the
+    #   canonical channel (`ledger.note_write` **does not exist** — the first version
+    #   called it and was about to swallow the failure in a try/except).
     try:
         import tools as _T
         _T._t_note({"action": "write",
                     "key": "CLOSURE-INTERROG-%s-%s" % (act, str(name)[:36]),
-                    "text": "## 결론\n닫힘 서술에 대한 심문 결과: %s\n\n%s\n\n닫힘 원문:\n%s\n\n%s"
+                    "text": "## Conclusion\nInterrogation of the closing prose: %s\n\n%s\n\nThe closure verbatim:\n%s\n\n%s"
                             % (_res, claim[:400], txt[:1200], _detail)})
     except Exception as _e:
-        print("\033[93m[interrogate-closure] 노트 기록 실패: %s\033[0m" % type(_e).__name__)
+        print("\033[93m[interrogate-closure] failed to write the note: %s\033[0m" % type(_e).__name__)
     return None
 
 
@@ -941,8 +990,9 @@ async def _gate_verdict(input_data, tool_use_id, context):
 
     def deny(reason):
         runlog.bump("gate_denials")
-        # ★ 무엇을 막았는지 남긴다. `_reject_gate` 의 반려 21개가 전부 이 자리로 흐르므로
-        #   여기 한 곳이면 기각 게이트 전체가 관측된다. 막는 동작은 그대로다. → R-05 / C-031
+        # Record what was blocked. All 21 denial paths in `_reject_gate` flow through
+        #   here, so this single point observes the whole rejection gate. The blocking
+        #   behaviour is unchanged.
         try:
             ledger.record_denial(tgt, reason, act=act, klass=inp.get("klass") or "")
         except Exception:
@@ -952,10 +1002,12 @@ async def _gate_verdict(input_data, tool_use_id, context):
                                        "permissionDecision": "deny",
                                        "permissionDecisionReason": reason}}
 
-    # ★ 2026-09-07 — 정확일치는 오타 한 글자로 우회된다. **정본화 후** 비교한다.
-    #   실측: `basis="measured on the live kernel, not inferred…"` 인 실측 기각이
-    #   이 게이트를 통째로 건너뛰었다.
-    # ★ 축을 닫는 서술(track note / gate_blocked why)에 적대자를 붙인다. 막지 않는다.
+    # An exact match is bypassed by a single stray character, so the comparison is
+    #   made **after canonicalisation.** Measured: a real measurement-based rejection
+    #   with `basis="measured on the live kernel, not inferred..."` skipped this gate
+    #   entirely.
+    # Attach an adversary to axis-closing prose (a track note, a gate_blocked why).
+    # It does not block.
     if act in ("track", "gate_blocked", "exhaust") and getattr(
             config, "GATE_INTERROGATE_CLOSURE", True):
         await _interrogate_closure(tgt, inp, act)
@@ -978,73 +1030,86 @@ async def _gate_verdict(input_data, tool_use_id, context):
             ok, msg = True, "Internal error in the rejection gate (%s) — passed through, but UNVERIFIED." % e
         if not ok:
             return deny(msg)
-        # ★ 정적 게이트를 통과한 기각에 **독립 심문자**를 붙인다 (반박자의 거울).
-        #   ASK 로 떨어진 건은 아직 기각이 아니므로 심문하지 않는다 —
-        #   ★★ 단, 2026-09-04: 그 ASK 에는 **두 가지**가 섞여 있었다.
-        #     `need_observation`(관측 부족)은 그대로 질문으로 둔다. LLM 이 봐도 나올 게 없다.
-        #     `inexpressible`(분석은 끝났는데 게이트 모델이 그 모양을 표현 못 함)은 다르다 —
-        #     실측 62건의 `dominates_only` 가 전부 여기였고, **어떤 LLM 도 본 적이 없이**
-        #     ASK 큐로 직행해 다음 회차가 같은 규칙에 다시 부딪혔다.
-        #     조건을 더 붙이는 대신(기계 규칙을 덕지덕지 늘리는 대신) **적대층이 한 번
-        #     종합 판단**한다. 새 역할은 만들지 않는다: 심문자의 맨데이트가 이미
-        #     "애매하면 기각이 서지 않는다"라 방향이 맞고, fault 계약도 그대로 쓴다.
-        # ★ 판결자 — 같은 행이 N회 미종결이면 **심문자 대신** 종결자를 부른다.
-        #   심문자를 또 부르면 같은 파기가 또 나올 뿐이다(실측 파기율 64~88%).
+        # Attach an **independent interrogator** to a rejection that passed the static
+        #   gates — the mirror of the refuter.
+        #   A row that fell out as an ASK is not yet a rejection, so it is not
+        #   interrogated — except that the ASK bucket held **two different things**:
+        #     `need_observation` (not enough observed) stays a question. An LLM looking at
+        #     it would produce nothing.
+        #     `inexpressible` (the analysis is finished but the gate model cannot express
+        #     that shape) is different — 62 measured `dominates_only` rows were all this,
+        #     and they went straight to the ASK queue **without any LLM ever seeing
+        #     them**, so the next round hit the same rule again.
+        #     Rather than piling on more machine rules, **the adversarial layer makes one
+        #     holistic judgement.** No new role is created: the interrogator's mandate is
+        #     already "when unsure, the rejection does not stand", which points the right
+        #     way, and the fault contract carries over unchanged.
+        # The adjudicator — once the same row has gone unresolved N times, call the
+        #   terminator **instead of** the interrogator. Calling the interrogator again
+        #   only reproduces the same teardown (measured teardown rate 64-88%).
         _prev = ledger._ask_for(tgt) or {}
         _natt = len(_prev.get("attempts") or [])
         if config.GATE_ADJUDICATE and _natt >= config.ADJUDICATE_AFTER:
             r = await _adjudicate(tgt, inp, _natt)
             if r is not None:
                 return r
-            # confirm 이면 inp["_adjudicated"] 가 실려 아래로 통과한다.
-            # reject 면 그대로 기각 경로로 간다 — 심문자는 건너뛴다(이미 종결됐다).
+            # On confirm, `inp["_adjudicated"]` is attached and it passes through below.
+            # On reject it goes down the rejection path as usual, skipping the interrogator
+            # (it has already been terminated).
             _ask, _inexpr, _settled = None, False, True
         else:
             _ask = (_rec or {}).get("ask") if isinstance(_rec, dict) else None
             _inexpr = bool(_ask) and _ask.get("kind") == "inexpressible"
             _settled = False
-        # ★ 판결이 났으면 심문자를 **돌리지 않는다.** 안 그러면 종결자가 끝낸 행을
-        #   심문자가 다시 깨서 루프가 그대로 살아난다 — 이 배선의 목적 자체가 사라진다.
-        # ★ 2026-09-05 재설계 — 게이트가 못 정한 것(`_ask`)은 **반려가 아니라 증거**다.
-        #   GATE_COMPUTE_ONLY 면 종류를 가리지 않고 심문자에게 보낸다:
-        #   `need_observation`(관측 부족)도 짝 탐색 루프의 원료였고, 그 판단은
-        #   기계 규칙보다 적대자가 낫다. 게이트 계산 결과는 `_rec` 로 같이 넘어간다.
+        # Once adjudicated, the interrogator **does not run.** Otherwise it breaks a row
+        #   the terminator just closed and the loop survives — which defeats the entire
+        #   purpose of this wiring.
+        # Redesigned: what the gate could not decide (`_ask`) is **evidence, not a
+        #   denial.** Under GATE_COMPUTE_ONLY everything goes to the interrogator
+        #   regardless of kind: `need_observation` was also the raw material of the
+        #   pair-hunting loop, and an adversary judges that better than a machine rule.
+        #   The gate's computation travels along in `_rec`.
         if getattr(config, "GATE_COMPUTE_ONLY", True) and _ask:
             _inexpr = True
         if config.GATE_INTERROGATE and not _settled and (not _ask or _inexpr):
             if _inexpr:
-                # 기계가 **무엇을 못 했는지**를 증거로 같이 넘긴다. 심문자는 추론 과정을
-                # 못 보지만, 게이트가 계산한 CFG 사실은 봐야 판단이 가능하다.
-                print(f"\033[96m[interrogate] {tgt} — 게이트가 표현 못 한 모양"
-                      f"({_ask.get('cfg')}) ⇒ 적대층에 종합 판단을 맡긴다\033[0m")
+                # Hand over **what the machine could not do** as evidence. The interrogator does
+                # not see the reasoning, but it cannot judge without the CFG facts the gate
+                # computed.
+                print(f"\033[96m[interrogate] {tgt} — a shape the gate could not express"
+                      f"({_ask.get('cfg')}) => handing the holistic judgement to the adversarial layer\033[0m")
                 runlog.bump("inexpressible_judged")
             r = await _interrogate(tgt, inp, _rec, force=_inexpr)
             if r is not None:
                 return r
             if _inexpr:
-                # 심문자가 기각을 깨지 않았다 ⇒ 게이트가 표현 못 했을 뿐 기각은 선다.
-                # ★ 2026-09-04 수정: 예전엔 이 사실을 **훅 지역 dict `_rec` 에만** 적었다.
-                #   툴 쪽 `verdict()` 는 `_reject_gate` 를 처음부터 다시 계산하므로 그 표시가
-                #   증발했다 — 원장에 `passed_by` 0건, `pending_interrog` 잔류 13건이 그 지문이다.
-                #   실측 10건이 그렇게 사라졌다. 판결자·승격자가 쓰는 stash 패턴으로 건넨다.
-                #   ★ ASK 를 취소하지는 않는다(운영자 결정 A안): 심문자의 `sustained` 는
-                #     "옳다"가 아니라 "못 깼다"이므로 자동 승격은 정밀도 축을 연다.
-                #     사실만 분석가에게 전달하고 **판단은 분석가가 한다.**
+                # The interrogator did not break the rejection => the gate merely could not
+                # express it, and the rejection stands.
+                # This fact used to be written **only into the hook-local dict `_rec`.** The tool
+                #   side's `verdict()` recomputes `_reject_gate` from scratch, so the marking
+                #   evaporated — the fingerprint was zero `passed_by` rows in the ledger against
+                #   13 left in `pending_interrog`. Ten measured rows vanished that way. It is now
+                #   handed over with the same stash pattern the adjudicator and escalator use.
+                #   The ASK is not cancelled (operator decision): the interrogator's `sustained`
+                #     means "could not break it", not "it is right", so promoting automatically
+                #     would open a precision hole. The fact is relayed and **the analyst judges.**
                 try:
                     ledger.stash_inexpr_pass(tgt, {"cfg": _ask.get("cfg"),
                                                    "klass": v.get("klass"),
                                                    "reason": v.get("reason")})
                 except Exception as _e:
-                    print("\033[93m[inexpr] stash 실패: %s\033[0m" % _e)
+                    print("\033[93m[inexpr] stash failed: %s\033[0m" % _e)
                 _rec.pop("ask", None)
                 _rec["passed_by"] = "interrogator_over_inexpressible"
                 _rec["gate_could_not_express"] = _ask.get("cfg")
                 runlog.bump("inexpressible_sustained")
-        # ★ L3 — `delta_zero` 기각은 **발견이 죽는 바로 그 자리**다. 여기서만 승격자가 막는다.
-        #   심문자(옳은가)와 다른 질문을 한다: **누구에게는 델타가 0이 아닌가.**
-        # ★ 트리거 확대(refs/01 · 04): 배선 이후 기각 37건에 `delta_zero` 는 **0건**이었고,
-        #   실제로 등급이 깎이는 순간은 `by_design`(19/37)으로 온다 — 그게 벤더의 기각 서사 자체다.
-        #   `by_design`/`delta_zero` 는 막고(blocking), `not_controlled` 는 붙여만 둔다.
+        # A `delta_zero` rejection is **exactly where a finding dies**, and this is the
+        #   only place the escalator blocks. It asks a different question from the
+        #   interrogator ("is it right?"): **for whom is the delta not zero?**
+        # Trigger widened: across 37 rejections after this was wired, `delta_zero`
+        #   appeared **zero times** — the grade actually collapses via `by_design`
+        #   (19/37), which is the vendor's own rejection narrative.
+        #   `by_design` and `delta_zero` block; `not_controlled` is only attached.
         _kl = (inp.get("klass") or "").lower()
         if (config.GATE_ESCALATE and not _settled
                 and _kl in ("delta_zero", "by_design", "not_controlled")
@@ -1053,8 +1118,9 @@ async def _gate_verdict(input_data, tool_use_id, context):
                 await _run_escalator(inp, tgt, "rejection klass=not_controlled - reason=%s"
                                      % (inp.get("reason") or "")[:400], blocking=False)
             else:
-                # ★ 대조 대상 동일성(C-029)을 **사실로** 승격자에게 넘긴다. 게이트는 막지
-                #   않았고, "같은 것을 잰 대조가 없다"는 관측은 델타 0을 의심할 근거다.
+                # Hand the control-identity observation to the escalator **as a fact.** The gate
+                #   did not block, and "no control measured the same thing" is grounds to
+                #   distrust a zero delta.
                 _co = (_rec or {}).get("control_overlap") if isinstance(_rec, dict) else None
                 _cotxt = ""
                 if isinstance(_co, dict) and _co.get("verdict") == "no_overlap":
@@ -1077,13 +1143,14 @@ async def _gate_verdict(input_data, tool_use_id, context):
     # G0
     if not inp.get("evidence"):
         return deny("evidence is empty. If you cannot write down the basis, it is INFERRED.")
-    # G5 — 선행연구. 코드만 보는 게이트로는 절대 못 잡는 것이 있다.
-    #   ksecdd.sys 확정은 앵커 32건 기계검증 + 반박자 생존을 통과했는데
-    #   2024년 공개물(KExecDD / SCRT blog)이었고, IOCTL 0x39006F 에는
-    #   IOCTL_KSEC_IPC_SET_FUNCTION_RETURN 이라는 공개된 이름까지 있었다.
+    # G5 — prior art. There are things a gate that only reads code can never catch.
+    #   One confirmation passed 32 machine-verified anchors and survived the refuter,
+    #   and it was public work from the year before — the control code even had a
+    #   published name.
     if config.GATE_PRIORART:
-        # ★ 축별로 본다. 예전엔 `has_priorart()` 가 비어 있지 않기만 하면 통과였다 —
-        #   프롬프트는 3축을 요구했는데 코드는 기록이 **하나라도** 있는지만 셌다.
+        # Checked per axis. It used to pass as long as `has_priorart()` was non-empty —
+        #   the prompt demanded three axes while the code counted whether **any** record
+        #   existed.
         _gaps = ledger.priorart_gaps(
             tgt, " ".join(str(inp.get(k) or "") for k in ("claim", "evidence", "target")))
         if not ledger.has_priorart() or _gaps:
@@ -1102,22 +1169,26 @@ async def _gate_verdict(input_data, tool_use_id, context):
             return deny(why)
     else:
         anchors = []
-    # ── G2' — ★ 2026-09-04: **임팩트 게이트를 반박자 앞으로 옮긴다.**
+    # ── G2' — **move the impact gate ahead of the refuter.**
     #
-    #   측정으로 드러난 순서 뒤집힘: `_impact_gate`(owner/delta/boundary)는
-    #   `ledger.verdict()` **기록 시점**에만 돌았다. 즉 반박자를 통과한 뒤였다.
-    #   그런데 반박자의 킬 클래스에는 `impact_unproven` 이 있고, 실제로 오늘 밤
-    #   확정 시도 6건 중 **2건이 그것으로 죽었다**(wcifs ATTACH-VECTOR / SILOUNION).
-    #   ⇒ 하니스는 **임팩트를 요구하기도 전에** 반박자에게 임팩트를 판정시켰다.
-    #     에이전트는 owner/delta/boundary 를 낼 기회조차 없었다.
-    #     `refuter.build_prompt` 도 임팩트를 인자로 받지 않았다 — 존재하지 않았으니까.
+    #   An ordering inversion the measurement exposed: `_impact_gate`
+    #   (owner/delta/boundary) only ran at `ledger.verdict()` **recording time** —
+    #   i.e. after the refuter had already passed. But the refuter's kill classes
+    #   include `impact_unproven`, and in one night **2 of 6** confirmation attempts
+    #   died on exactly that.
+    #   => the harness had the refuter adjudicate impact **before it had even asked
+    #     for impact.** The agent never got the chance to supply
+    #     owner/delta/boundary, and `refuter.build_prompt` did not take impact as an
+    #     argument — because it did not exist.
     #
-    #   같은 벽이 지휘자의 지시도 세 번 막았다(ahcache S9-D4 를 03:46/06:38/08:05 에
-    #   점점 좁혀 지시했는데 매번 미제출). 에이전트 기록: *"The handler didn't refuse the
+    #   The same wall blocked three successive instructions from the orchestrator —
+    #   narrowed at 03:46, 06:38 and 08:05, never submitted. The agent's own note:
+    #   *"The handler didn't refuse the
     #   supersede — it demanded the impact fields."*
     #
-    #   `_impact_gate` 는 **순수 함수**다(STATE 를 안 건드린다) ⇒ 기록 시점의 호출을
-    #   그대로 두고 여기서 한 번 더 불러도 안전하다. 실패하면 반박자를 태우지 않는다.
+    #   `_impact_gate` is **a pure function** (it does not touch STATE), so calling it
+    #   again here while leaving the recording-time call in place is safe. If it
+    #   fails, the refuter is not run.
     impact = None
     if config.GATE_IMPACT_BEFORE_REFUTE:
         _iok, _inote, impact = ledger._impact_gate(inp)
@@ -1138,7 +1209,7 @@ async def _gate_verdict(input_data, tool_use_id, context):
         return {}
     cand = ledger.open_candidate(tgt, claim, basis, inp.get("evidence"), anchors)
     ledger.STATE["refutes"]["run"] += 1
-    print(f"\033[96m[refute] {cand['id']} {tgt} — 독립 반박자 기동 "
+    print(f"\033[96m[refute] {cand['id']} {tgt} — independent refuter starting "
           f"(model={config.REFUTER_MODEL or 'inherit'})\033[0m")
     p = T.TARGET.get("_pe")
     rep = ""
@@ -1146,8 +1217,9 @@ async def _gate_verdict(input_data, tool_use_id, context):
         res, summ = evidence.check(p, inp.get("evidence", ""), alt=T.TARGET.get("_alt"),
                                images=T.images_all())
         rep = evidence.render(res, summ)
-    # ★ 임팩트를 **같이 넘긴다.** 안 넘기면 반박자는 "임팩트가 논증되지 않았다"밖에
-    #   말할 수 없다 — 답할 기회가 없는 것을 근거로 죽이는 셈이다.
+    # Pass the impact **along with it.** Without that, all the refuter can say is
+    #   "impact was not argued" — killing on grounds the claim had no chance to
+    #   answer.
     v, raw = await refuter.run(SERVER, tgt, claim, inp.get("evidence"), rep,
                                impact=impact,
                                model=config.REFUTER_MODEL, tools=REFUTER_TOOLS,
@@ -1163,13 +1235,14 @@ async def _gate_verdict(input_data, tool_use_id, context):
                     "and say so in the report).")
     runlog.transcript(f"[refute] {cand['id']} {v}")
     ledger.count_via("refutes", v)
-    # ★ 판정 불가(고장)를 **먼저** 가른다. 이 줄이 없으면 refuted=None 이 falsy 라
-    #   고장난 반박자가 확정을 그냥 통과시킨다 — 원래는 반대로 '죽였다' 로 세탁됐다.
+    # Separate undecidable (a malfunction) **first.** Without this line refuted=None
+    #   is falsy, so a broken refuter simply passes the confirmation through — and in
+    #   the other direction it used to be laundered as "it killed it".
     if v.get("fault"):
         ledger.STATE["refutes"]["failed"] += 1
         ledger.close_candidate(cand, "proposed", None, raw)
         ledger.save()
-        print(f"\033[93m[refute] FAULT [{v.get('fault')}] — 결과 아님\033[0m")
+        print(f"\033[93m[refute] FAULT [{v.get('fault')}] — not a result\033[0m")
         return deny(f"The refuter FAILED TO PRODUCE A VERDICT ({v.get('fault')}): "
                     f"{v.get('reason')}\n"
                     "One retry gave the same result. THIS IS A MALFUNCTION, NOT A REFUTATION — "
@@ -1182,8 +1255,9 @@ async def _gate_verdict(input_data, tool_use_id, context):
         ledger.close_candidate(cand, "refuted", v.get("klass"), v.get("reason", ""),
                                impact=impact)
         print(f"\033[91m[refute] KILLED [{v.get('klass')}] {v.get('reason','')[:120]}\033[0m")
-        # ★ 부활 조건을 **열린 질문 큐에 등재**한다. 예전엔 이 문장이 컨텍스트에 한 번 뜨고
-        #   사라져서, 반박자에게 죽은 확정 11건 중 재제출 시도가 0건이었다(refs/01).
+        # **File the resurrection condition in the open-question queue.** It used to
+        #   appear in the context once and vanish, and of 11 confirmations the refuter
+        #   killed, zero were ever resubmitted.
         try:
             _q = ledger.ask_refuted(tgt, claim, v.get("klass"), v.get("reason"),
                                     v.get("would_change_my_mind"))
@@ -1206,16 +1280,19 @@ async def _gate_verdict(input_data, tool_use_id, context):
     ledger.close_candidate(cand, "promoted", None, v.get("reason", ""))
     ledger.stage(tgt, claim, anchors, v)
     print(f"\033[92m[refute] SURVIVED — {v.get('reason','')[:120]}\033[0m")
-    # ★ L3 — 확정인데 임팩트가 약하면(델타 0 / 소유자 없음) 승격자를 붙인다.
-    #   여기서는 **막지 않는다**: 확정 자체는 유효하고 등급만 낮은 것이므로, 결과를 붙여만 둔다.
+    # A confirmation with weak impact (zero delta, no owner) gets the escalator.
+    #   It **does not block** here: the confirmation is valid and only its grade is
+    #   low, so the result is attached and no more.
     if config.GATE_ESCALATE:
         _d = str(inp.get("delta") or "").strip().lower()
         _o = str(inp.get("owner") or "").strip().lower()
-        _weak = (_d in ("0", "없음", "zero", "none") or _o in ("none", "없음", "n/a", "-"))
-        # ★ 범위 밖 경계(admin→kernel)는 **약한 임팩트와 같은 취급**을 받는다.
-        #   결함은 섰는데 경계로 등급이 0이 되는 자리 — 승격자의 질문이 정확히 여기에 맞는다:
-        #   "이 싱크에 닿는 더 낮은 권한은 누구인가."
-        # ★ 칸이 있으면 칸이 정본. 산문 정규식만 보던 동안 확정 6건 중 1건만 걸렸다.
+        _weak = (_d in ("0", "none", "zero", "none") or _o in ("none", "none", "n/a", "-"))
+        # An out-of-scope boundary (admin -> kernel) is **treated the same as weak
+        #   impact**: the defect stands but the boundary drives its grade to zero, which
+        #   is exactly where the escalator's question fits — "which lower principal
+        #   reaches this sink?"
+        # When the column exists, the column is canonical. While only a prose regex was
+        #   consulted, 1 of 6 confirmations was caught.
         _fp, _tp = (inp.get("from_principal") or ""), (inp.get("to_principal") or "")
         if _fp and _tp:
             _oos = ledger.boundary_typed(_fp, _tp)[0] in ("no", "unknown")
@@ -1239,7 +1316,7 @@ async def _gate_verdict(input_data, tool_use_id, context):
     return {}
 
 
-# ── PostToolUse: 상태·독트린 주입 ────────────────────────────
+# ── PostToolUse: inject state and doctrine ───────────────────────────────
 async def inject_state(input_data, tool_use_id, context):
     STATE["calls"] += 1
     name = (input_data or {}).get("tool_name", "")
@@ -1248,7 +1325,8 @@ async def inject_state(input_data, tool_use_id, context):
         parts.extend(STATE["nudges"]); STATE["nudges"].clear()
     if name == VERDICT or STATE["calls"] % 4 == 0:
         parts.append(ledger.status_block(STATE["calls"], config.MAX_TOOL_CALLS))
-    # ★ 지표 스냅샷 — 타임아웃(SIGKILL)이면 finish() 가 안 돌아 runs.jsonl 줄이 통째로 없다.
+    # A metrics snapshot: on a timeout (SIGKILL) `finish()` never runs and the
+    # `runs.jsonl` line is missing entirely.
     if STATE["calls"] % 5 == 0:
         try:
             runlog.snapshot(ledger.STATE, os.path.basename(T.TARGET.get("binary") or ""))
@@ -1260,14 +1338,16 @@ async def inject_state(input_data, tool_use_id, context):
                                    "additionalContext": "\n".join(parts)}}
 
 
-# ── Stop: 종료 검문 (조용한 성공 방지) ───────────────────────
+# ── Stop: the exit checkpoint (no silent success) ────────────────────────
 async def stop_gate(input_data, tool_use_id, context):
-    # ★ 2026-09-04: 예전엔 `stop_hook_active` 면 **무조건** 놓아줬다. 그 플래그는
-    #   "이 정지 사이클에서 스톱훅이 이미 한 번 막았다"는 뜻이라, 결과적으로
-    #   `STOP_BLOCKS` 가 몇이든 **실효 1회**였다. msquic r1 이 그 경로로
-    #   `종료 차단 (1/2)` 한 번만 맞고 **판정 0건에 23분**(cap 90분)으로 나갔다.
-    #   무한루프는 아래 카운터가 이미 막는다 — 그게 STOP_BLOCKS 의 존재 이유다.
-    #   ⇒ 플래그로 조기 반환하지 않고 카운터에 맡긴다.
+    # This used to let the run go **unconditionally** when `stop_hook_active` was
+    #   set. That flag means "the stop hook already blocked once in this stop cycle",
+    #   so whatever `STOP_BLOCKS` was set to, the **effective count was one.** One run
+    #   took a single `stop blocked (1/2)` on that path and left with **zero verdicts
+    #   in 23 minutes** against a 90-minute cap.
+    #   An infinite loop is already prevented by the counter below — that is what
+    #   STOP_BLOCKS is for.
+    #   => do not return early on the flag; leave it to the counter.
     if not config.GATE_STOP or STATE["stop_blocks"] >= config.STOP_BLOCKS:
         return {}
     bad = ledger.can_finish()
@@ -1278,30 +1358,31 @@ async def stop_gate(input_data, tool_use_id, context):
     msg = ("You cannot finish yet:\n" + "\n".join(f"  - {b}" for b in bad) +
            "\n\nZero confirmations is a legitimate outcome — but AN UNFILLED TABLE IS NOT AN "
            "OUTCOME.")
-    print(f"\033[93m[stop-gate] 종료 차단 ({STATE['stop_blocks']}/{config.STOP_BLOCKS})\033[0m")
+    print(f"\033[93m[stop-gate] stop blocked ({STATE['stop_blocks']}/{config.STOP_BLOCKS})\033[0m")
     return {"decision": "block", "reason": msg}
 
 
-# ── PreCompact: 체크포인트 ───────────────────────────────────
+# ── PreCompact: checkpoint ───────────────────────────────────────────────
 async def precompact(input_data, tool_use_id, context):
     ledger.save()
-    # ★ 압축되면 모델은 앞의 status_block 을 잃는다. 델타 캐시를 안 비우면 그 뒤로
-    #   '변동 없음' 한 줄만 받아 **그 회차 내내 상태를 못 본다.**
+    # After compaction the model loses the earlier status block. Without clearing the
+    #   delta cache it then receives only a "no change" line and **cannot see the
+    #   state for the rest of the round.**
     ledger.status_reset("precompact")
     runlog.bump("compactions")
-    print("\033[95m[compact] 원장을 디스크에 체크포인트했다 (컨텍스트 압축 직전)\033[0m")
+    print("\033[95m[compact] checkpointed the ledger to disk (just before context compaction)\033[0m")
     return {"hookSpecificOutput": {
         "hookEventName": "PreCompact",
         "additionalContext":
             "Pre-compaction checkpoint: the verdict ledger is on disk under state/ and your "
             "note-tool records survive too. After compaction, recover FIRST with "
             "verdict(action='status') and note(action='read'). "
-            "기억에 의존해 확정을 재구성하지 마라."}}
+            "Do not reconstruct a confirmation from memory."}}
 
 
 SYSTEM = """You are an autonomous vulnerability analyst working on a compiled binary.
 The goal is NOT to find something — it is to produce a defensible verdict for every item on
-the surface table: 확정 / 기각 / 미분석.
+the surface table: confirmed / rejected / unanalysed.
 
 Calibrate: on function-level vulnerability judgement, frontier models label roughly two thirds
 of everything they read as vulnerable, at false-positive rates of 33-45%. Your prior that any
@@ -1399,16 +1480,19 @@ SEED:
 """
 
 def _axes_block():
-    """★ **이번 회차에 어떤 실측 축이 열려 있는지 하니스가 직접 말해준다** (2026-09-05).
+    """**The harness itself states which measurement axes are open this round.**
 
-    왜 필요했나 — 측정으로 드러난 것: 이 표적의 이전 회차 툴 사용은
-    `run_python 25 · note 24 · disassemble 23 · verdict 18` 이고 **`ioctl` 0회**다.
-    툴은 내내 있었는데 모든 런이 `ALLOW_PROBE=0` 이었으므로 에이전트가 배운 것은
-    **"실측은 거부된다"** 뿐이었다. 그래서 축을 열어줘도 **시도하지 않는다** —
-    열렸다는 사실을 알 방법이 없기 때문이다(툴 설명은 "ALLOW_*=1 이 필요하다"까지만 말한다).
+    Why it was needed, from measurement: one target's previous rounds used
+        `run_python 25 · note 24 · disassemble 23 · verdict 18` and **`ioctl` zero
+        times.** The tool was there the whole time, but every run had
+        `ALLOW_PROBE=0`, so all the agent ever learned was **"measurement is
+        refused".** Open the axis and it still **does not try** — it has no way to
+        know the axis opened (the tool description only says "ALLOW_*=1 is
+        required").
 
-    ⇒ 게이트 상태를 **config 에서 계산해서** 프롬프트에 싣는다. 사람이 시드에 손으로
-      적는 방식은 틀린다 — 시드는 낡고 게이트는 env 로 바뀐다.
+    => the gate state is **computed from config** and put in the prompt. Writing it
+        into the seed by hand is wrong: a seed goes stale while the gates change via
+        the environment.
     """
     rows = [("host ioctl   ", config.ALLOW_PROBE, "ioctl(where='host', ...)",
              "fires at THIS analyst machine — a bugcheck kills the harness and the ledger"),
@@ -1446,55 +1530,62 @@ async def run(binary, corpus, alt, seed=None):
     try:
         T.set_target(binary, corpus, alt)
     except Exception as e:
-        print(f"\033[91m[!] 대상 로드 실패: {e}\033[0m")
+        print(f"\033[91m[!] failed to load the target: {e}\033[0m")
         return
     guid = ""
     if T.TARGET.get("_pe"):
         guid = T.TARGET["_pe"].codeview()[0] or ""
     loaded = ledger.attach(binary or corpus, guid)
-    # ★ 2026-09-04: 운영자 목표를 **attach 뒤에** 심는다. 환경변수로 받는 이유가 있다.
-    #   nightrun 은 목표를 state JSON 에 써 넣는데,
-    #     ① 첫 접촉 표적은 그 파일이 **아직 없어서** json.load 가 터지고 (조용히 삼켜졌다),
-    #     ② 파일이 있어도 nightrun 기본값 `FRESH=1` 이면 attach() 가 통째로 버린다.
-    #   즉 목표는 `FRESH=0` 회차에서만 살아 있었다. 종료 게이트가 목표를 못 보면
-    #   "표 정리"가 종료로 가는 최단 경로가 된다 — 09-02 에 그렇게 19분에 끝난 회차가 있다.
+    # The operator goal is installed **after attach**, and it arrives via the
+    #   environment for a reason. The orchestrator wrote the goal into the state JSON,
+    #   but
+    #     (1) on first contact with a target that file **does not exist yet**, so
+    #         json.load raised (and was silently swallowed), and
+    #     (2) even when it did exist, the orchestrator's default `FRESH=1` made
+    #         attach() discard it wholesale.
+    #   So the goal only survived on `FRESH=0` rounds. When the stop gate cannot see
+    #   the goal, "tidying the table" becomes the shortest path to the exit — one
+    #   round ended that way in 19 minutes.
     _og = (os.environ.get("OPERATOR_GOAL") or "").strip()
     if _og:
         _ok = (os.environ.get("OPERATOR_GOAL_KIND") or "judge").strip()
-        # ★ `by` 는 **정책**이다. operator 목표만 `set_goal` 이 잠근다(ledger.py 참조).
-        #   여기서 "operator" 로 굳히면 지휘자 *제안*이 잠긴 목표로 승격된다.
+        # `by` is **policy**: only an operator goal is locked by `set_goal` (see
+        #   ledger.py). Hard-coding "operator" here promotes an orchestrator *suggestion*
+        #   into a locked goal.
         _oby = (os.environ.get("OPERATOR_GOAL_BY") or "operator").strip()
-        # ★ 2026-09-05 — 예전엔 이 블록이 `seed_goal` 의 **본문을 복사**하고 있었다.
-        #   그래서 `seed_goal` 이 하는 검사(집행가능성 C-024 · 결론 처방 C-030)가 실제
-        #   회차에서는 **한 번도 돌지 않았다** — `seed_goal` 은 테스트에서만 불렸다.
-        #   `built-but-never-wired` 그대로다. 이제 한 곳으로 모은다.
+        # This block used to **duplicate the body** of `seed_goal`, so the checks
+        #   `seed_goal` performs (enforceability, prescribed-conclusion) **never ran in a
+        #   real round** — `seed_goal` was only ever called from tests. The
+        #   built-but-never-wired pattern again. It is funnelled through one place now.
         _gres = ledger.seed_goal(_og, _ok, by=_oby)
-        print(f"\033[96m[goal] 목표 설치 by={_oby} (kind={_ok}, FRESH 무관): {_og[:80]}\033[0m")
+        print(f"\033[96m[goal] goal installed by={_oby} (kind={_ok}, independent of FRESH): {_og[:80]}\033[0m")
         if isinstance(_gres, dict) and _gres.get("_warn"):
             print("\033[93m%s\033[0m" % _gres["_warn"])
             runlog.bump("goal_warned")
-    # ★ 크로스 이미지 등록. `IMAGES=nt=/mnt/c/.../ntoskrnl.exe,apphelp=/mnt/c/.../apphelp.dll`
-    #   표적 이미지 하나만 보면 `nt!` 계약에 바닥이 닿는 주장이 전부 BLOCKED 로 죽는다.
-    #   ntoskrnl 은 공개 PDB 심볼이 있어 익스포트 이름으로 바로 건너갈 수 있다.
+    # Cross-image registration:
+    #   `IMAGES=nt=/path/ntoskrnl.exe,apphelp=/path/apphelp.dll`
+    #   With only the target image loaded, every claim that bottoms out in an `nt!`
+    #   contract dies as BLOCKED. The kernel image has public PDB symbols, so it can
+    #   be crossed into directly by export name.
     for _spec in [x.strip() for x in os.environ.get("IMAGES", "").split(",") if x.strip()]:
         if "=" not in _spec:
-            print(f"\033[91m[images] 형식은 name=path 다: {_spec!r}\033[0m"); continue
+            print(f"\033[91m[images] the format is name=path: {_spec!r}\033[0m"); continue
         _n, _p = _spec.split("=", 1)
         try:
             _m = T.add_image(_n.strip(), _p.strip())
             ledger.record_image(_m)
             print(f"\033[96m[images] {_m['name']} ← {os.path.basename(_m['path'])} "
-                  f"(base={_m['base']} guid={_m['guid'][:16]} 익스포트 {_m['exports']}개) "
-                  f"— 인용은 `{_m['name']}!0xVA` 로 태그하라\033[0m")
+                  f"(base={_m['base']} guid={_m['guid'][:16]} {_m['exports']} exports) "
+                  f"— tag citations as `{_m['name']}!0xVA`\033[0m")
         except Exception as _e:
-            print(f"\033[91m[images] {_n} 등록 실패: {type(_e).__name__}: {_e}\033[0m")
+            print(f"\033[91m[images] failed to register {_n}: {type(_e).__name__}: {_e}\033[0m")
     if loaded:
         pct, done, tot = ledger.coverage()
-        print(f"\033[92m[ledger] 이전 원장 복원 — 전수 표 {tot}개, 커버리지 {pct*100:.0f}%, "
-              f"묘지 {len(ledger.STATE['graveyard'])}건 "
-              f"(FRESH={os.environ.get('FRESH','')!r} — **누적 모드**다)\033[0m")
+        print(f"\033[92m[ledger] restored the previous ledger — {tot} surface rows, {pct*100:.0f}% coverage, "
+              f"{len(ledger.STATE['graveyard'])} graveyard rows "
+              f"(FRESH={os.environ.get('FRESH','')!r} — this is **cumulative mode**)\033[0m")
     runlog.start(binary or corpus, config.RUN_TAG)
-    runlog.mark_baseline(ledger.STATE)   # ★ 반려는 원장 누적 — 이번 회차분 기준선
+    runlog.mark_baseline(ledger.STATE)   # denials are cumulative; baseline this round
 
     opts = ClaudeAgentOptions(
         model=config.MODEL, system_prompt=SYSTEM + _axes_block(), cwd=config.WORK_DIR,
@@ -1524,13 +1615,15 @@ async def run(binary, corpus, alt, seed=None):
         task.append(VARIANT_TASK.format(seed=seed[:6000]))
     brief = os.path.join(os.path.dirname(os.path.abspath(binary or corpus)), "BRIEF.md")
     if os.path.exists(brief):
-        print(f"[brief] {brief} 적용")
+        print(f"[brief] {brief} applied")
         task.append("\n=== BRIEF (BRIEF.md from the target folder) ===\n" + open(brief).read().strip())
     if loaded and ledger.STATE["graveyard"]:
-        # ★ 2026-09-04: 옛 코드는 `[-12:]` 최근 12건에 전부 "do not resurrect" 를 붙였다.
-        #   실측으로 묘지 394건 중 **반박자 킬은 24건(6%)** 이고 370건은 분석가 자신의 기각이다.
-        #   자기 판정이 적대자 판정과 같은 언어로 되돌아와 재심을 막는 프라이밍이 됐다.
-        #   `graveyard_priming()` 이 출처별로 문구를 가르고 klass 층화로 뽑는다.
+        # The old code attached "do not resurrect" to all of the most recent 12 rows.
+        #   Measured, of 394 graveyard rows only **24 (6%) were refuter kills** — the
+        #   other 370 were the analyst's own rejections. Their own verdicts came back in
+        #   the same language as an adversary's and primed them against re-auditing.
+        #   `graveyard_priming()` now splits the wording by origin and samples stratified
+        #   by klass.
         _gp = ledger.graveyard_priming(12)
         if _gp:
             task.append("\n" + _gp)
@@ -1540,8 +1633,8 @@ async def run(binary, corpus, alt, seed=None):
         final = None
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
-                # ★ 2026-09-07 — 타임아웃(SIGKILL)이면 ResultMessage 가 안 온다.
-                #   토큰은 여기서 누적해 두어야 부분 스냅샷이 비용 칸을 채운다.
+                # On a timeout (SIGKILL) no ResultMessage arrives. Tokens have to be accumulated
+                #   here for the partial snapshot to be able to fill the cost columns.
                 runlog.note_usage(getattr(msg, "usage", None))
                 for b in msg.content:
                     if isinstance(b, TextBlock) and b.text.strip():
@@ -1566,9 +1659,9 @@ async def run(binary, corpus, alt, seed=None):
 def _usage():
     print("usage: python agent_sdk.py <binary> [corpus.c]\n"
           "       python agent_sdk.py --corpus <corpus.c>\n"
-          "env  : ALT=<코퍼스와 같은 빌드의 PE>  SEED=<변종 사냥 씨앗 파일|문자열>\n"
+          "env  : ALT=<a PE of the same build as the corpus>  SEED=<variant-hunt seed file|string>\n"
           "       IMAGES=nt=/mnt/c/Windows/System32/ntoskrnl.exe[,name=path...]\n"
-          "       FRESH=1 원장 초기화 · GATE_REFUTE=0 반박자 끄기 · REFUTER_MODEL=<모델>")
+          "       FRESH=1 reset the ledger · GATE_REFUTE=0 disable the refuter · REFUTER_MODEL=<model>")
 
 
 if __name__ == "__main__":
@@ -1583,5 +1676,5 @@ if __name__ == "__main__":
     if seed and os.path.exists(seed):
         seed = open(seed, encoding="utf-8", errors="replace").read()
     if _LEAKED:
-        print("\033[93m[!] ANTHROPIC_API_KEY 를 제거했다 (있으면 구독이 아니라 API 과금).\033[0m")
+        print("\033[93m[!] ANTHROPIC_API_KEY  removed (if present, billing goes to the API instead of the subscription).\033[0m")
     asyncio.run(run(b, c, os.environ.get("ALT") or None, seed or None))

@@ -124,3 +124,16 @@ ALLOW_KDNET    = os.environ.get("ALLOW_KDNET", "0") in ("1", "true")
 # Prior-art dedup gate (G3) and the Stop-gate block budget.
 GATE_PRIORART = os.environ.get("GATE_PRIORART", "1") not in ("0", "false", "no")
 STOP_BLOCKS   = int(os.environ.get("STOP_BLOCKS", "2"))
+
+# The non-circular negative control for the double-fetch detector. It must be a
+# real image where the detector has been **hand-verified to produce a false
+# positive** (the IO_STACK_LOCATION.Parameters union misread). Fixing the
+# detector's answer there to zero is what stops the union bug coming back.
+# Leave it unset and that one control does not run — every result then says so,
+# because a control that did not run is not a control that passed.
+DBLFETCH_FP_CONTROL = os.environ.get("DBLFETCH_FP_CONTROL", "")
+
+# An optional real-image positive control for the asynchronous-registrar sweep.
+# The synthetic controls always run and prove the recovery path works; this one,
+# when set, additionally pins the sweep against a real compiler's output.
+ASYNC_CONTROL_IMAGE = os.environ.get("ASYNC_CONTROL_IMAGE", "")
